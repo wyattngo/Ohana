@@ -1,0 +1,97 @@
+<!doctype html><html lang="vi"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ohana — Lộ trình GĐ0</title><style>
+*{box-sizing:border-box}
+:root{--bg:#fff;--fg:#12151a;--mut:#6b7480;--line:#e3e6ea;--card:#f7f8fa;--acc:#2f6feb}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1216;--fg:#e6e9ee;--mut:#8b95a3;--line:#242a32;--card:#161a20;--acc:#5b8cf7}}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+header{padding:18px 22px;border-bottom:1px solid var(--line)}
+h1{margin:0 0 10px;font-size:17px}
+.kpis{display:flex;gap:10px;flex-wrap:wrap}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:7px 12px;font-size:12px}
+.kpi b{font-size:16px;display:block}
+.wrap{display:grid;grid-template-columns:minmax(340px,1fr) minmax(340px,1.15fr);gap:0;align-items:start}
+@media(max-width:900px){.wrap{grid-template-columns:1fr}}
+.pane{padding:16px 20px}
+.pane.right{border-left:1px solid var(--line);position:sticky;top:0;max-height:100vh;overflow:auto}
+@media(max-width:900px){.pane.right{border-left:0;border-top:1px solid var(--line);position:static;max-height:none}}
+.step{border:1px solid var(--line);border-radius:9px;margin-bottom:9px;overflow:hidden}
+.step>summary{padding:10px 12px;cursor:pointer;background:var(--card);display:flex;gap:9px;align-items:center;flex-wrap:wrap;list-style:none}
+.step>summary::-webkit-details-marker{display:none}
+.sid{font-weight:600}
+.anch{color:var(--mut);font-family:ui-monospace,Menlo,monospace;font-size:11.5px}
+.row{padding:7px 12px 7px 26px;border-top:1px solid var(--line);display:flex;gap:8px;align-items:center;flex-wrap:wrap;cursor:pointer}
+.row:hover,.ph:hover{background:var(--card)}
+.ph{margin-left:14px;padding:3px 8px;border-radius:5px;font-size:11.5px;font-family:ui-monospace,Menlo,monospace;border:1px solid var(--line);cursor:pointer}
+.pill{font-size:11px;padding:1.5px 7px;border-radius:99px;border:1px solid var(--line);color:var(--mut)}
+.b-DONE{color:#1a7f37;border-color:#1a7f3755}.b-PARTIAL{color:#bf8700;border-color:#bf870055}
+.b-BLOCKED{color:#cf222e;border-color:#cf222e55}.b-TODO{color:var(--mut)}.b-NONE{color:var(--mut);opacity:.75}
+.warn{color:#cf222e}.ok{color:#1a7f37}
+.det h2{font-size:15px;margin:0 0 4px}.det h3{font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--mut);margin:16px 0 6px}
+.det .box{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px;white-space:pre-wrap;word-break:break-word;font-size:13px}
+.det code,.mono{font-family:ui-monospace,Menlo,monospace;font-size:12px}
+ul.t{margin:0;padding-left:18px}ul.t li{margin:3px 0}
+.hint{color:var(--mut);font-size:13px}
+.issues{margin-top:18px;border-top:1px solid var(--line);padding-top:12px}
+</style></head><body>
+<header><h1>Ohana AI — Lộ trình GĐ0 <span class="anch">Phase → Step → Work item → Task</span></h1>
+<div class="kpis" id="kpis"></div>
+<div class="anch" style="margin-top:8px">Mẫu số ở đây là <b>GĐ0</b>. L3 <code>ROADMAP-STATUS.md</code> đếm toàn GĐ0–GĐ3 nên số khác — hai bộ đếm, hai câu hỏi.</div></header>
+<div class="wrap"><div class="pane" id="tree"></div><div class="pane right det" id="det"></div></div>
+<script>const D=__DATA__;
+const esc=s=>String(s==null?"":s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+// md(): escape TRƯỚC rồi mới bật **đậm** / `code` — nội dung L1/L2 đầy markdown,
+// để thô thì đọc rất khó. Thứ tự escape-trước là bắt buộc, không đảo.
+const md=s=>esc(s).replace(/\*\*(.+?)\*\*/g,"<b>$1</b>").replace(/`([^`]+)`/g,"<code>$1</code>");
+const K=D.kpi,kp=[["Work item",K.items],["Internal GĐ0",K.internal_done+"/"+K.internal_total],
+ ["Step đã ký",K.steps_signed+"/"+K.steps],
+ ["Dangling",D.dangling.length],["Drift",D.drift.length]];
+kpis.innerHTML=kp.map(([k,v])=>`<div class="kpi">${k}<b>${v}</b></div>`).join("");
+
+function stepHTML(s){
+ const its=s.items.map(i=>`<div class="row" data-k="i:${i.id}">
+   <span>${esc(i.id)}</span>${i.weak?'<span class="pill">weak</span>':''}
+   <span class="pill">${esc(i.cls||"?")}</span>
+   <span class="pill b-${i.status}">${i.status}</span>
+   ${i.phases.map(p=>`<span class="ph" data-k="p:${p}">${esc(p)}</span>`).join("")}
+ </div>`).join("")||'<div class="row hint">(không bind work item nào)</div>';
+ return `<details class="step" open><summary data-k="s:${s.id}">
+   <span class="sid">${esc(s.id)}</span><span class="anch">${esc(s.anchor)}</span>
+   <span class="pill ${s.signed?'ok':'warn'}">${s.signed?'✍ '+esc(s.by):'CHƯA KÝ'}</span>
+   <span class="pill">${(s.policy||[]).length} policy</span></summary>${its}</details>`;}
+
+tree.innerHTML=D.steps.map(stepHTML).join("")+
+ (D.outside.length?`<h3 style="font-size:12px;color:var(--mut);margin:18px 0 8px">NGOÀI §7 — không thuộc Step nào</h3>`+
+  D.outside.map(o=>`<details class="step"><summary><span class="anch">${esc(o.anchor)}</span></summary>`+
+   o.items.map(i=>`<div class="row" data-k="i:${i.id}"><span>${esc(i.id)}</span>
+     <span class="pill">${esc(i.cls||"?")}</span><span class="pill b-${i.status}">${i.status}</span>
+     ${i.phases.map(p=>`<span class="ph" data-k="p:${p}">${esc(p)}</span>`).join("")}</div>`).join("")+
+   `</details>`).join(""):"")+
+ ((D.drift.length||D.dangling.length)?`<div class="issues"><h3 style="font-size:12px;color:var(--mut)">SỨC KHOẺ</h3>`+
+   D.dangling.map(x=>`<div class="warn">✗ dangling — ${esc(x)}</div>`).join("")+
+   D.drift.map(x=>`<div class="warn">✗ drift — ${esc(x)}</div>`).join("")+`</div>`
+  :`<div class="issues ok">✓ 0 dangling · 0 drift</div>`);
+
+const findItem=id=>{for(const s of D.steps)for(const i of s.items)if(i.id===id)return i;
+ for(const o of D.outside)for(const i of o.items)if(i.id===id)return i;};
+function show(k){
+ const[t,...r]=k.split(":"),v=r.join(":");
+ if(t==="s"){const s=D.steps.find(x=>x.id===v);det.innerHTML=`<h2>${esc(s.id)} — ${esc(s.title||"")}</h2>
+  <div class="hint mono">derives_from: workflow#${esc(s.anchor)}</div>
+  <h3>Target (ý định Wyatt, đo được)</h3><ul class="t">${(s.targets||[]).map(x=>`<li>${md(x)}</li>`).join("")}</ul>
+  <h3>Test policy (đã ký — hợp đồng bất biến; L2 spec sinh JIT tiêu thụ thành <code>GATE:</code>)</h3><ul class="t">${(s.policy||[]).map(x=>`<li>${md(x)}</li>`).join("")}</ul>
+  <h3>Bound work items</h3><ul class="t">${s.items.map(i=>`<li><code>${esc(i.id)}</code> — ${i.status}</li>`).join("")||"<li>(không có)</li>"}</ul>`;}
+ else if(t==="i"){const i=findItem(v);det.innerHTML=`<h2>${esc(i.id)}</h2>
+  <div class="hint mono">${esc(i.derives)} · Class ${esc(i.cls)} · ${i.status}</div>
+  <h3>Nội dung</h3><div class="box">${md(i.what)}</div>
+  <h3>Acceptance (L1 §4.1)</h3><div class="box">${md(i.acceptance)}</div>
+  ${i.waits&&i.waits!=="—"?`<h3>Chờ ai</h3><div class="box">${esc(i.waits)}</div>`:""}
+  <h3>Task (phase L2)</h3><ul class="t">${i.phases.map(p=>`<li><span class="ph" data-k="p:${p}">${esc(p)}</span> ${esc(i.phase_status[p]||"")}</li>`).join("")||"<li>chưa có phase nào</li>"}</ul>`;}
+ else{const p=D.phases[v];if(!p)return;const F=p.f,ord=["STATUS","RISK","ROADMAP","GOAL","APPROACH","GATE","GATE_FULL","EVIDENCE","REVIEW","SMOKE","BLOCKED_BY","ALLOWED_FILES"];
+  det.innerHTML=`<h2>${esc(p.spec)}:${esc(p.phase)}</h2><div class="hint">${esc(p.spec_title)}</div>`+
+   ord.filter(k=>F[k]).map(k=>`<h3>${k}</h3><div class="box">${md(F[k])}</div>`).join("");}
+ det.scrollTop=0;}
+document.addEventListener("click",e=>{const el=e.target.closest("[data-k]");if(!el)return;
+ if(el.classList.contains("ph"))e.preventDefault();show(el.dataset.k);});
+det.innerHTML='<div class="hint">Bấm một <b>Step</b> để xem Target + Tests · một <b>work item</b> để xem acceptance · một <b>phase</b> để xem nguyên checkpoint ADP.</div>';
+</script></body></html>

@@ -1,0 +1,4 @@
+# Tier gác. `stop` = dừng, mô tả kế hoạch, chờ người duyệt trước khi sửa.
+free  docs/ tests/ *.md
+ask   agent/ api/ retrieval/ parsing/ tools/ app/
+stop  agent/pii.py agent/policy_gate.py channels/ auth/ db/migrations/ bridge/

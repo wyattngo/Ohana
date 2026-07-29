@@ -1,0 +1,196 @@
+[project]
+name = "ohana-ai"
+version = "0.1.0"
+description = "AI copilot cho seller social-commerce VN (Zalo/FB/IG) — MVP Zalo-only."
+requires-python = ">=3.11"
+dependencies = [
+    # PIN CỨNG, cùng lý do đã pin dev tool (ISSUE-019) — nhưng đây là RUNTIME, hỏng nặng hơn.
+    #
+    # Với `>=`, hai lần `pip install` cách nhau vài tuần cho ra hai ứng dụng khác nhau, và
+    # CI xanh KHÔNG chứng minh được gì về cái sẽ chạy ở production. Đo 2026-07-20 trước khi
+    # pin — floor khai trong file này so với thứ THỰC SỰ đang chạy:
+    #
+    #   🔴 openai         1.30  → 2.45.0   ← SDK của CẢ TogetherClient LẪN TogetherEmbedder
+    #   🔴 pypdf          4.0   → 6.14.2
+    #   🔴 redis          5.0   → 8.0.1
+    #   🔴 sse-starlette  2.1   → 3.4.5
+    #   🟡 fastapi 0.110→0.139 · uvicorn 0.29→0.51 · pydantic 2.6→2.13 · alembic 1.13→1.18
+    #
+    # Bốn cái đầu đã qua ĐỔI MAJOR. Toàn bộ test suite chưa bao giờ chạy trên floor đã khai —
+    # nó chạy trên thứ pip tình cờ giải ra hôm cài. `openai` đáng lo nhất: nó là đường sống
+    # của mọi lời gọi LLM và embedding, và bản 2.x đổi API so với 1.x.
+    #
+    # Version dưới đây = ĐÚNG thứ CI run 29709797545 (aae835c) chạy xanh đủ 11 step, gồm
+    # alembic + pytest trên container sạch. Pin là chốt hiện trạng đã được CI xác nhận,
+    # KHÔNG phải nâng cấp mù.
+    #
+    # Nâng version: đổi số ở đây → chạy `pytest -m live` (fake client KHÔNG bắt được lỗi
+    # SDK/endpoint) → xem CI xanh → mới commit. Đừng nới thành `>=` để "tiện".
+    "fastapi==0.139.2",
+    "uvicorn[standard]==0.51.0",
+    "pydantic==2.13.4",
+    "pydantic-settings==2.14.2",
+    "sse-starlette==3.4.5",
+    "python-multipart==0.0.32",
+    "pypdf==6.14.2",
+    "defusedxml==0.7.1",
+    "openai==2.45.0",
+    "httpx==0.28.1",
+    "pyjwt[crypto]==2.13.0",
+    "sqlalchemy==2.0.51",
+    "alembic==1.18.5",
+    "psycopg[binary]==3.3.4",
+    "pgvector==0.5.0",
+    "redis==8.0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    # PIN CỨNG, không phải `>=` — ruff vừa là linter vừa là GATE của ADP.
+    #
+    # Với `ruff>=0.4`, `ruff check .` là hàm của NGÀY CÀI ĐẶT chứ không phải của source: một
+    # bản ruff mới bật thêm rule ⇒ CI đỏ mà không ai đổi dòng code nào. Đã xảy ra thật —
+    # S603 land cùng spec 07 và đỏ dần theo bản ruff mới (ISSUE-019). Hệ quả nặng hơn CI đỏ:
+    # phase từng checkpoint DONE với GATE_FULL chứa `ruff check .` sẽ KHÔNG tái lập được kết
+    # quả cũ, tức EVIDENCE mất tính kiểm chứng — mà EVIDENCE tái lập được chính là thứ ADP
+    # bán. Nâng ruff từ nay là một commit CÓ CHỦ ĐÍCH, đọc changelog, sửa cái nó bắt.
+    "ruff==0.15.22",
+    # Pin cả bộ, cùng lý do: cả bốn công cụ này ĐỀU là bước trong GATE_FULL, nên phiên bản
+    # của chúng là một phần định nghĩa của "gate". `>=` biến gate thành hàm của ngày cài đặt.
+    #
+    # Đo lúc pin (2026-07-19) — cả ba đã trôi QUA MAJOR mà không ai chủ ý nâng:
+    #   mypy           khai >=1.10   → đang cài 2.3.0
+    #   pytest         khai >=8.0    → đang cài 9.1.1
+    #   pytest-asyncio khai >=0.23   → đang cài 1.4.0   (0.23 → 1.x có breaking change
+    #                                                    quanh asyncio_mode/fixture loop)
+    # Tức CI (`pip install -e ".[dev]"`, luôn lấy mới nhất) và máy dev có thể đang chạy hai
+    # bộ công cụ khác nhau, và không ai biết cho tới khi kết quả lệch.
+    #
+    # Pin = phiên bản ĐÃ verify xanh, không phải phiên bản mới nhất. Nâng là commit có chủ
+    # đích: đọc changelog, chạy GATE_FULL, sửa cái nó bắt.
+    "mypy==2.3.0",
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    # `lint-imports` là bước gate cho I1/I5, nên version của nó cũng là một phần định
+    # nghĩa của gate — pin theo đúng kỷ luật ba dòng trên.
+    #
+    # ⚠️ Số này CHƯA được CI xác nhận. Theo đúng doctrine của file này ("pin = phiên bản
+    # ĐÃ verify xanh"), chạy `pip install -e ".[dev]"` một lần, đọc `pip show import-linter`,
+    # rồi thay số ở đây bằng version thực sự đã chạy xanh.
+    "import-linter==2.3",
+]
+
+# ⚠️ CHƯA PIN: toàn bộ `[project].dependencies` runtime vẫn dùng `>=`. Đo 2026-07-19, 4 gói
+# đã trôi qua major mà không ai chủ ý nâng: `openai` >=1.30 → 2.45.0 · `redis` >=5.0 → 8.0.1
+# · `pypdf` >=4.0 → 6.14.2 · `sse-starlette` >=2.1 → 3.4.5. Đáng lo nhất là `openai`: đó là
+# SDK mà `TogetherClient` + `TogetherEmbedder` dùng để gọi Together. Pin runtime là quyết
+# định KHÁC LOẠI với pin dev-tool — nó đổi thứ chạy trong production, cần test rồi mới ký,
+# và đúng ra nên dùng lockfile chứ không phải `==` trong pyproject (pin `==` không khoá được
+# transitive dep). Chưa ai nhận — xem ISSUE-019.
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S"]
+
+[tool.ruff.lint.per-file-ignores]
+# S101 assert-used là idiom pytest. S105/S106 hardcoded password: test dùng dummy secret
+# tuỳ chỗ — production code chưa từng đọc từ literal (đọc env qua Settings), ignore trong
+# tests là an toàn và khớp intent bandit (nó cảnh báo LEAK, không phải constants trong test).
+"tests/**" = ["S101", "S105", "S106"]
+"api/**" = ["B008"]
+"auth/**" = ["B008"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+
+[[tool.mypy.overrides]]
+module = ["pypdf.*", "defusedxml.*", "pgvector.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+addopts = "-q -m 'not live'"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "live: real-net LLM smoke — nondeterministic; excluded from default gate (run with: pytest -m live)",
+]
+
+# =============================================================================
+# import-linter — cưỡng chế I1 và I5 ở tầng build.
+#
+# `[tool.importlinter]` là table header nên PHẢI ở top level, không nằm trong
+# mảng `dev = [...]` được. Thiếu block này thì lint-imports báo
+# "Missing option 'root_packages'" và không chạy.
+#
+# Lần chạy đầu SẼ đỏ — đó là mục đích. Nó in ra chính xác chỗ luồng A và luồng B
+# đang dính nhau, và danh sách đó là nội dung của A4 (tách entrypoint).
+# Đừng sửa code để nó xanh ngay; chỉ cần nó chạy được và in ra vi phạm.
+# =============================================================================
+
+[tool.importlinter]
+root_packages = ["api", "agent", "app", "auth", "channels", "db",
+                 "retrieval", "parsing", "tools", "bridge"]
+# BẮT BUỘC khi contract có forbidden_modules là package NGOÀI (I5 chặn openai).
+# Thiếu cờ này: "The top level configuration must have include_external_packages=True".
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "I1 · luồng A không thấy luồng B"
+type = "forbidden"
+source_modules = ["api.chat", "retrieval", "parsing"]
+forbidden_modules = ["api.webhook", "api.inbox", "agent.drafter", "channels", "bridge"]
+
+[[tool.importlinter.contracts]]
+# `agent.providers` CỐ Ý không có trong source_modules — đó là seam duy nhất được
+# chạm SDK. Mọi package khác, kể cả module agent khác, đều bị chặn.
+#
+# `allow_indirect_imports` BẮT BUỘC: không có nó, mọi chuỗi đi QUA seam hợp lệ
+# (api.chat -> agent.providers.together_client -> openai) cũng bị báo vi phạm,
+# và contract không bao giờ xanh được trừ khi không ai dùng provider cả.
+# Đo 2026-07-30: `openai` chỉ được import trong agent/providers/*.py, không chỗ khác.
+name = "I5 · SDK provider chỉ sống trong agent.providers"
+type = "forbidden"
+allow_indirect_imports = true
+source_modules = ["api", "app", "auth", "channels", "db", "retrieval", "parsing",
+                  "tools", "agent.drafter", "agent.pii", "agent.policy_gate",
+                  "agent.orchestrator", "agent.embedder", "agent.pii_client",
+                  "agent.persona", "agent.llm_client"]
+forbidden_modules = ["openai", "anthropic", "together", "langfuse"]
+
+[[tool.importlinter.contracts]]
+# Call-site phải đi qua seam `agent.llm_client` / `agent.embedder`, KHÔNG bind
+# provider cụ thể. Thiết kế nói đổi provider chỉ sửa một chỗ; nếu contract này
+# đỏ thì đổi provider phải sửa cả call-site.
+#
+# Đo 2026-07-30 — BROKEN, 3 edge:
+#   api.chat  -> agent.providers.together_client   (l.90)
+#   api.admin -> agent.providers.openai_embedder   (l.21)
+#   api.admin -> agent.providers.together_embedder (l.22)
+# Ba edge đó là scope của A4. Đừng sửa để nó xanh ở commit dựng hàng rào.
+name = "I5b · call-site không bind provider cụ thể"
+type = "forbidden"
+allow_indirect_imports = true
+source_modules = ["api", "app", "auth", "channels", "db", "retrieval", "parsing",
+                  "tools", "agent.drafter", "agent.orchestrator"]
+forbidden_modules = ["agent.providers"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# `packages = ["app"]` (khai báo cũ) SAI so với thực tế: chín package kia import được
+# chỉ vì mọi thứ chạy với cwd = gốc repo, và Python để cwd đầu sys.path.
+#
+# Hai hệ quả:
+#   1. `lint-imports` là console script ⇒ sys.path[0] là bin/ của venv, KHÔNG phải cwd
+#      ⇒ ModuleNotFoundError: No module named 'agent'
+#   2. `pip install .` (không -e) cho ra một wheel chỉ có `app` — không chạy được
+#
+# Sửa ở đây là sửa bug có sẵn, không phải phụ phẩm của import-linter.
+[tool.setuptools]
+packages = ["app", "agent", "api", "auth", "bridge", "channels",
+            "db", "parsing", "retrieval", "tools"]
