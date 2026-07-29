@@ -124,7 +124,8 @@ class Embedding(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
-    __table_args__ = (Index("idx_emb_shop_ns", "shop_id", "namespace"),)
+    # A1 (I2): bảng duy nhất luồng A đọc được — nằm ở schema `platform`, không phải `public`.
+    __table_args__ = (Index("idx_emb_shop_ns", "shop_id", "namespace"), {"schema": "platform"})
 
 
 class Customer(Base):

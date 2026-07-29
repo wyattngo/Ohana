@@ -9,7 +9,7 @@ services:
       POSTGRES_USER: ohana
       POSTGRES_PASSWORD: ${POSTGRES_PW}
       POSTGRES_DB: ohana
-    ports: ["5432:5432"]
+    ports: ["${OHANA_PG_PORT:-5432}:5432"]
     volumes: [pgdata:/var/lib/postgresql/data]
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "ohana", "-d", "ohana"]

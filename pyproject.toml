@@ -99,7 +99,8 @@ select = ["E", "F", "I", "B", "UP", "S"]
 # S101 assert-used là idiom pytest. S105/S106 hardcoded password: test dùng dummy secret
 # tuỳ chỗ — production code chưa từng đọc từ literal (đọc env qua Settings), ignore trong
 # tests là an toàn và khớp intent bandit (nó cảnh báo LEAK, không phải constants trong test).
-"tests/**" = ["S101", "S105", "S106"]
+# S608 SQL-injection: test contract build SQL từ hằng số module (PROBE) — không có input ngoài.
+"tests/**" = ["S101", "S105", "S106", "S608"]
 "api/**" = ["B008"]
 "auth/**" = ["B008"]
 

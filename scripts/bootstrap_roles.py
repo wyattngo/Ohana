@@ -62,8 +62,15 @@ def main() -> int:
         # ohana_migrator phải tạo được bảng trong public — đó là tiền đề của
         # `ALTER DEFAULT PRIVILEGES FOR ROLE ohana_migrator` ở revision A1.
         conn.execute("GRANT CREATE, USAGE ON SCHEMA public TO ohana_migrator")
+        # ... và tạo được SCHEMA mới (A1: `CREATE SCHEMA platform`) — quyền này
+        # nằm ở cấp database, GRANT trên schema public không phủ.
+        row = conn.execute("SELECT current_database()").fetchone()
+        if row is None:  # current_database() luôn trả 1 row — nhánh này chỉ để mypy
+            raise RuntimeError("SELECT current_database() không trả row nào")
+        dbname = row[0]
+        conn.execute(f'GRANT CREATE ON DATABASE "{dbname}" TO ohana_migrator')
         conn.execute("GRANT ohana_migrator TO CURRENT_USER")
-        print("grant ok: ohana_migrator CREATE ON public")
+        print(f"grant ok: ohana_migrator CREATE ON public + DATABASE {dbname}")
 
     return 0
 

@@ -21,7 +21,7 @@ from __future__ import annotations
 from alembic import op
 
 revision = "a1_platform_grants"
-down_revision = None  # ← đổi thành revision cuối hiện tại trước khi chạy
+down_revision = "0010"
 branch_labels = None
 depends_on = None
 
