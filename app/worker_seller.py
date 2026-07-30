@@ -34,7 +34,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from agent.llm_client import default_llm_client
 from agent.orchestrator import Drafter, receive_and_draft
 from app.runtime import setup_logging
-from db.repos import DebounceDue, MessageRepo, OutboxJob, OutboxRepo, SchedulerRepo
+from db.repos import (
+    DebounceDue,
+    MessageRepo,
+    OutboxJob,
+    OutboxPayload,
+    OutboxRepo,
+    SchedulerRepo,
+)
 from db.session import make_session_factory
 
 logger = logging.getLogger(__name__)
@@ -81,25 +88,25 @@ async def process_job(job: OutboxJob, deps: WorkerDeps) -> None:
     """Một job = một tin khách: ghi `messages` rồi đặt/đẩy lùi timer debounce.
 
     KHÔNG compose ở đây (khác A5): compose thuộc loop debounce — tách ra để N tin liên
-    tiếp của một khách thành MỘT draft thay vì N draft (w§2.2). Payload đã được webhook
-    chuẩn hoá + resolve identity (§6.1) — thiếu key là payload hỏng từ nguồn, KeyError
-    bay lên cho vòng lỗi xử lý (pending/dead), không vá tại chỗ.
+    tiếp của một khách thành MỘT draft thay vì N draft (w§2.2). Payload parse qua
+    `OutboxPayload.from_payload` — hợp đồng MỘT chỗ với webhook (ISSUE-024); row hỏng/
+    thiếu key vẫn KeyError bay lên cho vòng lỗi xử lý (pending/dead), không vá tại chỗ.
 
     Ghi message TRƯỚC set debounce: timer nổ sớm nhất cũng 5s sau, tin đã bền trong
     `messages` cho compose đọc. `append_inbound` trả False (job requeue — tin đã ghi lần
     trước) vẫn set debounce tiếp: draft có thể chưa kịp compose trước khi worker cũ chết.
     """
-    payload = job.payload
+    payload = OutboxPayload.from_payload(job.payload)
     async with deps.session_factory() as session:
         await MessageRepo(session, shop_scope=job.shop_id).append_inbound(
-            conversation_id=payload["conversation_id"],
-            customer_id=payload["customer_id"],
-            content=payload["text"],
-            platform_msg_id=payload["platform_msg_id"],
+            conversation_id=payload.conversation_id,
+            customer_id=payload.customer_id,
+            content=payload.text,
+            platform_msg_id=payload.platform_msg_id,
         )
     async with deps.session_factory() as session:
         await SchedulerRepo(session).set_debounce(
-            conversation_id=payload["conversation_id"],
+            conversation_id=payload.conversation_id,
             delay_seconds=DEBOUNCE_DELAY_SECONDS,
             trace_id=job.trace_id,
         )

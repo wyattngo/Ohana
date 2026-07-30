@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -139,12 +139,20 @@ class PendingReplyRepo:
         return row
 
     async def list_pending(self) -> Sequence[PendingReply]:
-        """List parked drafts for THIS shop, oldest-first (fair queue for the seller)."""
+        """List parked drafts for THIS shop — ESCALATE lên đầu, rồi oldest-first.
+
+        Mảnh đầu của sort §7 (`ESCALATE > window sắp hết > TTL sắp hết > mới nhất`): hai
+        khoá sau cần window/TTL wire thật (B5) — đổ bộ cùng chỗ đó. Không có khoá đầu này
+        thì `escalation_reasons` của A8 chết ở DB: draft nhạy cảm render y hệt draft FAQ
+        và xếp sau item cũ hơn (review A5-A8 #7)."""
         stmt = (
             select(PendingReply)
             .where(PendingReply.shop_id == self._shop_scope)
             .where(PendingReply.status == "pending")
-            .order_by(PendingReply.created_at)
+            .order_by(
+                (func.cardinality(PendingReply.escalation_reasons) > 0).desc(),
+                PendingReply.created_at,
+            )
         )
         return (await self._session.execute(stmt)).scalars().all()
 
@@ -505,6 +513,38 @@ _MARK_FAILED = text("""
 
 
 @dataclass(frozen=True)
+class OutboxPayload:
+    """Hợp đồng payload giữa webhook (producer, §6.1) và worker (consumer, loop outbox) —
+    MỘT nguồn sự thật cho shape đi qua ranh giới process (review A5-A8 #9, đúng bài học
+    ISSUE-024: hai bản khai của cùng khái niệm chỉ đồng bộ tới lần đổi kế tiếp; trước đây
+    shape này là dict literal ở webhook + payload[...] ở worker, đổi một bên qua mypy sạch
+    rồi mọi job mới KeyError cháy 5 attempts thành dead).
+
+    Đổi shape = đổi Ở ĐÂY, hai đầu cùng đỏ lúc type-check. `from_payload` vẫn KeyError với
+    row cũ thiếu key (deploy lệch thứ tự) — nhưng giờ nổ ở MỘT chỗ có tên, không rải rác.
+    """
+
+    conversation_id: str
+    customer_id: str
+    channel: str
+    platform_msg_id: str
+    text: str
+
+    def to_payload(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> OutboxPayload:
+        return cls(
+            conversation_id=payload["conversation_id"],
+            customer_id=payload["customer_id"],
+            channel=payload["channel"],
+            platform_msg_id=payload["platform_msg_id"],
+            text=payload["text"],
+        )
+
+
+@dataclass(frozen=True)
 class OutboxJob:
     """Một row outbox đã claim — snapshot để worker xử lý SAU khi transaction claim đã đóng."""
 
@@ -544,17 +584,26 @@ class OutboxRepo:
         """
         rows = (await self._session.execute(_CLAIM_OUTBOX)).mappings().all()
         await self._session.commit()
-        return [
-            OutboxJob(
-                outbox_id=r["outbox_id"],
-                event_id=r["event_id"],
-                shop_id=r["shop_id"],
-                payload=r["payload"],
-                attempts=r["attempts"],
-                trace_id=r["trace_id"],
-            )
-            for r in rows
-        ]
+        # Sắp lại theo outbox_id: RETURNING của UPDATE KHÔNG bảo toàn ORDER BY của
+        # subquery — hai tin liên tiếp cùng hội thoại trong một batch mà xử lý đảo thứ tự
+        # là `messages.created_at` ghi ngược, drafter đọc hội thoại tráo lượt (review
+        # A5-A8 #9b). Đủ cho 1 worker; ca ĐA worker chia burst qua SKIP LOCKED cần khoá
+        # thứ tự platform (timestamp/sequence) mang vào messages — defer tới khi scale
+        # thật, ghi ở B-item.
+        return sorted(
+            (
+                OutboxJob(
+                    outbox_id=r["outbox_id"],
+                    event_id=r["event_id"],
+                    shop_id=r["shop_id"],
+                    payload=r["payload"],
+                    attempts=r["attempts"],
+                    trace_id=r["trace_id"],
+                )
+                for r in rows
+            ),
+            key=lambda job: job.outbox_id,
+        )
 
     async def mark_done(self, outbox_id: int) -> None:
         """Row xử lý xong. Giữ row (status=done) thay vì DELETE — sổ sách cho

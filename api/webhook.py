@@ -33,7 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from channels.base import InboundChannel
 from channels.identity import resolve_conversation
-from db.repos import WebhookEventRepo
+from db.repos import OutboxPayload, WebhookEventRepo
 
 # `Drafter` import đã GỠ ở A5 — handler này không draft nữa. Bài học ISSUE-024 (Protocol
 # bản sao nói dối) vẫn áp dụng cho mọi seam khác trong file: nguồn sự thật là bên ĐỊNH
@@ -69,17 +69,25 @@ def build_router(
         # payload đã được đọc + parse trước signature verify — mất tính "verify raw bytes".
         # Giờ đọc raw body qua verify, downstream re-parse cùng bytes để đảm bảo consistency.
 
+        # G6: trace sinh Ở DÒNG ĐẦU — mọi response của handler này, KỂ CẢ nhánh lỗi, mang
+        # `X-Trace-Id` (review A5-A8: delivery bị 400/422 chính là thứ cần đối chiếu với
+        # log retry phía platform nhất, mà trước đây lại là nhánh duy nhất không trace
+        # được). Lỗi raise TRONG adapter (verify 401/400) vẫn ngoài tầm — ghi nhận, không
+        # vá hộ channel ở đây.
+        trace_id = uuid.uuid4()
+        trace_header = {"X-Trace-Id": str(trace_id)}
+
         if not enabled:
-            raise HTTPException(status_code=503, detail="webhook_disabled")
+            raise HTTPException(status_code=503, detail="webhook_disabled", headers=trace_header)
 
         adapter = channels.get(channel)
         if adapter is None:
-            raise HTTPException(status_code=404, detail="unknown_channel")
+            raise HTTPException(status_code=404, detail="unknown_channel", headers=trace_header)
 
         shop_id = endpoint_to_shop.get((channel, external_id))
         if shop_id is None:
             # Same shape as "unknown channel" — do not leak which endpoints are registered.
-            raise HTTPException(status_code=404, detail="unknown_endpoint")
+            raise HTTPException(status_code=404, detail="unknown_endpoint", headers=trace_header)
 
         # Spec 17 P1: verify signature TRƯỚC parse — chốt chặn duy nhất giữa "webhook mở"
         # và "adapter đọc payload". Verify FAIL ⇒ HTTPException 401/400 bubble lên FastAPI,
@@ -98,18 +106,17 @@ def build_router(
             raise HTTPException(
                 status_code=501,
                 detail="channel_verify_not_implemented",
+                headers=trace_header,
             )
         raw = await verify_fn(req, session_factory)
         payload = json.loads(raw)
 
-        # G6: trace sinh TẠI ĐÂY — điểm vào duy nhất của một lượt khách — rồi xuyên
-        # webhook_event_log → outbox → draft. Mọi response mang `X-Trace-Id` để đối chiếu §9.
-        trace_id = uuid.uuid4()
-
         try:
             msg = adapter.parse_inbound(payload)
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail="unparsable_payload") from exc
+            raise HTTPException(
+                status_code=400, detail="unparsable_payload", headers=trace_header
+            ) from exc
 
         # `None` = event channel CỐ Ý bỏ qua (Zalo image/sticker/oa_send_*/chưa-doc). ACK 200
         # để platform không retry — nhưng KHÔNG xử lý. Khác 400 (payload hỏng) ở chỗ đây là
@@ -122,7 +129,9 @@ def build_router(
         # xử lý không-dedup như trước A5: một channel thật thiếu msg_id là lỗi tích hợp phải
         # thấy ngay, không phải chế độ chạy. Zalo luôn có (`parse_inbound` raise nếu thiếu).
         if msg.platform_msg_id is None:
-            raise HTTPException(status_code=422, detail="missing_idempotency_key")
+            raise HTTPException(
+                status_code=422, detail="missing_idempotency_key", headers=trace_header
+            )
 
         # External identity → our identity, TRƯỚC khi enqueue: worker nhờ vậy không cần
         # adapter — payload đã mang id CỦA TA. `resolve_conversation` idempotent (ON CONFLICT
@@ -140,18 +149,20 @@ def build_router(
             # một event đã ghi ⇒ ACK 200 để nó thôi retry, KHÔNG enqueue lại (tin đã nằm
             # trong queue/messages từ lần trước). `raw_event` giữ payload thô để worker
             # re-derive được khi cần; `payload` là bản chuẩn hoá worker tiêu thụ trực tiếp.
+            # Shape payload sống ở `OutboxPayload` (ISSUE-024 — một nguồn sự thật với
+            # worker), KHÔNG phải dict literal tại chỗ.
             outbox_id = await WebhookEventRepo(session).record_and_enqueue(
                 channel=channel,
                 platform_msg_id=msg.platform_msg_id,
                 shop_id=shop_id,
                 raw_event=payload,
-                payload={
-                    "conversation_id": conversation_id,
-                    "customer_id": customer_id,
-                    "channel": channel,
-                    "platform_msg_id": msg.platform_msg_id,
-                    "text": msg.text,
-                },
+                payload=OutboxPayload(
+                    conversation_id=conversation_id,
+                    customer_id=customer_id,
+                    channel=channel,
+                    platform_msg_id=msg.platform_msg_id,
+                    text=msg.text,
+                ).to_payload(),
                 trace_id=trace_id,
             )
 
