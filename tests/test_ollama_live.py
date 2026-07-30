@@ -72,18 +72,26 @@ async def test_ollama_model_can_call_tools() -> None:
         },
     }
     client = OllamaClient()
+    # temperature=0 + chỉ dẫn cứng: đây là gate "model CÓ KHẢ NĂNG gọi tool", không phải
+    # đo tỉ lệ model CHỌN gọi (nondeterministic — đã flaky thật 2026-07-30 ở temp mặc
+    # định 0.7: cùng prompt, lần gọi lần không). Drafter thật cũng không đòi gọi ở mọi
+    # lượt: content trần khi có grounding tool đi đường _finalize (một tool duy nhất).
     step = await client.step(
         [
-            {"role": "system", "content": "Use the provided tools to answer."},
+            {
+                "role": "system",
+                "content": "You MUST call a tool. Never answer directly in text.",
+            },
             {"role": "user", "content": "How many 'ao thun trang' are left in stock?"},
         ],
         tools=[tool],
+        temperature=0.0,
         max_tokens=256,
     )
 
     assert step.tool_calls, (
-        f"model không gọi tool (content={step.content!r}) — OLLAMA_MODEL hiện tại "
-        "không dùng được cho drafter, đổi sang model tool-capable"
+        f"model không gọi tool kể cả khi bị ép (content={step.content!r}) — OLLAMA_MODEL "
+        "hiện tại không dùng được cho drafter, đổi sang model tool-capable"
     )
     assert step.tool_calls[0].name == "get_stock"
     assert "product" in step.tool_calls[0].arguments
