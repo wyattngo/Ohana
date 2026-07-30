@@ -456,6 +456,10 @@ class Shop(Base):
     id: Mapped[str] = mapped_column(Text, primary_key=True)
     name: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default="active")
+    # Trần token/ngày — nguồn cap DUY NHẤT cho pre-charge (a10, B6). Chỉnh per-shop bằng
+    # UPDATE vận hành; đổi giữa ngày KHÔNG tự lan sang cost_budget hôm nay (xem
+    # CostRepo.ensure_today — ON CONFLICT DO NOTHING có chủ đích).
+    daily_token_cap: Mapped[int] = mapped_column(Integer, nullable=False, server_default="200000")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

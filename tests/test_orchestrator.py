@@ -101,15 +101,17 @@ async def test_sensitive_intent_parks_with_sensitive_reason(fresh_db) -> None:
     )
 
     trace = uuid.uuid4()
-    reply_id = await receive_and_draft(
-        shop_id="shop_a",
-        customer_id="cust1",
-        conversation_id="conv1",
-        message="I want a refund on order O1.",
-        drafter=drafter,
-        session_factory=session_factory,
-        trace_id=trace,
-    )
+    reply_id = (
+        await receive_and_draft(
+            shop_id="shop_a",
+            customer_id="cust1",
+            conversation_id="conv1",
+            message="I want a refund on order O1.",
+            drafter=drafter,
+            session_factory=session_factory,
+            trace_id=trace,
+        )
+    ).reply_id
 
     rows = await _pending_rows(session_factory, shop_id="shop_a")
     assert len(rows) == 1
@@ -139,15 +141,17 @@ async def test_safe_intent_still_parks_with_empty_reasons(fresh_db) -> None:
         session_factory, shop_id="shop_a", customer_id="cust1", conversation_id="conv1"
     )
 
-    reply_id = await receive_and_draft(
-        shop_id="shop_a",
-        customer_id="cust1",
-        conversation_id="conv1",
-        message="What are your hours?",
-        drafter=drafter,
-        session_factory=session_factory,
-        trace_id=uuid.uuid4(),
-    )
+    reply_id = (
+        await receive_and_draft(
+            shop_id="shop_a",
+            customer_id="cust1",
+            conversation_id="conv1",
+            message="What are your hours?",
+            drafter=drafter,
+            session_factory=session_factory,
+            trace_id=uuid.uuid4(),
+        )
+    ).reply_id
 
     rows = await _pending_rows(session_factory, shop_id="shop_a")
     assert len(rows) == 1
@@ -169,15 +173,17 @@ async def test_low_confidence_persists_verbatim_and_parks(fresh_db) -> None:
         session_factory, shop_id="shop_a", customer_id="cust1", conversation_id="conv1"
     )
 
-    reply_id = await receive_and_draft(
-        shop_id="shop_a",
-        customer_id="cust1",
-        conversation_id="conv1",
-        message="Something unclear",
-        drafter=drafter,
-        session_factory=session_factory,
-        trace_id=uuid.uuid4(),
-    )
+    reply_id = (
+        await receive_and_draft(
+            shop_id="shop_a",
+            customer_id="cust1",
+            conversation_id="conv1",
+            message="Something unclear",
+            drafter=drafter,
+            session_factory=session_factory,
+            trace_id=uuid.uuid4(),
+        )
+    ).reply_id
 
     rows = await _pending_rows(session_factory, shop_id="shop_a")
     assert len(rows) == 1

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from xml.sax.saxutils import escape as xml_escape
 
@@ -115,11 +115,26 @@ EMIT_REPLY_TOOL: dict[str, Any] = {
 @dataclass(frozen=True)
 class DraftResult:
     """Kết quả một lượt draft. Cấu trúc khớp `agent.orchestrator._Draft` (text/intent/confidence)
-    để orchestrator tiêu thụ được mà drafter KHÔNG phải import orchestrator (gate ranh giới)."""
+    để orchestrator tiêu thụ được mà drafter KHÔNG phải import orchestrator (gate ranh giới).
+
+    `usage` (B6): tổng token của MỌI step trong lượt draft này (kể cả vòng tool + lượt
+    `_finalize`), cộng từ `AssistantStep.usage` per-call — KHÔNG đọc `last_usage`
+    cross-request (side-channel không thread-safe, ràng buộc T2 ghi ở OHB-6). None khi
+    provider không báo. Worker dùng số này reconcile cost reservation (§6.5b)."""
 
     text: str
     intent: str
     confidence: float
+    usage: dict[str, int] | None = None
+
+
+def _accumulate_usage(total: dict[str, int], step_usage: dict[str, int] | None) -> None:
+    """Cộng usage một step vào tổng (mutate `total`). None (provider không báo) ⇒ no-op —
+    tổng thiếu một step vẫn hơn là bịa số 0 giả."""
+    if not step_usage:
+        return
+    for key, value in step_usage.items():
+        total[key] = total.get(key, 0) + int(value)
 
 
 def _map_role(role: str) -> str:
@@ -209,11 +224,14 @@ class LLMDrafter:
             }
         )
 
+        # Cộng dồn usage per-step (B6) — xem docstring `DraftResult.usage`.
+        usage_total: dict[str, int] = {}
         for _ in range(MAX_TOOL_ROUNDS):
             step = await self._llm.step(messages, tools=self._tool_specs)
+            _accumulate_usage(usage_total, step.usage)
             emit = _extract_emit(step)
             if emit is not None:
-                return emit
+                return replace(emit, usage=usage_total or None)
             if not step.tool_calls:
                 # Model trả lời bằng `content` thay vì gọi `emit_reply`. Với grounding tools đang
                 # offer, đây là hành vi THẬT của Llama-3.3 (nó tra tool xong rồi trả lời tự nhiên,
@@ -226,7 +244,7 @@ class LLMDrafter:
                     raise ValueError(
                         "model không gọi emit_reply — không sinh draft, không bịa confidence"
                     )
-                return await self._finalize(messages, content=step.content)
+                return await self._finalize(messages, content=step.content, usage_total=usage_total)
             # Xâu lượt assistant (mang tool_calls) + kết quả mỗi tool (role=tool) để provider
             # correlate. `shop_id` xuống handler TỪ tham số draft(), KHÔNG từ tool args.
             messages.append(
@@ -247,7 +265,13 @@ class LLMDrafter:
             f"vượt {MAX_TOOL_ROUNDS} vòng tool mà model chưa gọi emit_reply — dừng, không bịa draft"
         )
 
-    async def _finalize(self, messages: list[ChatMessage], *, content: str | None) -> DraftResult:
+    async def _finalize(
+        self,
+        messages: list[ChatMessage],
+        *,
+        content: str | None,
+        usage_total: dict[str, int],
+    ) -> DraftResult:
         """Ép cấu trúc khi model đã trả lời bằng `content` thay vì `emit_reply` (D1 grounding).
 
         Xâu câu trả lời tự nhiên của model rồi gọi LẠI với CHỈ `emit_reply` (không grounding
@@ -258,9 +282,10 @@ class LLMDrafter:
         if content:
             msgs.append({"role": "assistant", "content": content})
         step = await self._llm.step(msgs, tools=[EMIT_REPLY_TOOL])
+        _accumulate_usage(usage_total, step.usage)
         emit = _extract_emit(step)
         if emit is not None:
-            return emit
+            return replace(emit, usage=usage_total or None)
         raise ValueError("model không gọi emit_reply kể cả khi chỉ offer nó — không bịa draft")
 
     async def _dispatch(self, tc: Any, *, shop_id: str, customer_id: str) -> dict[str, Any]:

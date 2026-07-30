@@ -28,6 +28,7 @@ Explicitly deferred to Phase 5+:
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from typing import Protocol
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -89,6 +90,20 @@ class Drafter(Protocol):
     ) -> _Draft: ...
 
 
+@dataclass(frozen=True)
+class DraftOutcome:
+    """Kết quả một lượt receive-and-draft (park-only — A8).
+
+    `usage` (B6): token per-call của lượt draft (từ `DraftResult.usage`, cộng per-step) —
+    worker reconcile cost reservation (§6.5b) bằng số này. KHÔNG lấy từ `last_usage`
+    (side-channel cross-request, ràng buộc T2 ghi ở OHB-6). None khi drafter không báo
+    (fake test, provider không trả usage) — caller fallback về số ước lượng đã reserve.
+    """
+
+    reply_id: str
+    usage: dict[str, int] | None = None
+
+
 async def receive_and_draft(
     *,
     shop_id: str,
@@ -98,7 +113,7 @@ async def receive_and_draft(
     drafter: Drafter,
     session_factory: async_sessionmaker[AsyncSession],
     trace_id: uuid.UUID,
-) -> str:
+) -> DraftOutcome:
     """Draft → gate → PARK. Một đường ra duy nhất (A8 · I10 — phase 1 không có nhánh gửi;
     tham số `sender` + `shop_auto_enabled_intents` đã XOÁ, không phải tạm ẩn: code path
     gửi không tồn tại thì không có gì để bảo vệ bằng if).
@@ -145,8 +160,10 @@ async def receive_and_draft(
     # flip status). Ghi lúc park hay lúc approve đều là khai "đã gửi" trong khi không ai gửi.
     # Hệ quả đã chấp nhận: reply seller duyệt không vào history cho tới khi worker gửi land.
     #
-    # Trả về CHỈ reply_id: escalation_reasons đã bền trên row — trả thêm bản sao là hai
-    # nguồn cho cùng một fact (review A5-A8), ai cần thì đọc PendingReply.
+    # Trả reply_id + usage, KHÔNG trả escalation_reasons: reasons đã bền trên row — trả
+    # thêm bản sao là hai nguồn cho cùng một fact (review A5-A8), ai cần thì đọc
+    # PendingReply. usage thì NGƯỢC LẠI không bền ở đâu cả (chưa có bảng llm_turn — O10),
+    # đường duy nhất về worker để reconcile là giá trị trả về này.
     reply_id = uuid.uuid4().hex
     async with session_factory() as session:
         repo = PendingReplyRepo(session, shop_scope=shop_id)
@@ -160,4 +177,6 @@ async def receive_and_draft(
             trace_id=trace_id,
             escalation_reasons=gate.escalation_reasons,
         )
-    return reply_id
+    # `usage` qua getattr vì `_Draft` Protocol cố ý KHÔNG đòi field này: fake drafter
+    # trong test (và impl tối giản) không phải khai — thiếu là None, worker fallback.
+    return DraftOutcome(reply_id=reply_id, usage=getattr(draft, "usage", None))

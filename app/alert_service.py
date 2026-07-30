@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 # 429 trên các request khác nhau). `int += 1` không nguyên tử dưới free-threading tương lai.
 _lock = threading.Lock()
 _provider_429_total = 0
+_cost_cap_hits: dict[str, int] = {}
 
 
 async def record_provider_429() -> None:
@@ -60,8 +61,32 @@ def provider_429_count() -> int:
         return _provider_429_total
 
 
+def record_cost_cap_hit(shop_id: str) -> None:
+    """Đếm một lượt compose bị bỏ vì shop chạm cost cap (B6 · w§2.4).
+
+    Cùng khế ước fail-OPEN với `record_provider_429`: gọi từ hot path của worker, một
+    exception thoát ra đây biến "chạm trần" thành "compose lỗi" và đi nhầm đường đếm
+    poison. Sync (không async) vì caller không cần await một phép cộng bộ nhớ.
+    """
+    with _lock:
+        _cost_cap_hits[shop_id] = _cost_cap_hits.get(shop_id, 0) + 1
+        count = _cost_cap_hits[shop_id]
+    try:
+        logger.warning("cost_cap_hit shop=%s count=%d", shop_id, count)
+    except Exception:  # noqa: S110  # pragma: no cover
+        # Cùng lý do nuốt như `record_provider_429`: thứ hỏng CHÍNH LÀ logging.
+        pass
+
+
+def cost_cap_hit_count(shop_id: str) -> int:
+    """Số lượt compose bị bỏ vì cap của shop này, trong đời tiến trình (reader test/quan sát)."""
+    with _lock:
+        return _cost_cap_hits.get(shop_id, 0)
+
+
 def _reset_for_test() -> None:
-    """Đưa bộ đếm về 0. CHỈ dùng trong test để cô lập giữa các ca — không gọi ở đường chạy thật."""
+    """Đưa MỌI bộ đếm về 0. CHỈ dùng trong test để cô lập giữa các ca — không gọi ở đường thật."""
     global _provider_429_total
     with _lock:
         _provider_429_total = 0
+        _cost_cap_hits.clear()

@@ -29,12 +29,16 @@ import sys
 import uuid
 from dataclasses import dataclass
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent.llm_client import default_llm_client
 from agent.orchestrator import Drafter, receive_and_draft
+from app import alert_service
 from app.runtime import setup_logging
+from db.models import Shop
 from db.repos import (
+    CostRepo,
     DebounceDue,
     MessageRepo,
     OutboxJob,
@@ -67,6 +71,13 @@ COMPOSE_TIMEOUT_SECONDS = 240.0
 # Đạt trần ⇒ NULL timer + GIỮ conversations.compose_failures cho vận hành query (quyết
 # 2026-07-30: dừng + counter, không park draft placeholder). Thành công ⇒ reset 0.
 MAX_COMPOSE_FAILURES = 5
+
+# Reserve ước lượng mỗi lượt draft (Wyatt duyệt spec B6): history cap 4k chars (~1.2k tok)
+# + persona + tool rounds — 8k là trần thô có lề, cùng họ số-chưa-đo ISSUE-022. Reconcile
+# §6.5b sửa sổ sách về số thật ngay sau mỗi call nên sai số chỉ sống vài giây; provider
+# không báo usage ⇒ ghi luôn ước lượng làm actual (cao hơn thật — an toàn theo chiều
+# không vượt cap).
+RESERVE_TOKENS_PER_DRAFT = 8_000
 
 
 @dataclass(frozen=True)
@@ -158,6 +169,12 @@ async def compose_due(item: DebounceDue, deps: WorkerDeps) -> bool:
 
     `trace_id` từ `debounce_trace_id` (G6 — trace của tin cuối batch); row từ trước A7
     chưa có ⇒ sinh mới, hợp lệ theo contract của `receive_and_draft`.
+
+    Pre-charge (B6 · I8): reserve TRƯỚC lời gọi LLM — chạm trần ⇒ KHÔNG gọi LLM, đếm
+    alert, trả `True` để caller finish (KHÔNG đi đường poison: cap là trạng thái ngân
+    sách, không phải lỗi compose; retry mỗi 5' tới nửa đêm chỉ spam counter). LLM nổ ⇒
+    release ngay (`reconcile(actual=0)`) rồi re-raise cho đường đếm trần; release chính
+    nó nổ thì R4 (§6.10) gỡ sau 5' — reservation không bao giờ mồ côi quá một chu kỳ reaper.
     """
     async with deps.session_factory() as session:
         latest_customer = await MessageRepo(
@@ -174,18 +191,70 @@ async def compose_due(item: DebounceDue, deps: WorkerDeps) -> bool:
             "conversation %s không có debounce_trace_id — sinh trace mới, đứt chuỗi G6",
             item.conversation_id,
         )
+    trace_id = item.trace_id if item.trace_id is not None else uuid.uuid4()
+
+    # Pre-charge §6.5 — cap đọc từ `shops.daily_token_cap` (a10, nguồn cap DUY NHẤT).
+    # `ensure_today` idempotent, KHÔNG đè cap của row ngân sách đang đếm giữa ngày.
+    async with deps.session_factory() as session:
+        cap_tokens = (
+            await session.execute(select(Shop.daily_token_cap).where(Shop.id == item.shop_id))
+        ).scalar_one()
+        cost = CostRepo(session, shop_scope=item.shop_id)
+        await cost.ensure_today(cap_tokens=cap_tokens)
+        reservation_id = await cost.reserve(tokens=RESERVE_TOKENS_PER_DRAFT, trace_id=trace_id)
+
+    if reservation_id is None:
+        # Chạm trần (hoặc fail-closed thiếu ngân sách): GIỮ im — không gọi LLM (w§2.4).
+        # Counter là tín hiệu vận hành duy nhất của nhánh này, đừng để nó âm thầm.
+        alert_service.record_cost_cap_hit(item.shop_id)
+        logger.warning(
+            "cost cap: shop %s chạm trần %s tokens/ngày — bỏ lượt compose %s (trace %s)",
+            item.shop_id,
+            cap_tokens,
+            item.conversation_id,
+            trace_id,
+        )
+        return True
 
     # Timeout BỌC cả lượt compose (LLM bên trong) — cưỡng chế O10 < 5' của R3/R4 bằng
     # code: compose sống lâu hơn mốc reaper là draft đôi (C2) + reservation bị R4 gỡ oan.
-    async with asyncio.timeout(COMPOSE_TIMEOUT_SECONDS):
-        await receive_and_draft(
-            shop_id=item.shop_id,
-            customer_id=item.customer_id,
-            conversation_id=item.conversation_id,
-            message=latest_customer.content,
-            drafter=deps.drafter,
-            session_factory=deps.session_factory,
-            trace_id=item.trace_id if item.trace_id is not None else uuid.uuid4(),
+    try:
+        async with asyncio.timeout(COMPOSE_TIMEOUT_SECONDS):
+            outcome = await receive_and_draft(
+                shop_id=item.shop_id,
+                customer_id=item.customer_id,
+                conversation_id=item.conversation_id,
+                message=latest_customer.content,
+                drafter=deps.drafter,
+                session_factory=deps.session_factory,
+                trace_id=trace_id,
+            )
+    except Exception:
+        # Release NGAY (actual=0) thay vì chờ R4: lỗi LLM thoáng qua không được giam 8k
+        # token tới 5' — cap nhỏ là vài lượt draft bị chặn oan. Release nổ thì nuốt-và-log
+        # (R4 là lưới), re-raise lỗi GỐC cho đường đếm trần poison ở loop.
+        try:
+            async with deps.session_factory() as session:
+                await CostRepo(session, shop_scope=item.shop_id).reconcile(
+                    reservation_id=reservation_id, actual_tokens=0
+                )
+        except Exception:
+            logger.exception("release reservation %s lỗi — R4 gỡ sau 5' (§6.10)", reservation_id)
+        raise
+
+    # Reconcile §6.5b về token THẬT. Provider không báo ⇒ giữ ước lượng làm actual (cao
+    # hơn thật — an toàn theo chiều không vượt cap). Trả False = R4 đã release trước
+    # (compose sát mốc 5') — token lượt này không vào sổ, chỉ log, không raise.
+    actual = (outcome.usage or {}).get("total_tokens", RESERVE_TOKENS_PER_DRAFT)
+    async with deps.session_factory() as session:
+        reconciled = await CostRepo(session, shop_scope=item.shop_id).reconcile(
+            reservation_id=reservation_id, actual_tokens=actual
+        )
+    if not reconciled:
+        logger.warning(
+            "reconcile no-op: reservation %s đã released (R4 gỡ trước?) — %s tokens không vào sổ",
+            reservation_id,
+            actual,
         )
     return True
 

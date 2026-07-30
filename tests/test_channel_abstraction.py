@@ -140,9 +140,14 @@ async def test_brand_new_channel_routes_end_to_end_without_touching_core(fresh_d
     from api.webhook import build_router
     from app.worker_seller import WorkerDeps, run_debounce_loop, run_outbox_loop
     from channels.base import InboundMessage
-    from db.models import Conversation, Customer, PendingReply
+    from db.models import Conversation, Customer, PendingReply, Shop
 
     engine, session_factory = await fresh_db()
+    # Shop row THẬT cho tenant đích: từ B6 compose đọc `shops.daily_token_cap` (fail-loud
+    # khi shop chưa provision) — endpoint map tới shop ma là lỗi cấu hình, không phải flow.
+    async with session_factory() as s:
+        s.add(Shop(id="shop_a", name="Shop A"))
+        await s.commit()
 
     class FakeChannel:
         """Một kênh tưởng tượng. Core chưa từng biết nó tồn tại.

@@ -344,15 +344,17 @@ async def test_park_writes_no_assistant_message(fresh_db) -> None:
     async with engine.begin() as c:
         cus, conv = await _seed_shop(c, shop)
 
-    reply_id = await receive_and_draft(
-        shop_id=shop,
-        customer_id=cus,
-        conversation_id=conv,
-        message="cho mình hoàn hàng",
-        drafter=_FakeDrafter(intent="complaint", confidence=0.4),
-        session_factory=sf,
-        trace_id=uuid.uuid4(),
-    )
+    reply_id = (
+        await receive_and_draft(
+            shop_id=shop,
+            customer_id=cus,
+            conversation_id=conv,
+            message="cho mình hoàn hàng",
+            drafter=_FakeDrafter(intent="complaint", confidence=0.4),
+            session_factory=sf,
+            trace_id=uuid.uuid4(),
+        )
+    ).reply_id
 
     assert reply_id
     assert await _messages(engine, shop, conv) == [], (
@@ -649,15 +651,17 @@ async def test_new_conversation_has_empty_history(fresh_db) -> None:
         cus, conv = await _seed_shop(c, shop)
 
     drafter = _HistoryCapturingDrafter()
-    reply_id = await receive_and_draft(
-        shop_id=shop,
-        customer_id=cus,
-        conversation_id=conv,
-        message="alo shop ơi",
-        drafter=drafter,
-        session_factory=sf,
-        trace_id=uuid.uuid4(),
-    )
+    reply_id = (
+        await receive_and_draft(
+            shop_id=shop,
+            customer_id=cus,
+            conversation_id=conv,
+            message="alo shop ơi",
+            drafter=drafter,
+            session_factory=sf,
+            trace_id=uuid.uuid4(),
+        )
+    ).reply_id
 
     assert reply_id
     assert drafter.seen == [], f"conversation mới phải có history rỗng, nhận {drafter.seen}"
