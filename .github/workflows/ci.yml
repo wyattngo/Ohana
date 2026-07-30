@@ -64,8 +64,13 @@ jobs:
       - name: Bootstrap roles + vector extension
         # CREATE EXTENSION cần superuser — chạy bằng owner `ohana` TRƯỚC alembic,
         # để `CREATE EXTENSION IF NOT EXISTS` trong migration 0001 thành no-op.
+        #
+        # `ohana_test`: DB RIÊNG cho pytest — fixture `fresh_db` DROP mọi bảng trên
+        # DATABASE_URL, không được trỏ nó vào DB alembic quản (conftest có guard tên
+        # `_test`). Contract tests vẫn trỏ 4 DSN role vào DB `ohana` đã migrate.
         run: |
           PGPASSWORD=ci psql -h localhost -U ohana -d ohana -c "CREATE EXTENSION IF NOT EXISTS vector"
+          PGPASSWORD=ci psql -h localhost -U ohana -d postgres -c "CREATE DATABASE ohana_test OWNER ohana"
           SUPERUSER_DSN="postgresql://ohana:ci@localhost:5432/ohana" python scripts/bootstrap_roles.py
 
       - name: Alembic upgrade head (bằng ohana_migrator)
@@ -76,6 +81,9 @@ jobs:
       - name: Pytest (kèm contract I14/I15)
         run: pytest -q
         env:
+          # DB test riêng — xem comment ở step Bootstrap. Alembic gate trong
+          # tests/test_embedding_dim.py cũng chạy trên DB này (nó tự reset từ zero).
+          DATABASE_URL: postgresql+psycopg://ohana:ci@localhost:5432/ohana_test
           MIGRATOR_DSN: postgresql://ohana_migrator:${{ env.MIGRATOR_PW }}@localhost:5432/ohana
           SVC_A_DSN: postgresql://svc_ohana_ai:${{ env.SVC_A_PW }}@localhost:5432/ohana
           SVC_B_DSN: postgresql://svc_seller:${{ env.SVC_B_PW }}@localhost:5432/ohana
