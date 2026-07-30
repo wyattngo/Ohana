@@ -38,6 +38,12 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 # bán hàng. Vẫn là open-weight ⇒ lập luận portability của ADR PRE-007 giữ nguyên.
 DEFAULT_TOGETHER_MODEL = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
 
+# Model Ollama mặc định — khớp model ĐANG CÀI trên máy dev (`ollama list`, 2026-07-30).
+# ⚠️ codellama là model code, KHÔNG hỗ trợ tool-calling qua wire OpenAI-compat của Ollama —
+# đường drafter (emit_reply là tool bắt buộc) cần model tool-capable (llama3.1+, qwen2.5...):
+# đổi bằng env OLLAMA_MODEL + `ollama pull`, không sửa code (luật §8.2 cấm hardcode call-site).
+DEFAULT_OLLAMA_MODEL = "codellama:34b"
+
 # Embedding model mặc định — ADR PRE-007 (ACCEPTED 2026-07-19) chốt e5 open-weight thay
 # `text-embedding-3-small` của OpenAI. Không lấy từ bảng giá hay `/v1/models`: spec 08 §5.1
 # gọi thật `POST /v1/embeddings` → HTTP 200, dimension THẬT = 1024. (Bài học spec 07: model
@@ -178,6 +184,24 @@ class Settings(BaseSettings):
     # Đổi default ở đây KHÔNG kéo theo migration nào (khác `openai_embed_model`): chat model
     # không đụng cột vector.
     together_model: str = DEFAULT_TOGETHER_MODEL
+
+    # ---- Ollama — provider LOCAL (OpenAI-compatible /v1), chọn qua LLM_PROVIDER=ollama.
+    #
+    # `LLM_PROVIDER`: nhánh trong `default_llm_client` (I5b — đổi provider là sửa env,
+    # call-site không đổi). Giá trị lạ ⇒ factory raise, KHÔNG âm thầm rơi về Together:
+    # một typo trong env mà vẫn chạy provider trả phí là hỏng kiểu đắt tiền.
+    llm_provider: str = "together"
+
+    # `OLLAMA_BASE_URL`: KHÁC Together — vị trí server Ollama là cấu hình TRIỂN KHAI
+    # (localhost / máy LAN / container), không phải danh tính provider, nên nó sống ở env.
+    # `host:port` trần hay kèm `/v1` đều được — adapter tự chuẩn hoá về endpoint
+    # OpenAI-compat (đã cháy thật: thiếu `/v1` ⇒ 404 "page not found" khó lần).
+    ollama_base_url: str = "http://localhost:11434/v1"
+
+    # `OLLAMA_MODEL`. Không có API key: server local không xác thực — SDK openai đòi chuỗi
+    # khác rỗng nên adapter tự điền placeholder, không có field key ở đây để khỏi gợi ý sai
+    # rằng có secret cần quản.
+    ollama_model: str = DEFAULT_OLLAMA_MODEL
 
     # `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_HOST` — tracing self-host
     # (docker-compose local, không dữ liệu nào rời hạ tầng). CẢ HAI key phải set thì

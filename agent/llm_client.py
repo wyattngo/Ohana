@@ -497,10 +497,24 @@ def default_llm_client() -> LLMClient:
     """
     from agent.pii_client import PIIFilteringClient
     from agent.providers.langfuse_tracer import default_trace_sink
-    from agent.providers.together_client import TogetherClient
     from app import alert_service
+    from app.config import get_settings
 
-    inner: LLMClient = TogetherClient(on_rate_limit=alert_service.record_provider_429)
+    # Nhánh provider theo env LLM_PROVIDER (I5b: đổi provider = đổi env, call-site không
+    # đổi). Giá trị lạ ⇒ raise, KHÔNG rơi âm thầm về Together: typo trong env mà vẫn chạy
+    # provider trả phí là hỏng kiểu đắt tiền, và lỗi lúc dựng client thì lộ ngay khi boot.
+    provider = (get_settings().llm_provider or "together").strip().lower()
+    inner: LLMClient
+    if provider == "ollama":
+        from agent.providers.ollama_client import OllamaClient
+
+        inner = OllamaClient(on_rate_limit=alert_service.record_provider_429)
+    elif provider == "together":
+        from agent.providers.together_client import TogetherClient
+
+        inner = TogetherClient(on_rate_limit=alert_service.record_provider_429)
+    else:
+        raise ValueError(f"LLM_PROVIDER={provider!r} không hỗ trợ — chọn 'together' hoặc 'ollama'")
     sink = default_trace_sink()
     if sink is not None:
         inner = TracingClient(inner, sink)
