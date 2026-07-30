@@ -12,8 +12,9 @@ services:
     ports: ["${OHANA_PG_PORT:-5432}:5432"]
     volumes: [pgdata:/var/lib/postgresql/data]
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "ohana", "-d", "ohana"]
+      test: ["CMD-SHELL", "pg_isready -U ohana -d ohana"]
       interval: 5s
+      timeout: 3s
       retries: 10
 
   langfuse-db:
@@ -23,8 +24,9 @@ services:
       POSTGRES_DB: langfuse
     volumes: [langfusedata:/var/lib/postgresql/data]
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "langfuse"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d langfuse"]
       interval: 5s
+      timeout: 3s
       retries: 10
 
   # v2, KHÔNG v3 — v3 cần ClickHouse + Redis + MinIO.
@@ -38,11 +40,10 @@ services:
       SALT: ${LANGFUSE_SALT}
       TELEMETRY_ENABLED: "false"
     ports: ["3000:3000"]
-    # `service_healthy`, không phải dạng list trần: app chạy prisma migrate ngay khi
-    # boot — thua cuộc đua với postgres là Exited(1) nằm im, `up -d` trông như xong
-    # mà :3000 chết (dính thật 2026-07-30).
     depends_on:
       langfuse-db:
         condition: service_healthy
 
-volumes: {pgdata: {}, langfusedata: {}}
+volumes:
+  pgdata: {}
+  langfusedata: {}
