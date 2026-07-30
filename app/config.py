@@ -179,6 +179,15 @@ class Settings(BaseSettings):
     # không đụng cột vector.
     together_model: str = DEFAULT_TOGETHER_MODEL
 
+    # `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_HOST` — tracing self-host
+    # (docker-compose local, không dữ liệu nào rời hạ tầng). CẢ HAI key phải set thì
+    # tracing mới bật (xem `agent/providers/langfuse_tracer.py::default_trace_sink`);
+    # thiếu một trong hai = tracing TẮT im lặng chứ không sập app — trace là phụ trợ,
+    # không phải đường sống. Secret không bao giờ được log/echo (cùng luật together key).
+    langfuse_public_key: str | None = None
+    langfuse_secret_key: str | None = None
+    langfuse_host: str = "http://localhost:3000"
+
     # `TOGETHER_EMBED_MODEL`. Default = e5 chốt ở ADR PRE-007, đã verify bằng gọi thật
     # (spec 08 §5.1: POST /v1/embeddings → 200, dim THẬT = 1024).
     #

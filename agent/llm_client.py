@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, Protocol, TypedDict
+
+logger = logging.getLogger(__name__)
 
 
 class TextPart(TypedDict):
@@ -246,6 +249,233 @@ class LLMClient(ABC):
             )
 
 
+# ── Tracing hook (I16) ──────────────────────────────────────────────────────────────
+#
+# Vị trí trong stack là toàn bộ cơ chế cưỡng chế I16 ("Langfuse chỉ nhận Scrubbed"):
+#
+#     PIIFilteringClient( TracingClient( TogetherClient ) )
+#                        ^^^^^^^^^^^^^^
+#
+# `TracingClient` nằm DƯỚI PII filter, nên messages nó thấy — và mọi thứ nó đưa cho
+# sink — đã đi qua `redact()` rồi. Không có đường code nào đưa text thô tới sink mà
+# không sửa thứ tự bọc trong `default_llm_client()`. Gate: tests/test_langfuse_wiring.py
+# ::test_sink_never_sees_raw_pii — đừng đổi thứ tự bọc mà không đọc test đó trước.
+#
+# SDK Langfuse KHÔNG import ở đây (I5): sink cụ thể sống ở
+# `agent/providers/langfuse_tracer.py`; module này chỉ khai Protocol.
+
+
+@dataclass
+class GenerationRecord:
+    """Một lượt gọi model đã hoàn tất, shape trung tính để sink ghi đi đâu tùy nó.
+
+    `input_messages` là messages ĐÃ REDACT (xem comment vị trí stack ở trên). `error`
+    non-None khi provider ném — record vẫn được ghi để trace nhìn thấy cả lượt hỏng."""
+
+    op: str  # "complete" | "stream" | "step" | "step_stream"
+    model: str | None
+    input_messages: list[ChatMessage]
+    output: str | None
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    usage: dict[str, int] | None = None
+    error: str | None = None
+
+
+class TraceSink(Protocol):
+    """Đích nhận GenerationRecord. Impl KHÔNG được ném từ `record()` — nhưng
+    `TracingClient` vẫn nuốt + log mọi exception: trace là phụ trợ, một sink hỏng
+    không được phép làm hỏng đường trả lời khách."""
+
+    def record(self, gen: GenerationRecord) -> None: ...
+
+
+class TracingClient(LLMClient):
+    """Decorator LLMClient — ghi mỗi lượt gọi model vào `sink`, delegate mọi thứ xuống
+    `inner`. Đặt DƯỚI PIIFilteringClient trong stack (xem comment I16 ở trên).
+
+    Sink lỗi ⇒ log warning, KHÔNG propagate. Provider lỗi ⇒ ghi record kèm `error` rồi
+    re-raise nguyên vẹn (design §3.5 — không nuốt exception của đường chính)."""
+
+    def __init__(self, inner: LLMClient, sink: TraceSink) -> None:
+        super().__init__()
+        self._inner = inner
+        self._sink = sink
+
+    def _emit(self, gen: GenerationRecord) -> None:
+        try:
+            self._sink.record(gen)
+        except Exception:  # noqa: BLE001 — mọi lỗi sink đều không được chạm đường chính
+            logger.warning("trace sink lỗi — bỏ qua record op=%s", gen.op, exc_info=True)
+
+    async def stream(
+        self,
+        messages: list[ChatMessage],
+        *,
+        model: str | None = None,
+        temperature: float = 0.7,
+        max_tokens: int | None = None,
+    ) -> AsyncIterator[str]:
+        chunks: list[str] = []
+        try:
+            async for delta in self._inner.stream(
+                messages, model=model, temperature=temperature, max_tokens=max_tokens
+            ):
+                chunks.append(delta)
+                yield delta
+        except Exception as exc:
+            self.last_usage = self._inner.last_usage
+            self._emit(
+                GenerationRecord(
+                    op="stream",
+                    model=model,
+                    input_messages=messages,
+                    output="".join(chunks) or None,
+                    usage=self._inner.last_usage,
+                    error=repr(exc),
+                )
+            )
+            raise
+        self.last_usage = self._inner.last_usage
+        self._emit(
+            GenerationRecord(
+                op="stream",
+                model=model,
+                input_messages=messages,
+                output="".join(chunks),
+                usage=self._inner.last_usage,
+            )
+        )
+
+    async def complete(
+        self,
+        messages: list[ChatMessage],
+        *,
+        model: str | None = None,
+        temperature: float = 0.7,
+        max_tokens: int | None = None,
+    ) -> str:
+        try:
+            out = await self._inner.complete(
+                messages, model=model, temperature=temperature, max_tokens=max_tokens
+            )
+        except Exception as exc:
+            self.last_usage = self._inner.last_usage
+            self._emit(
+                GenerationRecord(
+                    op="complete",
+                    model=model,
+                    input_messages=messages,
+                    output=None,
+                    usage=self._inner.last_usage,
+                    error=repr(exc),
+                )
+            )
+            raise
+        self.last_usage = self._inner.last_usage
+        self._emit(
+            GenerationRecord(
+                op="complete",
+                model=model,
+                input_messages=messages,
+                output=out,
+                usage=self._inner.last_usage,
+            )
+        )
+        return out
+
+    async def step(
+        self,
+        messages: list[ChatMessage],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        temperature: float = 0.7,
+        max_tokens: int | None = None,
+    ) -> AssistantStep:
+        try:
+            result = await self._inner.step(
+                messages, tools=tools, model=model, temperature=temperature, max_tokens=max_tokens
+            )
+        except Exception as exc:
+            self.last_usage = self._inner.last_usage
+            self._emit(
+                GenerationRecord(
+                    op="step",
+                    model=model,
+                    input_messages=messages,
+                    output=None,
+                    usage=self._inner.last_usage,
+                    error=repr(exc),
+                )
+            )
+            raise
+        self.last_usage = self._inner.last_usage
+        self._emit(
+            GenerationRecord(
+                op="step",
+                model=model,
+                input_messages=messages,
+                output=result.content,
+                tool_calls=list(result.tool_calls),
+                usage=result.usage,
+            )
+        )
+        return result
+
+    async def step_stream(
+        self,
+        messages: list[ChatMessage],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        temperature: float = 0.7,
+        max_tokens: int | None = None,
+        reasoning: bool = False,
+    ) -> AsyncIterator[StreamEvent]:
+        # Delegate THẲNG xuống inner (không dùng fallback của ABC): nếu inner có native
+        # streaming-with-tools thì đi đường đó; record ghi tại StreamDone.
+        chunks: list[str] = []
+        done: StreamDone | None = None
+        try:
+            async for event in self._inner.step_stream(
+                messages,
+                tools=tools,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                reasoning=reasoning,
+            ):
+                if isinstance(event, StreamTokenDelta):
+                    chunks.append(event.delta)
+                elif isinstance(event, StreamDone):
+                    done = event
+                yield event
+        except Exception as exc:
+            self.last_usage = self._inner.last_usage
+            self._emit(
+                GenerationRecord(
+                    op="step_stream",
+                    model=model,
+                    input_messages=messages,
+                    output="".join(chunks) or None,
+                    usage=self._inner.last_usage,
+                    error=repr(exc),
+                )
+            )
+            raise
+        self.last_usage = self._inner.last_usage
+        self._emit(
+            GenerationRecord(
+                op="step_stream",
+                model=model,
+                input_messages=messages,
+                output="".join(chunks) or None,
+                tool_calls=list(done.accumulated_tool_calls) if done else [],
+                usage=done.usage if done else self._inner.last_usage,
+            )
+        )
+
+
 def default_llm_client() -> LLMClient:
     """Factory — chỗ DUY NHẤT call-site lấy LLM client (I5b: đổi provider chỉ sửa ở đây).
     Chuyển từ `api/chat.py::get_llm_client` sang seam ở fix I5b; call-site giữ phần cache.
@@ -260,10 +490,18 @@ def default_llm_client() -> LLMClient:
     - `PIIFilteringClient` (spec 16 B0): bọc để MỌI call-site đi qua LLMClient tự động
       redact PII trước khi payload rời máy — chokepoint nằm trên interface, call-site
       thứ N thêm sau vẫn an toàn.
+
+    Thứ tự bọc là I16 (xem block comment TracingClient): PII NGOÀI, trace TRONG —
+    Langfuse chỉ có thể thấy text đã redact. Không có key Langfuse ⇒ sink None ⇒
+    không có tầng TracingClient, đường gọi y như trước khi wire.
     """
     from agent.pii_client import PIIFilteringClient
+    from agent.providers.langfuse_tracer import default_trace_sink
     from agent.providers.together_client import TogetherClient
     from app import alert_service
 
-    inner = TogetherClient(on_rate_limit=alert_service.record_provider_429)
+    inner: LLMClient = TogetherClient(on_rate_limit=alert_service.record_provider_429)
+    sink = default_trace_sink()
+    if sink is not None:
+        inner = TracingClient(inner, sink)
     return PIIFilteringClient(inner)

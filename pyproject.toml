@@ -40,6 +40,10 @@ dependencies = [
     "sqlalchemy==2.0.51",
     "alembic==1.18.5",
     "psycopg[binary]==3.3.4",
+    # v2 pin khớp server self-host `langfuse/langfuse:2` (docker-compose) — SDK v3 nói
+    # OTel-first cho server v3, KHÔNG trộn. Import CHỈ trong agent/providers/ (I5);
+    # payload tới Langfuse CHỈ sau PII filter (I16 — xem agent/llm_client.py).
+    "langfuse==2.60.10",
     "pgvector==0.5.0",
     "redis==8.0.1",
 ]
@@ -109,7 +113,7 @@ python_version = "3.11"
 strict = true
 
 [[tool.mypy.overrides]]
-module = ["pypdf.*", "defusedxml.*", "pgvector.*"]
+module = ["pypdf.*", "defusedxml.*", "pgvector.*", "langfuse.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
