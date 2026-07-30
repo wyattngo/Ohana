@@ -544,6 +544,173 @@ class OutboxRepo:
         await self._session.commit()
 
 
+# §6.3 NGUYÊN VĂN (design — PRE-010 C2), đổi tên theo ánh xạ: `seller.conversation` →
+# `conversations`, cột khoá `conversation_id` → `id`.
+#
+# 🚫 BỎ `debounce_claimed_at IS NULL` khỏi WHERE = hai draft cho một hội thoại — hai
+# scheduler cùng thấy "đến hạn" rồi cùng compose, và không câu nào lỗi. `IS NULL` trong
+# WHERE là TOÀN BỘ nội dung C2: Postgres serialize UPDATE trên row, đúng một bên thắng.
+_CLAIM_DEBOUNCE = text("""
+    UPDATE conversations SET debounce_claimed_at = now()
+     WHERE id = :conversation_id
+       AND next_debounce_at <= now()
+       AND debounce_claimed_at IS NULL
+    RETURNING id
+""")
+
+# Tin mới ĐẨY LÙI timer (w§2.2 coalesce) + chở trace G6 của tin cuối sang conversation.
+_SET_DEBOUNCE = text("""
+    UPDATE conversations
+       SET next_debounce_at = now() + make_interval(secs => :delay_seconds),
+           debounce_trace_id = :trace_id
+     WHERE id = :conversation_id
+""").bindparams(bindparam("trace_id", type_=Uuid()))
+
+# Đọc đúng theo partial index idx_conversations_debounce_due (predicate trùng khít).
+_DUE_CONVERSATIONS = text("""
+    SELECT id, shop_id, customer_id, channel, debounce_trace_id
+      FROM conversations
+     WHERE next_debounce_at IS NOT NULL AND debounce_claimed_at IS NULL
+       AND next_debounce_at <= now()
+     ORDER BY next_debounce_at
+     LIMIT :limit
+""")
+
+# Thả claim sau khi compose xong. `next_debounce_at` chỉ về NULL khi vẫn là timer CŨ đã
+# đến hạn — tin mới đến GIỮA lúc compose đã đặt timer tương lai thì giữ nguyên ⇒ compose
+# lại sau (O9: coalesce chỉ TRƯỚC compose; tin đến trong compose sinh draft mới sau).
+_FINISH_DEBOUNCE = text("""
+    UPDATE conversations
+       SET debounce_claimed_at = NULL,
+           next_debounce_at = CASE WHEN next_debounce_at <= now()
+                                   THEN NULL ELSE next_debounce_at END
+     WHERE id = :conversation_id
+""")
+
+# ── Reaper — 4 việc, design §3, chạy mỗi 10s. R3/R4 NGUYÊN VĂN §6.9/§6.10. ──────────────
+# R1 · draft hết TTL → expired. `expires_at IS NOT NULL`: TTL chưa wire (A0 để nullable),
+# row không TTL thì không bao giờ expire — đúng hành vi trước khi B5 wire TTL thật.
+_REAP_R1_EXPIRED_DRAFTS = text("""
+    UPDATE pending_reply SET status = 'expired'
+     WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at < now()
+""")
+
+# R2 · outbox kẹt processing >5' → pending — đóng lỗ đã khai ở A5 (worker chết giữa claim
+# và done). attempts KHÔNG tăng ở đây — §6.2 là chỗ duy nhất tăng, lần claim lại sẽ đếm.
+_REAP_R2_STUCK_OUTBOX = text("""
+    UPDATE outbox SET status = 'pending'
+     WHERE status = 'processing' AND claimed_at < now() - interval '5 minutes'
+""")
+
+# R3 · §6.9 NGUYÊN VĂN — thiếu câu này, worker chết sau §6.3 ⇒ conversation rơi khỏi
+# partial index (claimed IS NOT NULL) ⇒ im lặng VĨNH VIỄN. Đây là lý do I13 tồn tại.
+_REAP_R3_STUCK_DEBOUNCE = text("""
+    UPDATE conversations SET debounce_claimed_at = NULL
+     WHERE debounce_claimed_at < now() - interval '5 minutes'
+""")
+
+# R4 · §6.10 NGUYÊN VĂN — release reservation treo (LLM timeout giữa reserve và
+# reconcile). GREATEST(0, ...) phòng double-release; không thay cho việc release đúng.
+_REAP_R4_STUCK_RESERVATIONS = text("""
+    WITH rel AS (
+      UPDATE cost_reservation SET released_at = now()
+       WHERE released_at IS NULL AND created_at < now() - interval '5 minutes'
+      RETURNING shop_id, budget_date, tokens
+    )
+    UPDATE cost_budget b
+       SET reserved_tokens = GREATEST(0, b.reserved_tokens - r.tokens)
+      FROM rel r
+     WHERE b.shop_id = r.shop_id AND b.budget_date = r.budget_date
+""")
+
+
+@dataclass(frozen=True)
+class DebounceDue:
+    """Một conversation đến hạn compose — snapshot cho loop debounce."""
+
+    conversation_id: str
+    shop_id: str
+    customer_id: str
+    channel: str
+    trace_id: uuid.UUID | None  # None: row từ trước A7 / ghi tay — caller tự sinh trace mới
+
+
+class SchedulerRepo:
+    """Debounce scheduler + reaper (A7 · design §6.3 §6.9 §6.10 · I13, C2).
+
+    KHÔNG `shop_scope` — cùng biên nền-tảng với `OutboxRepo`: scheduler quét mọi shop theo
+    thứ tự đến hạn, không theo tenant. Tenant isolation sống ở bước compose (MessageRepo/
+    PendingReplyRepo scope theo shop_id ĐỌC TỪ ROW conversation, không từ input ngoài).
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def set_debounce(
+        self, *, conversation_id: str, delay_seconds: float, trace_id: uuid.UUID
+    ) -> None:
+        """Đặt/đẩy lùi timer compose — outbox loop gọi SAU khi ghi message. Gọi lặp với tin
+        mới là chủ đích (coalesce): timer dời về sau, draft trả lời cả cụm tin."""
+        await self._session.execute(
+            _SET_DEBOUNCE,
+            {
+                "conversation_id": conversation_id,
+                "delay_seconds": delay_seconds,
+                "trace_id": trace_id,
+            },
+        )
+        await self._session.commit()
+
+    async def due_conversations(self, *, limit: int = 20) -> list[DebounceDue]:
+        """Các conversation đến hạn compose, cũ nhất trước. Đọc KHÔNG claim — caller phải
+        `claim_debounce` từng cái trước khi compose (đọc-rồi-claim là hai bước, nhưng an
+        toàn: claim §6.3 mới là chỗ quyết, đọc chỉ để biết ứng viên)."""
+        rows = (await self._session.execute(_DUE_CONVERSATIONS, {"limit": limit})).all()
+        return [
+            DebounceDue(
+                conversation_id=r[0],
+                shop_id=r[1],
+                customer_id=r[2],
+                channel=r[3],
+                trace_id=r[4],
+            )
+            for r in rows
+        ]
+
+    async def claim_debounce(self, conversation_id: str) -> bool:
+        """§6.3 — `False` = instance khác đã lấy (hoặc chưa đến hạn) ⇒ bỏ qua, KHÔNG chờ.
+        Đúng 1 draft dù N scheduler (C2)."""
+        row = (
+            await self._session.execute(_CLAIM_DEBOUNCE, {"conversation_id": conversation_id})
+        ).first()
+        await self._session.commit()
+        return row is not None
+
+    async def finish_debounce(self, conversation_id: str) -> None:
+        """Thả claim sau compose. Compose LỖI thì ĐỪNG gọi — để claim treo cho R3 gỡ sau
+        5' là đường retry có nhịp, không retry nóng mỗi tick 500ms."""
+        await self._session.execute(_FINISH_DEBOUNCE, {"conversation_id": conversation_id})
+        await self._session.commit()
+
+    async def reap(self) -> dict[str, int]:
+        """Bốn việc reaper (design §3) trong MỘT lần gọi, trả số row mỗi việc để log.
+
+        Mỗi câu commit chung một lần — bốn việc độc lập nhau, nhưng không có lý do tách
+        transaction: reaper chạy mỗi 10s, câu nào cũng idempotent, lỗi một câu thì lần
+        chạy sau làm lại cả bốn."""
+        counts: dict[str, int] = {}
+        for name, stmt in (
+            ("r1_expired_drafts", _REAP_R1_EXPIRED_DRAFTS),
+            ("r2_stuck_outbox", _REAP_R2_STUCK_OUTBOX),
+            ("r3_stuck_debounce", _REAP_R3_STUCK_DEBOUNCE),
+            ("r4_stuck_reservations", _REAP_R4_STUCK_RESERVATIONS),
+        ):
+            result = cast("CursorResult[Any]", await self._session.execute(stmt))
+            counts[name] = int(result.rowcount or 0)
+        await self._session.commit()
+        return counts
+
+
 # §6.5 NGUYÊN VĂN (design — I8, I13), đổi tên bảng theo ánh xạ adopt-plan §1 + bind theo tên.
 #
 # 🚫 Điều kiện cap nằm TRONG WHERE của UPDATE — sức mạnh của câu này. "Đọc budget, so ở

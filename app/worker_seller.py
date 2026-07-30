@@ -1,17 +1,15 @@
-"""Entrypoint worker luồng B (A4 → A5) — loop `outbox` chạy thật; debounce §6.3 và
-reaper R3/R4 đổ bộ ở A7 (bảng/cột của chúng chưa tồn tại).
+"""Entrypoint worker luồng B (A4 → A5 → A7) — đủ 3 loop của design §3:
 
-Nhịp một job (design §3, loop `outbox` 200ms):
+| Loop       | Chu kỳ | Việc                                                        |
+|------------|--------|-------------------------------------------------------------|
+| `outbox`   | 200ms  | claim §6.2 → ghi tin khách (C1) → set debounce (coalesce)   |
+| `debounce` | 500ms  | claim §6.3 conversation đến hạn → compose draft             |
+| `reaper`   | 10s    | R1 draft hết TTL · R2 outbox kẹt · R3 §6.9 · R4 §6.10       |
 
-    claim §6.2 (commit NGAY — không giữ transaction qua lời gọi LLM)
-      → ghi tin khách vào `messages` (idempotent qua khoá C1 — requeue không nhân đôi tin)
-      → compose draft qua `receive_and_draft` (A7 sẽ thay bước này bằng "set debounce";
-        hôm nay compose trực tiếp = giữ hành vi draft-per-message có từ trước A5)
-      → `done` · lỗi ⇒ `pending` thử lại, chạm trần attempts ⇒ `dead` + `last_error`
-
-⚠️ Lỗ hổng ĐÃ BIẾT tới khi A7 land reaper R2: worker chết GIỮA claim và done thì row kẹt
-`processing` vĩnh viễn (I13 đòi reaper gỡ — R2 là mảnh của A7). Chấp nhận được ở A5 vì
-webhook chưa mount (PRE-004) nên chưa có traffic thật; KHÔNG mở webhook trước khi có R2.
+Coalesce (w§2.2): tin mới ĐẨY LÙI `next_debounce_at`, nên cụm tin gõ liên tiếp thành MỘT
+draft. Lỗi compose ⇒ để claim treo cho R3 gỡ sau 5' — retry có nhịp, không retry nóng.
+Lỗ "row kẹt processing khi worker chết" khai ở A5 đã ĐÓNG bằng R2 (I13 tròn: mọi claim —
+outbox, debounce, reservation — đều có reaper gỡ).
 
 Auto-send KHÔNG wire ở đây: `shop_auto_enabled` rỗng ⇒ policy_gate luôn park, và sender
 là chốt-nổ (`RefuseSender`) để một nhánh auto-send ngoài dự kiến chết to thay vì gửi im
@@ -28,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -37,12 +36,20 @@ from agent.llm_client import default_llm_client
 from agent.orchestrator import Drafter, receive_and_draft
 from app.runtime import setup_logging
 from bridge.zalo_sender import ZaloSender
-from db.repos import MessageRepo, OutboxJob, OutboxRepo
+from db.repos import DebounceDue, MessageRepo, OutboxJob, OutboxRepo, SchedulerRepo
 from db.session import make_session_factory
 
 logger = logging.getLogger(__name__)
 
 OUTBOX_TICK_SECONDS = 0.2  # design §3 — chu kỳ loop outbox khi queue rỗng
+DEBOUNCE_TICK_SECONDS = 0.5  # design §3 — chu kỳ quét conversation đến hạn
+REAPER_TICK_SECONDS = 10.0  # design §3 — chu kỳ reaper
+
+# Khoảng chờ coalesce: từ TIN CUỐI tới lúc compose (khác chu kỳ quét 500ms ở trên — quét
+# là nhịp nhìn đồng hồ, đây là đồng hồ). Design không chốt số (Wyatt ký 5s, 2026-07-30,
+# lượt duyệt A7). ⚠️ CHƯA ĐO trên hội thoại thật — cùng họ HISTORY caps ở orchestrator:
+# đặt số để có ràng buộc cứng từ đầu, KHÔNG phải vì tin nó đúng. Đo lại khi có traffic.
+DEBOUNCE_DELAY_SECONDS = 5.0
 
 
 class RefuseSender:
@@ -76,16 +83,20 @@ class WorkerDeps:
     shop_auto_enabled: Mapping[str, frozenset[str]] = field(default_factory=dict)
 
 
+# ── Loop 1 · outbox (§6.2) ───────────────────────────────────────────────────────────────
+
+
 async def process_job(job: OutboxJob, deps: WorkerDeps) -> None:
-    """Một job = một tin khách: ghi `messages` rồi compose draft.
+    """Một job = một tin khách: ghi `messages` rồi đặt/đẩy lùi timer debounce.
 
-    Payload đã được webhook chuẩn hoá + resolve identity (§6.1) — thiếu key là payload hỏng
-    từ nguồn, KeyError bay lên cho vòng lỗi xử lý (pending/dead), không vá tại chỗ.
+    KHÔNG compose ở đây (khác A5): compose thuộc loop debounce — tách ra để N tin liên
+    tiếp của một khách thành MỘT draft thay vì N draft (w§2.2). Payload đã được webhook
+    chuẩn hoá + resolve identity (§6.1) — thiếu key là payload hỏng từ nguồn, KeyError
+    bay lên cho vòng lỗi xử lý (pending/dead), không vá tại chỗ.
 
-    Ghi message TRƯỚC compose, cùng lý do H1 cũ: drafter nổ thì tin khách vẫn đã bền; và
-    `last_n` trong `receive_and_draft` nhờ vậy thấy tin hiện tại ở cuối history (contract
-    đã ghi ở orchestrator). `append_inbound` trả False (job requeue — tin đã ghi lần trước)
-    vẫn đi tiếp: draft có thể chưa kịp tạo trước khi worker cũ chết.
+    Ghi message TRƯỚC set debounce: timer nổ sớm nhất cũng 5s sau, tin đã bền trong
+    `messages` cho compose đọc. `append_inbound` trả False (job requeue — tin đã ghi lần
+    trước) vẫn set debounce tiếp: draft có thể chưa kịp compose trước khi worker cũ chết.
     """
     payload = job.payload
     async with deps.session_factory() as session:
@@ -95,27 +106,21 @@ async def process_job(job: OutboxJob, deps: WorkerDeps) -> None:
             content=payload["text"],
             platform_msg_id=payload["platform_msg_id"],
         )
-
-    await receive_and_draft(
-        shop_id=job.shop_id,
-        customer_id=payload["customer_id"],
-        conversation_id=payload["conversation_id"],
-        message=payload["text"],
-        drafter=deps.drafter,
-        sender=deps.senders.get(payload["channel"], _REFUSE_SENDER),
-        session_factory=deps.session_factory,
-        shop_auto_enabled_intents=deps.shop_auto_enabled.get(job.shop_id, frozenset()),
-        trace_id=job.trace_id,
-    )
+    async with deps.session_factory() as session:
+        await SchedulerRepo(session).set_debounce(
+            conversation_id=payload["conversation_id"],
+            delay_seconds=DEBOUNCE_DELAY_SECONDS,
+            trace_id=job.trace_id,
+        )
 
 
 async def run_outbox_loop(deps: WorkerDeps, *, run_once: bool = False) -> None:
     """Loop §6.2: claim → xử lý từng job → done/failed. `run_once=True` cho test.
 
     Claim mở session riêng và commit ngay bên trong `claim_batch`; mỗi lần đổi trạng thái
-    sau đó cũng session riêng — KHÔNG có transaction nào sống qua lời gọi LLM (yêu cầu
-    tường minh của §6.2). Lỗi một job không giết loop: job đó về pending/dead, job sau chạy
-    tiếp — một payload độc không được phép chặn cả queue.
+    sau đó cũng session riêng — KHÔNG có transaction nào sống qua bước xử lý (yêu cầu
+    tường minh của §6.2). Lỗi một job không giết loop: job đó về pending/dead (worker
+    chết giữa chừng thì R2 trả về pending sau 5'), job sau chạy tiếp.
     """
     while True:
         async with deps.session_factory() as session:
@@ -140,6 +145,98 @@ async def run_outbox_loop(deps: WorkerDeps, *, run_once: bool = False) -> None:
             await asyncio.sleep(OUTBOX_TICK_SECONDS)
 
 
+# ── Loop 2 · debounce (§6.3) ─────────────────────────────────────────────────────────────
+
+
+async def compose_due(item: DebounceDue, deps: WorkerDeps) -> None:
+    """Compose draft cho một conversation ĐÃ claim.
+
+    `message` = tin KHÁCH mới nhất (draft trả lời cụm tin mà nó khép lại); tin phía shop
+    chen giữa không phải câu cần trả lời. Không còn tin khách nào (đã bị dọn/edge) ⇒ bỏ
+    qua êm — không có gì để trả lời thì không draft.
+
+    `trace_id` từ `debounce_trace_id` (G6 — trace của tin cuối batch); row từ trước A7
+    chưa có ⇒ sinh mới, hợp lệ theo contract của `receive_and_draft`.
+    """
+    async with deps.session_factory() as session:
+        history = await MessageRepo(session, shop_scope=item.shop_id).last_n(
+            item.conversation_id, limit=20
+        )
+    latest_customer = next((m for m in reversed(history) if m.role == "user"), None)
+    if latest_customer is None:
+        return
+
+    await receive_and_draft(
+        shop_id=item.shop_id,
+        customer_id=item.customer_id,
+        conversation_id=item.conversation_id,
+        message=latest_customer.content,
+        drafter=deps.drafter,
+        sender=deps.senders.get(item.channel, _REFUSE_SENDER),
+        session_factory=deps.session_factory,
+        shop_auto_enabled_intents=deps.shop_auto_enabled.get(item.shop_id, frozenset()),
+        trace_id=item.trace_id if item.trace_id is not None else uuid.uuid4(),
+    )
+
+
+async def run_debounce_loop(deps: WorkerDeps, *, run_once: bool = False) -> None:
+    """Loop §6.3: đọc ứng viên đến hạn → claim từng cái → compose → thả claim.
+
+    Claim 0 row ⇒ instance khác đã lấy ⇒ bỏ qua (C2: đúng 1 draft dù N scheduler).
+    Compose LỖI ⇒ KHÔNG finish — claim treo có chủ đích, R3 gỡ sau 5' rồi lượt sau thử
+    lại; finish trong nhánh lỗi là biến retry-có-nhịp thành retry nóng mỗi 500ms.
+    """
+    while True:
+        async with deps.session_factory() as session:
+            due = await SchedulerRepo(session).due_conversations()
+
+        for item in due:
+            async with deps.session_factory() as session:
+                claimed = await SchedulerRepo(session).claim_debounce(item.conversation_id)
+            if not claimed:
+                continue
+            try:
+                await compose_due(item, deps)
+            except Exception:
+                logger.exception("compose lỗi, để R3 gỡ claim: %s", item.conversation_id)
+                continue
+            async with deps.session_factory() as session:
+                await SchedulerRepo(session).finish_debounce(item.conversation_id)
+
+        if run_once:
+            return
+        if not due:
+            await asyncio.sleep(DEBOUNCE_TICK_SECONDS)
+
+
+# ── Loop 3 · reaper (R1–R4) ──────────────────────────────────────────────────────────────
+
+
+async def run_reaper_loop(deps: WorkerDeps, *, run_once: bool = False) -> None:
+    """Bốn việc mỗi 10s. Log CHỈ khi có gì để gỡ — reaper im lặng là reaper khỏe; một dòng
+    log mỗi 10s là noise che mất chính tín hiệu nó phải phát."""
+    while True:
+        async with deps.session_factory() as session:
+            counts = await SchedulerRepo(session).reap()
+        if any(counts.values()):
+            logger.warning("reaper gỡ: %s", {k: v for k, v in counts.items() if v})
+        if run_once:
+            return
+        await asyncio.sleep(REAPER_TICK_SECONDS)
+
+
+async def run_worker(deps: WorkerDeps) -> None:
+    """Ba loop trong MỘT process (design §3 — MUST NOT tách 3 process vì 'LLM block event
+    loop'; `await` HTTP không block loop). Một loop chết = cả worker chết + exit ≠ 0:
+    worker khập khiễng (còn outbox, mất reaper) trông y hệt worker khỏe trong `ps` — đúng
+    kiểu hỏng I13 cấm. Chết to để orchestration (systemd/k8s) restart cả cụm."""
+    await asyncio.gather(
+        run_outbox_loop(deps),
+        run_debounce_loop(deps),
+        run_reaper_loop(deps),
+    )
+
+
 def main() -> int:
     setup_logging()
     # Dựng LLM client TRƯỚC khi vào loop — thiếu env provider thì thoát lỗi rõ ràng ngay
@@ -160,7 +257,7 @@ def main() -> int:
         session_factory=session_factory,
         drafter=LLMDrafter(llm, session_factory),
     )
-    asyncio.run(run_outbox_loop(deps))
+    asyncio.run(run_worker(deps))
     return 0
 
 

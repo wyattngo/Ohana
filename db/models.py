@@ -201,6 +201,18 @@ class Conversation(Base):
     window_status: Mapped[str] = mapped_column(
         Text, nullable=False, server_default="active"
     )  # active | warning | expired
+    # A7 (design §5.5 · I13, C2): timer coalesce + khoá claim của §6.3. Tin mới đẩy lùi
+    # `next_debounce_at`; `debounce_claimed_at IS NULL` trong WHERE của §6.3 là toàn bộ C2,
+    # và claim này có reaper R3 gỡ (§6.9). Đường ghi DUY NHẤT: `SchedulerRepo`.
+    next_debounce_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    debounce_claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # KHÔNG có trong design §5.5 (lỗ doc — Wyatt ký 2026-07-30, A7): chỗ trace G6 đi qua
+    # conversation khi compose sống ở loop debounce. Batch coalesce ⇒ trace của TIN CUỐI.
+    debounce_trace_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -235,6 +247,13 @@ class Conversation(Base):
             name="fk_conversations_customer_same_shop",
         ),
         Index("idx_conv_shop_last_inbound", "shop_id", "last_inbound_at"),
+        # A7 — partial index nguyên văn design §5.5: đường quét 500ms của loop debounce.
+        # Predicate trùng khít WHERE của `SchedulerRepo.due_conversations`.
+        Index(
+            "idx_conversations_debounce_due",
+            "next_debounce_at",
+            postgresql_where=text("next_debounce_at IS NOT NULL AND debounce_claimed_at IS NULL"),
+        ),
     )
 
 
