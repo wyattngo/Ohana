@@ -10,9 +10,10 @@ hiệu train (approved|rejected|edited). Trùng cho approve/reject, LỆCH cho e
 rồi duyệt = status approved nhưng label edited). Cột riêng — gộp là mất `edited` mãi mãi.
 
 B0 — webhook_event_log: idempotency ở tầng DB (workflow §2.1 ràng buộc #2). PK
-`(channel, platform_msg_id)` + `record_event` on_conflict_do_nothing ⇒ retry Zalo cùng
-payload KHÔNG nhân đôi. Repo KHÔNG shop-scoped: idempotency là biên giới nền-tảng, không
-phải dữ liệu tenant. Race-safe bằng MỘT câu insert (KHÔNG select-then-insert = ISSUE-017).
+`(channel, platform_msg_id)` + CTE §6.1 `record_and_enqueue` (A5, thay `record_event`)
+ON CONFLICT DO NOTHING ⇒ retry Zalo cùng payload KHÔNG nhân đôi: lần đầu trả `outbox_id`,
+duplicate trả `None`. Repo KHÔNG shop-scoped: idempotency là biên giới nền-tảng, không
+phải dữ liệu tenant. Race-safe bằng MỘT câu lệnh (KHÔNG select-then-insert = ISSUE-017).
 """
 
 from __future__ import annotations
@@ -52,6 +53,7 @@ async def _make_reply(session_factory, **kw):  # type: ignore[no-untyped-def]
             draft_text="chào bạn",
             intent="general_qa",
             confidence=0.5,
+            trace_id=uuid.uuid4(),
             **kw,
         )
 
@@ -146,6 +148,7 @@ async def test_label_check_constraint_rejects_bad_value(fresh_db) -> None:  # ty
                     confidence=0.5,
                     status="pending",
                     label="garbage",
+                    trace_id=uuid.uuid4(),
                 )
             )
             await s.commit()
@@ -165,64 +168,67 @@ async def _count_events(session_factory) -> int:  # type: ignore[no-untyped-def]
         return (await s.execute(select(func.count()).select_from(WebhookEventLog))).scalar_one()
 
 
-async def test_record_event_first_time_returns_true_and_creates_row(fresh_db) -> None:  # type: ignore[no-untyped-def]
+async def _record(session_factory, *, channel: str, platform_msg_id: str) -> int | None:  # type: ignore[no-untyped-def]
+    """Gọi CTE §6.1 với raw_event/payload tối thiểu — các test ở đây đo IDEMPOTENCY
+    (outbox_id vs None), không đo shape payload (đó là hợp đồng `OutboxPayload`)."""
     from db.repos import WebhookEventRepo
 
-    _, session_factory = await fresh_db()
     async with session_factory() as s:
-        first = await WebhookEventRepo(s).record_event(
-            channel="zalo", platform_msg_id="msg-1", shop_id=_SHOP
+        return await WebhookEventRepo(s).record_and_enqueue(
+            channel=channel,
+            platform_msg_id=platform_msg_id,
+            shop_id=_SHOP,
+            raw_event={"raw": True},
+            payload={"normalized": True},
+            trace_id=uuid.uuid4(),
         )
-    assert first is True
+
+
+async def test_record_first_time_returns_outbox_id_and_creates_row(fresh_db) -> None:  # type: ignore[no-untyped-def]
+    _, session_factory = await fresh_db()
+    first = await _record(session_factory, channel="zalo", platform_msg_id="msg-1")
+    assert first is not None
     assert await _count_events(session_factory) == 1
 
 
-async def test_record_event_duplicate_returns_false_single_row(fresh_db) -> None:  # type: ignore[no-untyped-def]
-    """Retry cùng key ⇒ False + vẫn 1 row. Đây là bất biến chống-nhân-đôi của webhook."""
+async def test_record_duplicate_returns_none_single_row(fresh_db) -> None:  # type: ignore[no-untyped-def]
+    """Retry cùng key ⇒ None + vẫn 1 row + was_seen True. Bất biến chống-nhân-đôi webhook."""
     from db.repos import WebhookEventRepo
 
     _, session_factory = await fresh_db()
-    async with session_factory() as s:
-        assert await WebhookEventRepo(s).record_event(
-            channel="zalo", platform_msg_id="msg-1", shop_id=_SHOP
-        )
-    async with session_factory() as s:
-        second = await WebhookEventRepo(s).record_event(
-            channel="zalo", platform_msg_id="msg-1", shop_id=_SHOP
-        )
-    assert second is False
+    assert await _record(session_factory, channel="zalo", platform_msg_id="msg-1") is not None
+    second = await _record(session_factory, channel="zalo", platform_msg_id="msg-1")
+    assert second is None
     assert await _count_events(session_factory) == 1
+    async with session_factory() as s:
+        assert await WebhookEventRepo(s).was_seen(channel="zalo", platform_msg_id="msg-1")
 
 
-async def test_record_event_key_is_channel_plus_msg_id(fresh_db) -> None:  # type: ignore[no-untyped-def]
+async def test_record_key_is_channel_plus_msg_id(fresh_db) -> None:  # type: ignore[no-untyped-def]
     """Cùng platform_msg_id nhưng KHÁC channel ⇒ 2 row (key là cặp). Và khác msg_id ⇒ 2 row."""
     from db.repos import WebhookEventRepo
 
     _, session_factory = await fresh_db()
-    async with session_factory() as s:
-        repo = WebhookEventRepo(s)
-        assert await repo.record_event(channel="zalo", platform_msg_id="m", shop_id=_SHOP)
-        assert await repo.record_event(channel="fb", platform_msg_id="m", shop_id=_SHOP)
-        assert await repo.record_event(channel="zalo", platform_msg_id="m2", shop_id=_SHOP)
+    assert await _record(session_factory, channel="zalo", platform_msg_id="m") is not None
+    assert await _record(session_factory, channel="fb", platform_msg_id="m") is not None
+    assert await _record(session_factory, channel="zalo", platform_msg_id="m2") is not None
     assert await _count_events(session_factory) == 3
+    async with session_factory() as s:
+        assert not await WebhookEventRepo(s).was_seen(channel="fb", platform_msg_id="m2")
 
 
-async def test_record_event_concurrent_same_key_yields_one_row(fresh_db) -> None:  # type: ignore[no-untyped-def]
-    """HAI record_event ĐỒNG THỜI cùng key (session riêng) ⇒ đúng MỘT row, đúng MỘT True.
+async def test_record_concurrent_same_key_yields_one_row(fresh_db) -> None:  # type: ignore[no-untyped-def]
+    """HAI record_and_enqueue ĐỒNG THỜI cùng key (session riêng) ⇒ đúng MỘT row, đúng MỘT
+    outbox_id (bên thua nhận None).
 
     Đây là ca thật của webhook: Zalo retry trong khi request đầu chưa commit. Chống trùng
-    phải ở tầng DB (on_conflict), KHÔNG select-then-insert — select-then-insert cho cả hai
-    thấy 'chưa có' rồi insert cả hai (ISSUE-017 spec 09 vừa đóng cho Conversation)."""
-    from db.repos import WebhookEventRepo
-
+    phải ở tầng DB (ON CONFLICT trong CTE §6.1), KHÔNG select-then-insert — select-then-insert
+    cho cả hai thấy 'chưa có' rồi insert cả hai (ISSUE-017 spec 09 vừa đóng cho Conversation)."""
     _, session_factory = await fresh_db()
 
-    async def _one() -> bool:
-        async with session_factory() as s:
-            return await WebhookEventRepo(s).record_event(
-                channel="zalo", platform_msg_id="race", shop_id=_SHOP
-            )
-
-    results = await asyncio.gather(_one(), _one())
-    assert sum(results) == 1, f"đúng một True mong đợi, được {results}"
+    results = await asyncio.gather(
+        _record(session_factory, channel="zalo", platform_msg_id="race"),
+        _record(session_factory, channel="zalo", platform_msg_id="race"),
+    )
+    assert sum(r is not None for r in results) == 1, f"đúng một outbox_id mong đợi: {results}"
     assert await _count_events(session_factory) == 1

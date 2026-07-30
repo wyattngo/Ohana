@@ -78,6 +78,9 @@ def _alembic_owns_this_db() -> None:
         for table in reversed(Base.metadata.sorted_tables):
             conn.execute(f'DROP TABLE IF EXISTS "{table.name}" CASCADE')
         conn.execute("DROP TABLE IF EXISTS alembic_version")
+        # ENUM sống ngoài bảng: `create_all` từ file khác tạo `outbox_status`, DROP TABLE
+        # không kéo nó theo, và a5 `CREATE TYPE` from-zero nổ DuplicateObject (đo 2026-07-30).
+        conn.execute("DROP TYPE IF EXISTS outbox_status")
 
 
 def _alembic(*args: str) -> subprocess.CompletedProcess[str]:

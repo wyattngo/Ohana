@@ -119,6 +119,8 @@ async def _seed_pending_reply(
         async with session_factory() as session:
             await _seed_parents(session, conversation_id=conversation_id, customer_id=customer_id)
             repo = PendingReplyRepo(session, shop_scope=_FIXTURE_SHOP_ID)
+            # `trace_id` BẮT BUỘC từ A5/G6 (không default — draft không trace là draft
+            # không đối chiếu được §9); test seed ngoài đường webhook nên tự sinh.
             await repo.create(
                 reply_id=reply_id,
                 conversation_id=conversation_id,
@@ -126,6 +128,7 @@ async def _seed_pending_reply(
                 draft_text=draft_text,
                 intent=intent,
                 confidence=confidence,
+                trace_id=uuid.uuid4(),
             )
     finally:
         await engine.dispose()
@@ -183,6 +186,8 @@ async def test_inbox_lists_seeded_pending_reply(
     assert row["confidence"] == pytest.approx(0.91)
     assert row["status"] == "pending"
     assert row["draft_text"].startswith("Xin chào anh/chị")
+    # A8 wire-up: inbox trả escalation_reasons cho seller — row seed không escalate ⇒ [].
+    assert row["escalation_reasons"] == []
 
 
 async def test_approve_flips_status_in_db(

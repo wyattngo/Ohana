@@ -312,6 +312,7 @@ CREATE TABLE seller.outbox (
   payload    jsonb  NOT NULL,
   status     seller.outbox_status NOT NULL DEFAULT 'pending',
   attempts   int    NOT NULL DEFAULT 0,
+  next_retry_at timestamptz,   -- backoff 2^attempts giây khi lỗi; NULL = claim được ngay (amend 2026-07-30, review A5-A8)
   claimed_at timestamptz,
   last_error text,
   trace_id   uuid   NOT NULL,
@@ -480,12 +481,19 @@ RETURNING outbox_id;
 UPDATE seller.outbox SET status='processing', claimed_at=now(), attempts=attempts+1
 WHERE outbox_id IN (
   SELECT outbox_id FROM seller.outbox
-   WHERE status='pending' ORDER BY created_at
+   WHERE status='pending'
+     AND (next_retry_at IS NULL OR next_retry_at <= now())
+   ORDER BY created_at
    FOR UPDATE SKIP LOCKED LIMIT 20
 )
 RETURNING *;
 ```
 Commit ngay sau claim. **MUST NOT** giữ transaction mở trong lúc gọi LLM.
+
+Điều kiện `next_retry_at` (amend 2026-07-30, review A5–A8): job lỗi quay về `pending` với
+`next_retry_at = now() + 2^attempts giây`. Thiếu điều kiện này, row lỗi (cũ nhất theo
+`created_at`) bị claim lại NGAY tick kế tiếp — 5 attempts cháy trong ~1 giây trước khi một
+lỗi thoáng qua kịp hết, và tin khách thành `dead` oan.
 
 ### §6.3 Claim debounce (PRE-010 C2)
 ```sql
@@ -584,13 +592,22 @@ WITH rel AS (
   UPDATE seller.cost_reservation SET released_at = now()
    WHERE released_at IS NULL AND created_at < now() - interval '5 minutes'
   RETURNING shop_id, budget_date, tokens
+), agg AS (
+  SELECT shop_id, budget_date, sum(tokens) AS tokens
+    FROM rel GROUP BY shop_id, budget_date
 )
 UPDATE seller.cost_budget b
-   SET reserved_tokens = GREATEST(0, b.reserved_tokens - r.tokens)
-  FROM rel r
- WHERE b.shop_id = r.shop_id AND b.budget_date = r.budget_date;
+   SET reserved_tokens = GREATEST(0, b.reserved_tokens - a.tokens)
+  FROM agg a
+ WHERE b.shop_id = a.shop_id AND b.budget_date = a.budget_date;
 ```
 `GREATEST(0, ...)` phòng double-release; không thay cho việc release đúng.
+
+CTE `agg` (amend 2026-07-30, review A5–A8): `UPDATE … FROM` của Postgres chỉ áp MỘT row
+FROM cho mỗi row đích — bản cũ join thẳng `rel` nên hai reservation treo cùng
+`(shop_id, budget_date)` chỉ trừ được một, phần còn lại rò trong `reserved_tokens` tới
+nửa đêm và không còn reservation chưa-release nào để R4 gỡ nữa. GROUP BY trước rồi mới
+UPDATE thì N reservation trừ đúng tổng N.
 
 ---
 

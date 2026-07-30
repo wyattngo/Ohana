@@ -438,7 +438,27 @@ def test_chat_module_cannot_reach_the_customer_send_path() -> None:
         "channels.zalo": "adapter kênh = đường ra tới khách",
         "bridge.zalo_sender": "sender = đường ra tới khách",
     }
-    hits = [f"{m} ({why})" for m, why in forbidden.items() if m in reachable]
+    # NGOẠI LỆ ĐÚNG MỘT CẠNH (A5-A8): `db/models.py` import HẰNG SỐ `SEVERITY_RANK` từ
+    # `agent.policy_gate` cho CHECK constraint `escalation_reasons_known`, nên policy_gate
+    # giờ nằm trong bao đóng của MỌI module chạm db.models. Cạnh đó là data-shape, không
+    # phải đường gửi khách — nên gate chuyển từ "membership trong bao đóng" sang "cạnh
+    # import trực tiếp": mọi module trong bao đóng của api.chat bị cấm import các module
+    # forbidden, TRỪ đúng cạnh db.models → agent.policy_gate. db.models import thêm bất kỳ
+    # thứ forbidden nào khác (orchestrator, sender...) vẫn đỏ, và module nào khác import
+    # policy_gate cũng vẫn đỏ.
+    allowed_edges = {("db.models", "agent.policy_gate")}
+    hits = []
+    for mod in sorted(reachable):
+        path = _module_path(mod)
+        if path is None:
+            continue
+        for child in _first_party_imports(path):
+            for target, why in forbidden.items():
+                if (child == target or child.startswith(target + ".")) and (
+                    mod,
+                    target,
+                ) not in allowed_edges:
+                    hits.append(f"{mod} -> {child} ({why})")
     assert not hits, "api/chat.py với tới đường gửi khách qua: " + "; ".join(hits)
 
     # `PendingReply` là hàng đợi duyệt-rồi-gửi. Chạm vào nó nghĩa là chat đang park thứ gì đó

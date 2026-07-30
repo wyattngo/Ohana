@@ -33,6 +33,9 @@ class PendingReplyOut(BaseModel):
     intent: str
     confidence: float
     status: str
+    # A8 wire-up (review A5-A8 #7): output của policy_gate tới được seller — không có
+    # field này thì draft ESCALATE render y hệt draft FAQ và toàn bộ A8 chết ở DB.
+    escalation_reasons: list[str]
 
 
 def build_router(
@@ -68,6 +71,7 @@ def build_router(
                 intent=r.intent,
                 confidence=r.confidence,
                 status=r.status,
+                escalation_reasons=r.escalation_reasons,
             )
             for r in rows
         ]

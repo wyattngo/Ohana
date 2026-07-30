@@ -1,30 +1,35 @@
-"""Orchestrator draft-and-decide flow (spec 01 Phase 5 step 14).
+"""Orchestrator receive-and-draft flow (spec 01 Sub-task E → A8 · I10).
 
-Exercises the F3 glue end-to-end WITHOUT hitting Zalo or a live LLM: the draft LLM and
-Zalo sender are Protocol-based fakes injected at call time. The gate proves two invariants:
+Exercises the F3 glue end-to-end WITHOUT Zalo or a live LLM: the drafter is a
+Protocol-based fake injected at call time.
 
-  1. Sensitive intent → park (row lands in `pending_reply`, sender NEVER called).
-  2. Safe + high-confidence + shop opted-in → send (sender called exactly once with the draft;
-     no `pending_reply` row created).
+A8: auto_send + threshold đã xoá cùng nhánh code — I10. `receive_and_draft` không còn
+nhận `sender` / `shop_auto_enabled_intents`, không trả `ReceiveOutcome`: PARK là đường ra
+DUY NHẤT, hàm trả thẳng `reply_id`. Test cũ đổi nghĩa theo:
+  - test_safe_high_confidence_auto_enabled_sends → safe intent giờ CŨNG park, chỉ khác
+    là `escalation_reasons` rỗng (không có nhánh nào chạm khách).
+  - test_low_confidence_parks_even_for_safe_intent → confidence không gate gì nữa; nó
+    chỉ được persist nguyên trạng lên row (tín hiệu train/hiển thị w§8.1).
 
-The park row's `shop_id` MUST match the identity supplied by the caller — a caller for
-shop A cannot cause a park row for shop B (S4 ownership seam).
-
-Written BEFORE `agent/orchestrator.py`, `db/repos.py`, `bridge/zalo_sender.py`, and the
-`PendingReply` model — expected RED until steps 15/16/17/18 land.
+Invariants còn lại:
+  1. Sensitive intent → park row mang `escalation_reasons == ["sensitive_intent"]`.
+  2. Park row's `shop_id` MUST match the caller identity — repo scoped to shop B never
+     sees shop A's row (S4 ownership seam).
+  3. `trace_id` truyền vào bền nguyên trạng trên row (A5/G6 — draft đối chiếu được §9).
 """
 
 from __future__ import annotations
 
-import os
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
 import pytest
+from sqlalchemy import select
 
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL", "postgresql+psycopg://ohana:ohana@localhost:5432/ohana"
-)
+from agent.orchestrator import receive_and_draft
+from db.models import Conversation, Customer, PendingReply, Shop
+from db.repos import PendingReplyRepo
 
 
 @dataclass
@@ -54,32 +59,16 @@ class _FakeDrafter:
         return _FakeDraft(text="…", intent="general_qa", confidence=0.4)
 
 
-class _FakeSender:
-    """Records send calls without any network. In prod this is bridge/zalo_sender.py."""
-
-    def __init__(self) -> None:
-        self.sends: list[dict[str, Any]] = []
-
-    async def send(self, *, shop_id: str, customer_id: str, text: str) -> None:
-        self.sends.append({"shop_id": shop_id, "customer_id": customer_id, "text": text})
-
-
 async def _seed_parents(session_factory, *, shop_id: str, customer_id: str, conversation_id: str):
-    """Create the Customer + Conversation a parked reply now references.
+    """Create the Shop + Customer + Conversation a parked reply references.
 
     Spec 06 F0 gave `pending_reply.conversation_id` / `.customer_id` composite foreign keys
-    `(shop_id, …)`. These tests used to pass invented ids straight through because the columns
-    referenced nothing; now the parents must exist, same as production.
-
-    Note these tests pass `conversation_id` EXPLICITLY from here on. `agent/orchestrator.py`
-    still falls back to `conversation_id or customer_id` — a shim from before `conversations`
-    existed, which would now FK-violate at runtime. That shim is KNOWN UNCOVERED in spec 06
-    §7 F0 and must be fixed before the webhook is mounted; these tests deliberately do not
-    exercise it rather than papering over it.
+    `(shop_id, …)`; spec 11 S0 made `shops` the parent of `shop_id`. The parents must exist,
+    same as production — invented ids straight through would FK-violate at INSERT.
     """
-    from db.models import Conversation, Customer
-
     async with session_factory() as s:
+        s.add(Shop(id=shop_id, name=f"Shop {shop_id}", status="active"))
+        await s.flush()
         s.add(Customer(id=customer_id, shop_id=shop_id, channel="zalo", external_id=customer_id))
         await s.flush()
         s.add(
@@ -90,159 +79,108 @@ async def _seed_parents(session_factory, *, shop_id: str, customer_id: str, conv
         await s.commit()
 
 
+async def _pending_rows(session_factory, *, shop_id: str) -> list[PendingReply]:
+    async with session_factory() as s:
+        return list(
+            (await s.execute(select(PendingReply).where(PendingReply.shop_id == shop_id)))
+            .scalars()
+            .all()
+        )
+
+
 @pytest.mark.asyncio
-async def test_sensitive_intent_parks_and_never_sends() -> None:
-    """Adversarial: high confidence, shop opted into auto — the sensitive-intent blocklist
-    still forces a park. Zalo sender is NEVER called."""
-    from sqlalchemy import select
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-
-    from agent.orchestrator import receive_and_draft
-    from db.models import Base, PendingReply
-    from db.repos import PendingReplyRepo
-
-    engine = create_async_engine(DATABASE_URL, echo=False)
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-        await conn.run_sync(Base.metadata.create_all)
-
-    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+async def test_sensitive_intent_parks_with_sensitive_reason(fresh_db) -> None:
+    """Adversarial: confidence cao cỡ nào thì blocklist vẫn thắng — row park mang
+    `escalation_reasons == ["sensitive_intent"]` để inbox sort nó lên đầu (§7)."""
+    _, session_factory = await fresh_db()
     drafter = _FakeDrafter(
         {"refund": _FakeDraft(text="Draft: refund reply.", intent="refund", confidence=0.99)}
     )
-    sender = _FakeSender()
-
     await _seed_parents(
         session_factory, shop_id="shop_a", customer_id="cust1", conversation_id="conv1"
     )
 
-    outcome = await receive_and_draft(
+    trace = uuid.uuid4()
+    reply_id = await receive_and_draft(
         shop_id="shop_a",
         customer_id="cust1",
         conversation_id="conv1",
         message="I want a refund on order O1.",
         drafter=drafter,
-        sender=sender,
         session_factory=session_factory,
-        shop_auto_enabled_intents=frozenset(),  # unused for sensitive — blocklist wins
+        trace_id=trace,
     )
 
-    assert outcome.action == "park"
-    assert outcome.reply_id is not None
-    assert sender.sends == [], "sensitive intent must NEVER call the sender"
-
-    async with session_factory() as s:
-        rows = (
-            (await s.execute(select(PendingReply).where(PendingReply.shop_id == "shop_a")))
-            .scalars()
-            .all()
-        )
+    rows = await _pending_rows(session_factory, shop_id="shop_a")
     assert len(rows) == 1
-    assert rows[0].status == "pending"
-    assert rows[0].intent == "refund"
-    assert rows[0].shop_id == "shop_a"
+    row = rows[0]
+    assert row.reply_id == reply_id
+    assert row.status == "pending"
+    assert row.intent == "refund"
+    assert row.shop_id == "shop_a"
+    assert row.escalation_reasons == ["sensitive_intent"]
+    assert row.trace_id == trace, "trace_id phải bền nguyên trạng trên row (A5/G6)"
 
     # Sanity: repo scoped to a DIFFERENT shop sees nothing (S4 ownership seam holds).
     async with session_factory() as s:
         other = await PendingReplyRepo(s, shop_scope="shop_b").list_pending()
     assert other == [], "cross-shop repo must not see shop_a's row"
 
-    await engine.dispose()
-
 
 @pytest.mark.asyncio
-async def test_safe_high_confidence_auto_enabled_sends() -> None:
-    """The one path that reaches the customer without a seller in the loop."""
-    from sqlalchemy import select
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-
-    from agent.orchestrator import receive_and_draft
-    from db.models import Base, PendingReply
-
-    engine = create_async_engine(DATABASE_URL, echo=False)
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-        await conn.run_sync(Base.metadata.create_all)
-
-    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+async def test_safe_intent_still_parks_with_empty_reasons(fresh_db) -> None:
+    """A8 · I10: KHÔNG có nhánh nào chạm khách — safe intent + confidence cao vẫn park.
+    Khác biệt duy nhất với sensitive: `escalation_reasons` rỗng (draft thường)."""
+    _, session_factory = await fresh_db()
     drafter = _FakeDrafter(
         {"hours": _FakeDraft(text="We are open 9-6.", intent="general_qa", confidence=0.95)}
     )
-    sender = _FakeSender()
-
-    # `_seed_parents` LÀ bắt buộc kể từ spec 10 H1. Comment cũ ở đây nói auto_send "writes
-    # NO row" nên không đụng FK nào — điều đó đúng cho tới H1, khi nhánh auto_send bắt đầu
-    # ghi `messages` (role=assistant) sau khi gửi thành công. Composite FK của H0 lập tức
-    # từ chối id giả `conv1`/`cust1`, và đó là FK làm đúng việc của nó.
     await _seed_parents(
         session_factory, shop_id="shop_a", customer_id="cust1", conversation_id="conv1"
     )
-    outcome = await receive_and_draft(
+
+    reply_id = await receive_and_draft(
         shop_id="shop_a",
         customer_id="cust1",
         conversation_id="conv1",
         message="What are your hours?",
         drafter=drafter,
-        sender=sender,
         session_factory=session_factory,
-        shop_auto_enabled_intents=frozenset({"general_qa"}),
+        trace_id=uuid.uuid4(),
     )
 
-    assert outcome.action == "auto_send"
-    assert outcome.reply_id is None
-    assert len(sender.sends) == 1
-    assert sender.sends[0] == {
-        "shop_id": "shop_a",
-        "customer_id": "cust1",
-        "text": "We are open 9-6.",
-    }
-
-    async with session_factory() as s:
-        rows = (await s.execute(select(PendingReply))).scalars().all()
-    assert rows == [], "auto_send path must NOT create a pending_reply row"
-
-    await engine.dispose()
+    rows = await _pending_rows(session_factory, shop_id="shop_a")
+    assert len(rows) == 1
+    assert rows[0].reply_id == reply_id
+    assert rows[0].status == "pending"
+    assert rows[0].draft_text == "We are open 9-6."
+    assert rows[0].escalation_reasons == []
 
 
 @pytest.mark.asyncio
-async def test_low_confidence_parks_even_for_safe_intent() -> None:
-    """Draft's own confidence is below threshold → park regardless of auto opt-in."""
-    from sqlalchemy import select
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-
-    from agent.orchestrator import receive_and_draft
-    from db.models import Base, PendingReply
-
-    engine = create_async_engine(DATABASE_URL, echo=False)
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-        await conn.run_sync(Base.metadata.create_all)
-
-    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+async def test_low_confidence_persists_verbatim_and_parks(fresh_db) -> None:
+    """Confidence không còn gate gì (A8) — draft mù mờ vẫn park như mọi draft, và con số
+    được persist NGUYÊN TRẠNG lên row cho seller/tầng train nhìn thấy, không bị chặn/sửa."""
+    _, session_factory = await fresh_db()
     drafter = _FakeDrafter(
         {"unclear": _FakeDraft(text="I'm not sure.", intent="general_qa", confidence=0.3)}
     )
-    sender = _FakeSender()
-
     await _seed_parents(
         session_factory, shop_id="shop_a", customer_id="cust1", conversation_id="conv1"
     )
 
-    outcome = await receive_and_draft(
+    reply_id = await receive_and_draft(
         shop_id="shop_a",
         customer_id="cust1",
         conversation_id="conv1",
         message="Something unclear",
         drafter=drafter,
-        sender=sender,
         session_factory=session_factory,
-        shop_auto_enabled_intents=frozenset({"general_qa"}),
+        trace_id=uuid.uuid4(),
     )
 
-    assert outcome.action == "park"
-    assert sender.sends == []
-    async with session_factory() as s:
-        rows = (await s.execute(select(PendingReply))).scalars().all()
+    rows = await _pending_rows(session_factory, shop_id="shop_a")
     assert len(rows) == 1
-
-    await engine.dispose()
+    assert rows[0].reply_id == reply_id
+    assert rows[0].confidence == pytest.approx(0.3)
+    assert rows[0].escalation_reasons == []

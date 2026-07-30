@@ -7,7 +7,8 @@ last-N history không có ai tiêu thụ. `LLMDrafter` lấp đúng chỗ đó.
 **Structured output = một tool-loop với terminal tool `emit_reply` (approach C, spec 13 §2).**
 Model được yêu cầu LUÔN kết thúc bằng `emit_reply(text, intent, confidence)`; args của tool
 đó CHÍNH LÀ output có cấu trúc. Nhờ vậy `intent`+`confidence` đến từ LLM, KHÔNG phải hằng số
-ta gán — một `confidence` bịa sẽ lái `policy_gate` auto_send bằng con số không có căn cứ.
+ta gán. (`intent` lái `policy_gate` xếp hạng escalation; `confidence` từ A8 không còn gate
+gì — nó là tín hiệu train/hiển thị w§8.1, và một con số bịa vẫn đầu độc chỗ đó.)
 
 **Ranh giới an toàn (import-graph, như `api/chat.py`).** Module này CHỈ sinh draft. Nó KHÔNG
 import `agent.policy_gate`, `agent.orchestrator`, `channels.*`, hay `bridge.*sender*` — quyết

@@ -22,6 +22,8 @@ Nghĩa là mọi assertion dưới đây kiểm **model**, không kiểm **migra
 `0006` viết sai thì suite này vẫn xanh. Tính đúng của migration có gate riêng và phải chạy
 thật: `alembic upgrade head && alembic downgrade -1 && alembic upgrade head` trong GATE_FULL.
 Đừng gộp hai thứ đó làm một.
+
+A8: các test auto_send đã xoá cùng nhánh code (I10 — phase 1 park-only).
 """
 
 from __future__ import annotations
@@ -244,16 +246,6 @@ class _FakeDrafter:
         return _FakeDraft(text=self.text, intent=self.intent, confidence=self.confidence)
 
 
-@dataclass
-class _ExplodingSender:
-    """`send()` luôn nổ — dùng cho ca (e). Ghi TRƯỚC khi gửi sẽ lộ ra ở đúng test này."""
-
-    sends: list[dict[str, str]] | None = None
-
-    async def send(self, *, shop_id: str, customer_id: str, text: str) -> None:
-        raise RuntimeError("Zalo API down")
-
-
 async def _messages(engine, shop: str, conv: str) -> list[tuple[str, str]]:
     """Trả [(role, content)] theo thứ tự thời gian cho đúng (shop, conversation)."""
     async with engine.connect() as c:
@@ -338,63 +330,31 @@ async def test_cross_shop_read_returns_empty_not_raise(fresh_db) -> None:
 
 
 @pytest.mark.asyncio
-async def test_auto_send_persists_assistant_message(fresh_db) -> None:
-    """(b) Nhánh `auto_send` ⇒ thêm ĐÚNG 1 row `role='assistant'`, SAU khi gửi thành công."""
-    from agent.orchestrator import receive_and_draft
-    from bridge.zalo_sender import MockZaloSender
-
-    engine, sf = await fresh_db()
-    shop = _uid("shop")
-    async with engine.begin() as c:
-        cus, conv = await _seed_shop(c, shop)
-
-    sender = MockZaloSender()
-    outcome = await receive_and_draft(
-        shop_id=shop,
-        customer_id=cus,
-        conversation_id=conv,
-        message="còn size M không",
-        drafter=_FakeDrafter(),
-        sender=sender,
-        session_factory=sf,
-        shop_auto_enabled_intents=frozenset({"product_info"}),
-    )
-
-    assert outcome.action == "auto_send"
-    assert len(sender.sends) == 1
-    assert await _messages(engine, shop, conv) == [("assistant", "dạ còn size M ạ")]
-
-
-@pytest.mark.asyncio
 async def test_park_writes_no_assistant_message(fresh_db) -> None:
-    """(c) Nhánh `park` ⇒ KHÔNG có row assistant.
+    """(c) Park (đường ra DUY NHẤT từ A8) ⇒ KHÔNG có row assistant.
 
     Đây là test khẳng định một QUYẾT ĐỊNH (PRE-1004 / §14 Q2: chưa ghi lúc approve), không
     phải một chi tiết kỹ thuật. Nếu ai đó sau này thêm ghi-khi-approve thì test này ĐỎ —
     đúng ý: quyết định đổi thì phải đổi tường minh, không trôi âm thầm.
     """
     from agent.orchestrator import receive_and_draft
-    from bridge.zalo_sender import MockZaloSender
 
     engine, sf = await fresh_db()
     shop = _uid("shop")
     async with engine.begin() as c:
         cus, conv = await _seed_shop(c, shop)
 
-    sender = MockZaloSender()
-    outcome = await receive_and_draft(
+    reply_id = await receive_and_draft(
         shop_id=shop,
         customer_id=cus,
         conversation_id=conv,
         message="cho mình hoàn hàng",
         drafter=_FakeDrafter(intent="complaint", confidence=0.4),
-        sender=sender,
         session_factory=sf,
-        shop_auto_enabled_intents=frozenset(),  # không opt-in ⇒ park
+        trace_id=uuid.uuid4(),
     )
 
-    assert outcome.action == "park"
-    assert sender.sends == []
+    assert reply_id
     assert await _messages(engine, shop, conv) == [], (
         "nhánh park KHÔNG được ghi message — PendingReply đã là bản ghi của nó, "
         "và chưa có worker nào thực sự gửi"
@@ -402,50 +362,22 @@ async def test_park_writes_no_assistant_message(fresh_db) -> None:
 
 
 @pytest.mark.asyncio
-async def test_failed_send_writes_no_assistant_message(fresh_db) -> None:
-    """(e) `sender.send` nổ ⇒ KHÔNG có row assistant.
-
-    Đây là test phân biệt "ghi sau khi gửi" với "ghi trước khi gửi". Ghi trước thì lịch sử
-    khai một điều chưa từng xảy ra, và AI lượt sau sẽ tưởng nó đã trả lời khách rồi.
-    """
-    from agent.orchestrator import receive_and_draft
-
-    engine, sf = await fresh_db()
-    shop = _uid("shop")
-    async with engine.begin() as c:
-        cus, conv = await _seed_shop(c, shop)
-
-    with pytest.raises(RuntimeError, match="Zalo API down"):
-        await receive_and_draft(
-            shop_id=shop,
-            customer_id=cus,
-            conversation_id=conv,
-            message="còn size M không",
-            drafter=_FakeDrafter(),
-            sender=_ExplodingSender(),
-            session_factory=sf,
-            shop_auto_enabled_intents=frozenset({"product_info"}),
-        )
-
-    assert await _messages(engine, shop, conv) == [], "gửi THẤT BẠI mà vẫn ghi assistant"
-
-
-@pytest.mark.asyncio
 async def test_inbound_persisted_through_real_webhook_route(fresh_db) -> None:
-    """(a-mạnh) HTTP POST thật → `messages` có ĐÚNG 1 row `user`, gắn Conversation THẬT.
+    """(a-mạnh) HTTP POST thật → outbox → worker ghi `messages` ĐÚNG 1 row `user`.
 
     Test `test_inbound_message_is_persisted` chỉ chạm `MessageRepo` — nó xanh kể cả khi
-    không ai gọi repo từ webhook. GOAL của H1 nói "một tin nhắn khách **đi qua webhook**",
-    nên bằng chứng phải đi hết đường: HTTP → adapter → resolve_conversation → ghi.
-
-    Dùng `park` (confidence thấp) để cô lập ĐÚNG đường ghi inbound: nếu nhánh auto_send
-    cũng chạy thì không phân biệt được row `user` đến từ webhook hay từ orchestrator.
+    không ai gọi repo từ đường webhook. GOAL của H1 nói "một tin nhắn khách **đi qua
+    webhook**", nên bằng chứng phải đi hết đường. Từ A5 webhook KHÔNG ghi `messages` nữa —
+    nó chỉ ghi sổ idempotency + enqueue outbox (§6.1) rồi ACK `queued`; tin khách do loop
+    outbox của worker ghi (`append_inbound`). Test chạy đúng chuỗi đó:
+    HTTP → adapter → resolve_conversation → enqueue → `run_outbox_loop(run_once=True)` → row.
     """
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
     from sqlalchemy import select
 
     from api.webhook import build_router
+    from app.worker_seller import WorkerDeps, run_outbox_loop
     from channels.base import InboundMessage
     from db.models import Conversation
 
@@ -460,38 +392,38 @@ async def test_inbound_persisted_through_real_webhook_route(fresh_db) -> None:
             return await req.body()
 
         def parse_inbound(self, payload):  # type: ignore[no-untyped-def]
-            return InboundMessage(external_user_id=payload["uid"], text=payload["body"])
-
-        async def send(self, *, shop_id: str, customer_id: str, text: str) -> None:
-            raise AssertionError("park path KHÔNG được gọi sender")
-
-    class LowConfDrafter:
-        async def draft(
-            self, *, shop_id: str, customer_id: str, message: str, history: list[Message]
-        ) -> _FakeDraft:
-            return _FakeDraft(text="draft ...", intent="general_qa", confidence=0.2)
+            # `platform_msg_id` BẮT BUỘC từ A5 — thiếu là webhook trả 422 (khoá idempotency).
+            return InboundMessage(
+                external_user_id=payload["uid"],
+                text=payload["body"],
+                platform_msg_id=payload["mid"],
+            )
 
     app = FastAPI()
     app.include_router(
         build_router(
-            LowConfDrafter(),
             sf,
             channels={"fakechan": FakeChannel()},  # type: ignore[dict-item]
             endpoint_to_shop={("fakechan", "EP1"): "shop_a"},
-            shop_auto_enabled={},
             enabled=True,
         )
     )
     resp = TestClient(app).post(
-        "/webhook/fakechan/EP1", json={"uid": "ext-user-9", "body": "còn size M không"}
+        "/webhook/fakechan/EP1",
+        json={"uid": "ext-user-9", "body": "còn size M không", "mid": "pmid-1"},
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["action"] == "park"
+    assert resp.json()["action"] == "queued"
+
+    # Webhook mới chỉ enqueue — chưa có row message nào cho tới khi worker chạy.
+    deps = WorkerDeps(session_factory=sf, drafter=_FakeDrafter())
+    await run_outbox_loop(deps, run_once=True)
 
     async with sf() as s:
         conv = (await s.execute(select(Conversation))).scalars().one()
     assert await _messages(engine, "shop_a", conv.id) == [("user", "còn size M không")], (
-        "tin khách phải được ghi khi đi qua webhook, gắn ĐÚNG conversation vừa resolve"
+        "tin khách phải được ghi khi đi qua webhook + outbox loop, "
+        "gắn ĐÚNG conversation vừa resolve"
     )
 
 
@@ -513,18 +445,6 @@ from agent.orchestrator import (  # noqa: E402
 )
 from db.models import Message  # noqa: E402
 from db.repos import MessageRepo  # noqa: E402
-
-
-@dataclass
-class _RecordingSender:
-    """Sender im lặng — H2 không đo đường gửi, chỉ đo history tới drafter."""
-
-    sent: list[str] | None = None
-
-    async def send(self, *, shop_id: str, customer_id: str, text: str) -> None:
-        if self.sent is None:
-            self.sent = []
-        self.sent.append(text)
 
 
 @dataclass
@@ -584,9 +504,8 @@ async def test_second_turn_drafter_receives_first_turn_history(fresh_db) -> None
         conversation_id=conv,
         message="cái áo đó còn size M không",
         drafter=drafter,
-        sender=_RecordingSender(),
         session_factory=sf,
-        shop_auto_enabled_intents=frozenset(),
+        trace_id=uuid.uuid4(),
     )
 
     assert drafter.seen == [
@@ -624,9 +543,8 @@ async def test_history_of_other_conversation_does_not_leak(fresh_db) -> None:
         conversation_id=conv_2,
         message="tiếp",
         drafter=drafter,
-        sender=_RecordingSender(),
         session_factory=sf,
-        shop_auto_enabled_intents=frozenset(),
+        trace_id=uuid.uuid4(),
     )
 
     assert drafter.seen == [("user", "KHÁCH HAI")], (
@@ -661,9 +579,8 @@ async def test_history_capped_by_message_count_keeps_newest(fresh_db) -> None:
         conversation_id=conv,
         message="tiếp",
         drafter=drafter,
-        sender=_RecordingSender(),
         session_factory=sf,
-        shop_auto_enabled_intents=frozenset(),
+        trace_id=uuid.uuid4(),
     )
 
     seen = drafter.seen or []
@@ -706,9 +623,8 @@ async def test_history_capped_by_chars_keeps_newest(fresh_db) -> None:
         conversation_id=conv,
         message="tiếp",
         drafter=drafter,
-        sender=_RecordingSender(),
         session_factory=sf,
-        shop_auto_enabled_intents=frozenset(),
+        trace_id=uuid.uuid4(),
     )
 
     seen = drafter.seen or []
@@ -733,16 +649,15 @@ async def test_new_conversation_has_empty_history(fresh_db) -> None:
         cus, conv = await _seed_shop(c, shop)
 
     drafter = _HistoryCapturingDrafter()
-    outcome = await receive_and_draft(
+    reply_id = await receive_and_draft(
         shop_id=shop,
         customer_id=cus,
         conversation_id=conv,
         message="alo shop ơi",
         drafter=drafter,
-        sender=_RecordingSender(),
         session_factory=sf,
-        shop_auto_enabled_intents=frozenset(),
+        trace_id=uuid.uuid4(),
     )
 
-    assert outcome.action == "park"
+    assert reply_id
     assert drafter.seen == [], f"conversation mới phải có history rỗng, nhận {drafter.seen}"

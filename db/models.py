@@ -14,7 +14,7 @@ ids for those relations since GĐ0 doesn't need normalized joins.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -23,11 +23,14 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import (
     BigInteger,
     CheckConstraint,
+    Date,
     DateTime,
     Float,
     ForeignKey,
     ForeignKeyConstraint,
+    Identity,
     Index,
+    Integer,
     Numeric,
     Text,
     UniqueConstraint,
@@ -35,10 +38,12 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy.dialects.postgresql import ENUM as PG_ENUM
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from agent.persona import PERSONA_MAX_CHARS
+from agent.policy_gate import SEVERITY_RANK
 from app.config import EMBED_DIM
 
 # Alias, KHÔNG phải bản sao — mọi chỗ trong file này vẫn đọc `_EMBED_DIM` như trước, nhưng giá
@@ -86,6 +91,10 @@ class Message(Base):
     customer_id: Mapped[str] = mapped_column(Text, nullable=False)
     role: Mapped[str] = mapped_column(Text, nullable=False)  # user | assistant | seller | system
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    # C1 (A5, design §5.5/§9): id tin phía platform — mang khoá dedup tầng message. NULL cho
+    # message không đến từ webhook (assistant/seller/system); UNIQUE bên dưới coi NULL là
+    # distinct nên các row đó không bị ràng.
+    platform_msg_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -95,6 +104,11 @@ class Message(Base):
         # Index thứ hai, KHÔNG thay thế cái trên: cái cũ phục vụ truy vấn theo shop, cái này
         # phục vụ đường đọc history của H2 (`last-N của conversation này`).
         Index("idx_msg_shop_conv_created", "shop_id", "conversation_id", "created_at"),
+        # C1 — chặn double-process của worker (R2 requeue ⇒ job chạy lại ⇒ append lần 2 thành
+        # no-op qua ON CONFLICT). KHÁC tầng với `webhook_event_log` (chặn retry của platform).
+        UniqueConstraint(
+            "conversation_id", "platform_msg_id", name="uq_messages_conv_platform_msg"
+        ),
         ForeignKeyConstraint(
             ["shop_id", "conversation_id"],
             ["conversations.shop_id", "conversations.id"],
@@ -188,6 +202,22 @@ class Conversation(Base):
     window_status: Mapped[str] = mapped_column(
         Text, nullable=False, server_default="active"
     )  # active | warning | expired
+    # A7 (design §5.5 · I13, C2): timer coalesce + khoá claim của §6.3. Tin mới đẩy lùi
+    # `next_debounce_at`; `debounce_claimed_at IS NULL` trong WHERE của §6.3 là toàn bộ C2,
+    # và claim này có reaper R3 gỡ (§6.9). Đường ghi DUY NHẤT: `SchedulerRepo`.
+    next_debounce_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    debounce_claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # KHÔNG có trong design §5.5 (lỗ doc — Wyatt ký 2026-07-30, A7): chỗ trace G6 đi qua
+    # conversation khi compose sống ở loop debounce. Batch coalesce ⇒ trace của TIN CUỐI.
+    debounce_trace_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
+    # A9 — trần thử lại cho đường compose (nơi duy nhất gọi LLM): lỗi ⇒ +1, thành công ⇒ 0,
+    # đạt trần ⇒ worker NULL timer và GIỮ counter cho vận hành query (poison conversation
+    # không được phép đốt LLM mỗi 5' vĩnh viễn). Xem worker_seller.MAX_COMPOSE_FAILURES.
+    compose_failures: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -222,6 +252,20 @@ class Conversation(Base):
             name="fk_conversations_customer_same_shop",
         ),
         Index("idx_conv_shop_last_inbound", "shop_id", "last_inbound_at"),
+        # A7 — partial index nguyên văn design §5.5: đường quét 500ms của loop debounce.
+        # Predicate trùng khít WHERE của `SchedulerRepo.due_conversations`.
+        Index(
+            "idx_conversations_debounce_due",
+            "next_debounce_at",
+            postgresql_where=text("next_debounce_at IS NOT NULL AND debounce_claimed_at IS NULL"),
+        ),
+        # A9 — phần BÙ của index trên, cho R3: chỉ chứa claim đang treo (vài row) để reaper
+        # 10s là index probe thay vì seq-scan toàn bảng.
+        Index(
+            "idx_conversations_debounce_claimed",
+            "debounce_claimed_at",
+            postgresql_where=text("debounce_claimed_at IS NOT NULL"),
+        ),
     )
 
 
@@ -306,6 +350,15 @@ class PendingReply(Base):
     snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     label: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # G6 (A5): trace sinh tại webhook, xuyên webhook_event_log → outbox → đây. NOT NULL và
+    # KHÔNG default — caller phải mang trace thật từ đường ingest, không được để DB bịa.
+    trace_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
+    # A8 (design §5.5 · C5, I10): output của policy_gate — lý do seller cần chú ý, sắp theo
+    # SEVERITY_RANK. Rỗng = draft thường, vẫn park (phase 1 không có nhánh gửi). CHECK ở
+    # __table_args__ chặn typo tầng DB — label bẩn đầu độc training set w§8.1.
+    escalation_reasons: Mapped[list[str]] = mapped_column(
+        ARRAY(Text), nullable=False, server_default="{}"
+    )
 
     # spec 06 F0: `conversation_id` / `customer_id` were bare Text with nothing behind them —
     # they could point at ids that never existed and Postgres accepted it. Now composite FKs,
@@ -317,6 +370,17 @@ class PendingReply(Base):
             "label IS NULL OR label IN ('approved', 'rejected', 'edited')",
             name="ck_pending_reply_label",
         ),
+        # DERIVE từ policy_gate.SEVERITY_RANK — cùng cơ chế PERSONA_MAX_CHARS ở trên:
+        # model là code SỐNG, chép tay bảy giá trị là nguồn sự thật thứ N (review A5-A8;
+        # migration a8 giữ bản chép — snapshot đóng băng đúng nghĩa migration). B4 đổi
+        # rank thì metadata tự khớp; DB thật cần migration đi kèm — gate là contract test
+        # insert đủ list(SEVERITY_RANK) qua role thật.
+        CheckConstraint(
+            "escalation_reasons <@ ARRAY["
+            + ",".join(f"'{reason}'" for reason in SEVERITY_RANK)
+            + "]::text[]",
+            name="escalation_reasons_known",
+        ),
         ForeignKeyConstraint(
             ["shop_id", "conversation_id"],
             ["conversations.shop_id", "conversations.id"],
@@ -326,6 +390,13 @@ class PendingReply(Base):
             ["shop_id", "customer_id"],
             ["customers.shop_id", "customers.id"],
             name="fk_pending_reply_customer_same_shop",
+        ),
+        # A9 — đường quét của reaper R1 (draft quá TTL, mỗi 10s): index cũ dẫn đầu bằng
+        # shop_id nên R1 không dùng được; partial này chỉ chứa draft đang chờ có TTL.
+        Index(
+            "idx_pending_reply_ttl",
+            "expires_at",
+            postgresql_where=text("status = 'pending'"),
         ),
     )
 
@@ -443,8 +514,11 @@ class WebhookEventLog(Base):
     từ `(endpoint, page_id sau verify)` và có thể là sentinel/pre-verify chưa là shop thật
     (cùng lý do `embeddings._platform`, spec 11 PRE-1104).
 
-    B0 chỉ dựng bảng + repo. Wire vào `api/webhook.py` là runtime `GD0-INGEST`, cần
-    signature-verify (`GD0-ZALO`, PRE-004) đứng trước.
+    A5 nâng cấp bảng thành nửa đầu của §6.1 (≙ `seller.webhook_seen` design §5.4):
+    `event_id` là đích FK cho `outbox`, `raw_event` giữ payload thô (worker re-derive được,
+    tin khách không mất dù worker chết trước khi ghi `messages` — O8 retention còn treo),
+    `trace_id` sinh tại webhook và xuyên suốt G6. Ghi vào đây CHỈ qua
+    `WebhookEventRepo.record_and_enqueue` — một câu CTE §6.1, I7 cấm tách đôi.
     """
 
     __tablename__ = "webhook_event_log"
@@ -452,43 +526,49 @@ class WebhookEventLog(Base):
     channel: Mapped[str] = mapped_column(Text, primary_key=True)
     platform_msg_id: Mapped[str] = mapped_column(Text, primary_key=True)
     shop_id: Mapped[str] = mapped_column(Text, nullable=False)
+    event_id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), unique=True)
+    raw_event: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    trace_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
 
 class Outbox(Base):
-    """Hàng đợi sự kiện inbound (A5, design §5.4 §6.1 §6.2) — webhook ghi, worker drain.
+    """Queue của luồng B (A5 · design §5.4 · I7). `outbox` CHÍNH LÀ queue — §10 cấm
+    Redis/RabbitMQ/SQS: broker ngoài = dual-write, tức chính bug mà §6.1 tồn tại để chặn.
 
-    ĐÂY LÀ QUEUE DUY NHẤT (design §10 cấm Redis/RabbitMQ/SQS: broker ngoài = dual-write
-    = vỡ C1). Webhook ghi row này CÙNG MỘT CÂU với `webhook_event_log` (CTE §6.1, I7 —
-    xem `OutboxRepo.record_and_enqueue`); worker claim bằng §6.2 `FOR UPDATE SKIP LOCKED`.
+    Hai đường ghi DUY NHẤT, cả hai là raw SQL nguyên văn trong `db/repos.py`:
+    enqueue qua CTE §6.1 (`record_and_enqueue` — cùng câu lệnh với `webhook_event_log`),
+    claim qua §6.2 (`OutboxRepo.claim_batch` — `FOR UPDATE SKIP LOCKED` + commit ngay).
+    Model này tồn tại cho metadata + các UPDATE trạng thái sau claim (done/lỗi), KHÔNG
+    phải để ORM-insert — insert qua ORM là tách §6.1 thành hai câu, I7 vỡ im lặng.
 
-    Lệch design-đích, có chủ đích (adopt-plan §1 — tên phẳng trong `public`):
-    - FK **compound** `(channel, platform_msg_id)` → `webhook_event_log`, thay cho
-      `event_id bigint REFERENCES seller.webhook_seen`: event log hiện tại PK compound,
-      không có surrogate id. Di cư schema `seller` thật sẽ đổi cả hai bảng cùng lúc.
-    - `payload` là message ĐÃ PARSE với ID NỘI BỘ (`{customer_id, conversation_id, text}`),
-      KHÔNG phải `raw_event` của platform như design §5.4 — O8 (OHB-12, retention NĐ13)
-      đang mở, không import thêm một chỗ giữ PII thô vĩnh viễn. `text` cùng lớp retention
-      với `messages` (đằng nào cũng đã lưu ở đó).
-    - `payload` nullable: worker NULL-out khi `done` (O8 trim — draft/messages đã giữ phần
-      cần giữ). Row `failed` giữ payload để ops nhìn được mình đã fail với input gì.
+    KHÔNG FK về `shops` — `shop_id` copy từ `webhook_event_log`, nơi nó có thể là
+    sentinel/pre-verify (PRE-1104, xem docstring `WebhookEventLog`).
 
-    I13: `claimed_at` + status `processing` là một CLAIM ⇒ PHẢI có reaper gỡ
-    (`OutboxRepo.reap_stuck`, worker loop 2). Đừng thêm trạng thái claim mới ở đây mà
-    không nối nó vào reaper.
+    `status`: pending → processing → done | dead; processing kẹt >5' do worker chết sẽ
+    được reaper R2 (A7) trả về pending. `dead` khi attempts chạm trần (quyết 2026-07-30,
+    xem `db/repos.py::OutboxRepo.MAX_ATTEMPTS`).
     """
 
     __tablename__ = "outbox"
 
-    outbox_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    channel: Mapped[str] = mapped_column(Text, nullable=False)
-    platform_msg_id: Mapped[str] = mapped_column(Text, nullable=False)
-    shop_id: Mapped[str] = mapped_column(Text, ForeignKey("shops.id"), nullable=False)
-    payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
-    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="pending")
-    attempts: Mapped[int] = mapped_column(nullable=False, server_default="0")
+    outbox_id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    event_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("webhook_event_log.event_id"), nullable=False
+    )
+    shop_id: Mapped[str] = mapped_column(Text, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    status: Mapped[str] = mapped_column(
+        PG_ENUM("pending", "processing", "done", "dead", name="outbox_status", create_type=False),
+        nullable=False,
+        server_default="pending",
+    )
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    # A9 (amend §6.2): job lỗi chờ 2^attempts giây trước khi claim lại — không có backoff
+    # thì 5 attempts cháy trong ~1s và lỗi thoáng qua cũng thành dead.
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     trace_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
@@ -497,26 +577,73 @@ class Outbox(Base):
     )
 
     __table_args__ = (
-        ForeignKeyConstraint(
-            ["channel", "platform_msg_id"],
-            ["webhook_event_log.channel", "webhook_event_log.platform_msg_id"],
-            name="fk_outbox_event",
-        ),
-        CheckConstraint(
-            "status IN ('pending', 'processing', 'done', 'failed')",
-            name="ck_outbox_status",
-        ),
-        # Hai partial index nguyên văn design §5.4 — đường quét của claim §6.2 (pending
-        # theo created_at) và của reaper (processing theo claimed_at).
+        # Hai partial index đúng design §5.4: đường claim §6.2 (pending theo created_at) và
+        # đường quét của reaper R2 (processing kẹt theo claimed_at).
+        Index("idx_outbox_pending", "created_at", postgresql_where=text("status = 'pending'")),
         Index(
-            "idx_outbox_pending_created",
+            "idx_outbox_processing", "claimed_at", postgresql_where=text("status = 'processing'")
+        ),
+    )
+
+
+class CostBudget(Base):
+    """Sổ cái cost theo ngày — một shop một ngày một row (A6 · design §5.6 · I8).
+
+    `reserved_tokens` (đang giữ chỗ) và `actual_tokens` (đã reconcile) tách bạch có chủ
+    đích: điều kiện cap của §6.5 đọc CẢ HAI trong WHERE của UPDATE — atomic, không bao giờ
+    check-rồi-update. Đường ghi DUY NHẤT là `CostRepo` (§6.5/§6.5b nguyên văn); UPDATE hai
+    cột đếm ngoài repo đó là phá I8.
+
+    FK về `shops` — KHÁC `outbox`/`webhook_event_log`: ngân sách là dữ liệu tenant thật,
+    không có ca sentinel pre-verify, shop phải tồn tại trước khi có ngân sách.
+
+    Row ngày do `CostRepo.ensure_today` tạo idempotent; §6.5 là UPDATE-first nên thiếu row
+    ⇒ reserve trả 0 row ⇒ fail-closed (coi như chạm trần, không gọi LLM — w§2.4).
+    """
+
+    __tablename__ = "cost_budget"
+
+    shop_id: Mapped[str] = mapped_column(Text, ForeignKey("shops.id"), primary_key=True)
+    budget_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    cap_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    reserved_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    actual_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+
+
+class CostReservation(Base):
+    """Một lần giữ chỗ token, CÓ DANH TÍNH (A6 · design §5.6 · I13).
+
+    Không có bảng này thì LLM timeout ⇒ `reserved_tokens` rò rỉ ⇒ shop bị khoá tới nửa
+    đêm, và reaper không có cách nào biết reservation nào treo. `released_at IS NULL` =
+    đang giữ chỗ; partial index bên dưới là đường quét của reaper R4 (§6.10 — A7).
+
+    `trace_id` nối tiếp G6: webhook → outbox → draft → reservation cùng một trace, đối
+    chiếu được ai giữ chỗ cho lượt nào. Composite FK ghim reservation vào đúng row ngân
+    sách ngày — không bao giờ trỏ vào một ngày không tồn tại.
+    """
+
+    __tablename__ = "cost_reservation"
+
+    reservation_id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    shop_id: Mapped[str] = mapped_column(Text, nullable=False)
+    budget_date: Mapped[date] = mapped_column(Date, nullable=False)
+    tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    trace_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index(
+            "idx_cost_reservation_unreleased",
             "created_at",
-            postgresql_where=text("status = 'pending'"),
+            postgresql_where=text("released_at IS NULL"),
         ),
-        Index(
-            "idx_outbox_processing_claimed",
-            "claimed_at",
-            postgresql_where=text("status = 'processing'"),
+        ForeignKeyConstraint(
+            ["shop_id", "budget_date"],
+            ["cost_budget.shop_id", "cost_budget.budget_date"],
+            name="cost_reservation_shop_id_budget_date_fkey",
         ),
     )
 

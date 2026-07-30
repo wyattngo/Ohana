@@ -282,8 +282,12 @@ def test_drafter_module_cannot_reach_the_send_path() -> None:
     assert _module_path("agent.drafter") is not None, "không tìm thấy agent/drafter.py"
     assert len(reachable) > 1, "agent/drafter.py không import gì — gate có thể vô nghĩa"
 
+    # A8: `agent.policy_gate` KHÔNG còn trong forbidden. Hai lý do: (1) nó không còn là
+    # module hành-động — nhánh auto_send/threshold đã xoá (I10), decide() chỉ xếp hạng
+    # escalation_reasons, không quyết gửi; (2) `db/models.py` import SEVERITY_RANK từ nó
+    # (CHECK escalation_reasons_known dẫn xuất từ rank), nên policy_gate nằm trong closure
+    # của MỌI module chạm db.models — cấm nó ở đây là cấm drafter dùng model/repo, vô lý.
     forbidden = {
-        "agent.policy_gate": "cổng quyết định gửi/park — drafter không được quyết",
         "agent.orchestrator": "luồng gửi/park khách",
         "bridge.zalo_sender": "sender = đường ra tới khách",
         "channels.zalo": "adapter kênh = đường ra tới khách",

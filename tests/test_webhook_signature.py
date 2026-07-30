@@ -4,15 +4,15 @@ Test level cao hơn `test_zalo_signature.py`: mock full HTTP stack qua `TestClie
 minh signature verify chạy TRƯỚC parse — nếu verify fail, `parse_inbound` KHÔNG chạy (không
 side effect, không log gợi ý payload).
 
-Cả 4 case dùng cùng cấu hình router: FakeChannel (fakechan), endpoint_to_shop, MockDrafter.
-Chỉ khác signature header và body content.
+Cả 4 case dùng cùng cấu hình router: adapter tracker + endpoint_to_shop. Chỉ khác
+signature header và body content. (A5: webhook không còn drafter/sender — router chỉ cần
+`channels` + `endpoint_to_shop`, nhánh thành công là "queued".)
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
 from typing import Any
 
 import pytest
@@ -52,22 +52,6 @@ def _build_zalo_payload(text: str = "còn hàng ko", ts: str | None = None) -> t
     return json.dumps(payload, separators=(",", ":")).encode("utf-8"), ts
 
 
-@dataclass
-class _D:
-    text: str
-    intent: str
-    confidence: float
-
-
-class _NoOpDrafter:
-    """Drafter luôn park — spec 17 P1 chỉ test verify path, không test draft."""
-
-    async def draft(
-        self, *, shop_id: str, customer_id: str, message: str, history: list[Any]
-    ) -> _D:
-        return _D(text="draft", intent="general_qa", confidence=0.2)
-
-
 class _ParseTracker:
     """Adapter ghi lại `parse_inbound` được gọi hay chưa — để chứng minh verify chạy TRƯỚC parse.
 
@@ -80,7 +64,6 @@ class _ParseTracker:
     parse_count = 0
 
     def __init__(self) -> None:
-        self.sent: list[dict[str, str]] = []
         type(self).parse_count = 0
 
     async def verify_signature(
@@ -92,12 +75,13 @@ class _ParseTracker:
 
     def parse_inbound(self, payload: dict[str, Any]) -> InboundMessage:
         type(self).parse_count += 1
+        # `platform_msg_id` BẮT BUỘC từ A5 (422 fail-loud nếu thiếu) — tracker phải cấp
+        # để nhánh verify-PASS đi tới ACK 200 thay vì chết ở khoá idempotency.
         return InboundMessage(
-            external_user_id=payload["sender"]["id"], text=payload["message"]["text"]
+            external_user_id=payload["sender"]["id"],
+            text=payload["message"]["text"],
+            platform_msg_id=payload["message"]["msg_id"],
         )
-
-    async def send(self, *, shop_id: str, customer_id: str, text: str) -> None:
-        self.sent.append({"shop_id": shop_id, "customer_id": customer_id, "text": text})
 
 
 async def _seed_zalo_token(session_factory, oa_id: str = _OA_ID) -> None:
@@ -123,11 +107,9 @@ async def _seed_zalo_token(session_factory, oa_id: str = _OA_ID) -> None:
 def _build_test_client(session_factory) -> tuple[TestClient, _ParseTracker]:
     tracker = _ParseTracker()
     router = build_router(
-        _NoOpDrafter(),
         session_factory,
         channels={"zalo": tracker},  # type: ignore[dict-item]
         endpoint_to_shop={("zalo", "EP1"): "shop_a"},
-        shop_auto_enabled={},
         enabled=True,
     )
     app = FastAPI()
@@ -151,6 +133,8 @@ async def test_endpoint_valid_signature_returns_200_and_parses(fresh_db):
     )
     assert resp.status_code == 200, resp.text
     assert tracker.parse_count == 1, "verify PASS ⇒ parse_inbound phải chạy đúng 1 lần"
+    assert resp.json()["action"] == "queued", "A5: nhánh thành công là enqueue, không draft"
+    assert resp.headers.get("X-Trace-Id"), "mọi response webhook phải mang X-Trace-Id (G6)"
 
 
 @pytest.mark.asyncio

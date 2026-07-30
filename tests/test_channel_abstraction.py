@@ -121,8 +121,9 @@ async def test_resolve_conversation_creates_and_reuses_tenant_scoped_rows(fresh_
 async def test_brand_new_channel_routes_end_to_end_without_touching_core(fresh_db) -> None:
     """Bằng chứng MẠNH của phase này (test grep source ở trên chỉ là bằng chứng yếu).
 
-    Dựng một kênh mà core chưa từng nghe tên — "fakechan" — rồi chạy hết luồng:
-    HTTP → chọn adapter → parse → resolve identity → orchestrator → park.
+    Dựng một kênh mà core chưa từng nghe tên — "fakechan" — rồi chạy hết luồng A5:
+    HTTP → chọn adapter → parse → resolve identity → enqueue ("queued") → worker outbox
+    ghi tin → worker debounce compose (orchestrator) → park.
     KHÔNG sửa một dòng nào trong `api/webhook.py` hay `agent/orchestrator.py` để test này chạy.
     Nếu abstraction chưa land thật thì không thể làm được điều đó.
 
@@ -134,8 +135,10 @@ async def test_brand_new_channel_routes_end_to_end_without_touching_core(fresh_d
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
     from sqlalchemy import select
+    from sqlalchemy import text as sa_text
 
     from api.webhook import build_router
+    from app.worker_seller import WorkerDeps, run_debounce_loop, run_outbox_loop
     from channels.base import InboundMessage
     from db.models import Conversation, Customer, PendingReply
 
@@ -160,7 +163,12 @@ async def test_brand_new_channel_routes_end_to_end_without_touching_core(fresh_d
             return await req.body()
 
         def parse_inbound(self, payload):  # type: ignore[no-untyped-def]
-            return InboundMessage(external_user_id=payload["uid"], text=payload["body"])
+            # `platform_msg_id` BẮT BUỘC từ A5 (thiếu ⇒ webhook 422 fail-loud).
+            return InboundMessage(
+                external_user_id=payload["uid"],
+                text=payload["body"],
+                platform_msg_id=payload["mid"],
+            )
 
         async def send(self, *, shop_id: str, customer_id: str, text: str) -> None:
             self.sent.append({"shop_id": shop_id, "customer_id": customer_id, "text": text})
@@ -179,21 +187,32 @@ async def test_brand_new_channel_routes_end_to_end_without_touching_core(fresh_d
 
     ch = FakeChannel()
     router = build_router(
-        LowConfDrafter(),
         session_factory,
         channels={"fakechan": ch},  # type: ignore[dict-item]
         endpoint_to_shop={("fakechan", "EP1"): "shop_a"},
-        shop_auto_enabled={},
         enabled=True,
     )
     app = FastAPI()
     app.include_router(router)
     client = TestClient(app)
 
-    resp = client.post("/webhook/fakechan/EP1", json={"uid": "ext-user-9", "body": "còn hàng ko"})
+    resp = client.post(
+        "/webhook/fakechan/EP1", json={"uid": "ext-user-9", "body": "còn hàng ko", "mid": "m-1"}
+    )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["action"] == "park", "low-confidence phải park, không gửi thẳng"
-    assert ch.sent == [], "park path KHÔNG được gọi sender"
+    assert resp.json()["action"] == "queued", "A5: webhook chỉ enqueue, không draft inline"
+
+    # Drain queue bằng worker (A5): outbox loop ghi tin, debounce loop compose → park.
+    # Timer debounce mặc định là tương lai — backdate để compose ngay trong test.
+    deps = WorkerDeps(session_factory=session_factory, drafter=LowConfDrafter())
+    await run_outbox_loop(deps, run_once=True)
+    async with session_factory() as s:
+        await s.execute(
+            sa_text("UPDATE conversations SET next_debounce_at = now() - interval '1 second'")
+        )
+        await s.commit()
+    await run_debounce_loop(deps, run_once=True)
+    assert ch.sent == [], "park path KHÔNG được gọi sender (worker không cầm sender — I10)"
 
     # Identity thật đã được tạo, và PendingReply trỏ vào ĐÚNG chúng (FK composite của F0
     # sẽ từ chối nếu resolve_conversation trả id rác).
