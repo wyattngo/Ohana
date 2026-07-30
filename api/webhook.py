@@ -22,15 +22,16 @@ When PRE-004 lands: verify the platform signature over the RAW body before parsi
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Protocol
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent.orchestrator import Drafter, ReceiveOutcome, receive_and_draft
 from channels.base import InboundChannel, OutboundChannel
 from channels.identity import resolve_conversation
-from db.repos import MessageRepo, WebhookEventRepo
+from db.repos import MessageRepo, OutboxRepo
 
 # `Drafter` import THẲNG từ `agent.orchestrator` — KHÔNG khai lại ở đây (ISSUE-024).
 #
@@ -75,6 +76,7 @@ def build_router(
         channel: str,
         external_id: str,
         req: Request,
+        response: Response,
     ) -> dict[str, object]:
         # ⚠️ `Body(...)` đã bị GỠ (spec 17 P1): FastAPI parse body TRƯỚC handler chạy, tức
         # payload đã được đọc + parse trước signature verify — mất tính "verify raw bytes".
@@ -137,34 +139,46 @@ def build_router(
                 external_thread_id=msg.external_thread_id,
             )
 
-            # Idempotency + append ATOMIC trong MỘT transaction (spec 17 P3 review HIGH fix).
-            # Thứ tự & atomicity là chốt chặn silent-message-loss: record_event ghi TRƯỚC
-            # append nhưng CHỈ commit CÙNG append (commit=False cả hai). Nếu tách commit —
-            # record 'processed' rồi append lỗi → retry thấy duplicate → DROP tin khách vĩnh
-            # viễn (Zalo không cho đọc lại). Với atomic: append lỗi ⇒ record cũng rollback ⇒
-            # retry reprocess ⇒ tin không mất. record_event=False (duplicate thật) ⇒ rollback
-            # + ACK 200: tin đã nằm trong log từ lần commit trước, không xử lý lại.
+            # A5: nhánh có khoá idempotency ⇒ ENQUEUE, không draft inline. Ba việc trong
+            # MỘT transaction: (event ghi nhận ⟺ vào queue) là MỘT CÂU CTE §6.1 (I7 —
+            # tách hai INSERT là bug im lặng, xem docstring `OutboxRepo`), + append message
+            # cùng commit (bài spec 17 P3 giữ nguyên: append lỗi ⇒ cả event lẫn queue-row
+            # rollback ⇒ retry reprocess ⇒ tin không mất). CTE trả None = duplicate ⇒
+            # rollback + ACK 200, không enqueue lại.
             #
-            # `platform_msg_id is None` = channel KHÔNG cấp khoá idempotency (FakeChannel test;
-            # Zalo user_send_text LUÔN có msg_id — parse_inbound raise nếu thiếu, chống
-            # amplification). Không có khoá ⇒ append thường (commit=True), không dedup được —
-            # thà xử lý 2 lần (duplicate) còn hơn drop. Dedup thật cần khoá platform.
+            # Webhook giờ trả `queued` NGAY — draft do worker (`app/worker_seller.py`) làm
+            # ngoài đường ACK ≤2s (design §7). Đây là chỗ đứng của pre-charge B6: reserve
+            # cost chạy trong worker TRƯỚC lời gọi LLM, không phải ở đây.
+            #
+            # `trace_id` sinh TẠI ĐÂY (design §9) — một webhook = một trace, đi vào outbox
+            # row và ra header X-Trace-Id để đối chiếu.
+            #
+            # `platform_msg_id is None` = channel KHÔNG cấp khoá idempotency (FakeChannel
+            # test; Zalo user_send_text LUÔN có msg_id — parse_inbound raise nếu thiếu).
+            # Không khoá ⇒ không vào queue được (outbox FK về event log) ⇒ giữ đường cũ:
+            # append + draft inline, không dedup — thà xử lý 2 lần còn hơn drop.
             msg_repo = MessageRepo(session, shop_scope=shop_id)
             if msg.platform_msg_id is not None:
-                is_new = await WebhookEventRepo(session).record_event(
+                trace_id = uuid.uuid4()
+                outbox_id = await OutboxRepo(session).record_and_enqueue(
                     channel=channel,
                     platform_msg_id=msg.platform_msg_id,
                     shop_id=shop_id,
+                    payload={
+                        "customer_id": customer_id,
+                        "conversation_id": conversation_id,
+                        "text": msg.text,
+                    },
+                    trace_id=trace_id,
                     commit=False,
                 )
-                if not is_new:
+                if outbox_id is None:
                     await session.rollback()
                     return {
                         "action": "duplicate",
                         "reason": "already_processed",
                         "reply_id": None,
                     }
-                # Atomic với record_event: cùng transaction, commit chung dưới.
                 await msg_repo.append(
                     conversation_id=conversation_id,
                     customer_id=customer_id,
@@ -172,15 +186,17 @@ def build_router(
                     content=msg.text,
                     commit=False,
                 )
-                await session.commit()  # record_event + append: cả hai hoặc không cái nào
-            else:
-                # Channel không có idempotency key — append thường (không dedup).
-                await msg_repo.append(
-                    conversation_id=conversation_id,
-                    customer_id=customer_id,
-                    role="user",
-                    content=msg.text,
-                )
+                await session.commit()  # CTE (event+outbox) + append: tất cả hoặc không gì
+                response.headers["X-Trace-Id"] = str(trace_id)
+                return {"action": "queued", "reason": "enqueued_for_draft", "reply_id": None}
+
+            # Channel không có idempotency key — append thường (không dedup), draft inline.
+            await msg_repo.append(
+                conversation_id=conversation_id,
+                customer_id=customer_id,
+                role="user",
+                content=msg.text,
+            )
 
         outcome: ReceiveOutcome = await receive_and_draft(
             shop_id=shop_id,

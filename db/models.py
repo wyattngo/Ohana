@@ -13,6 +13,7 @@ ids for those relations since GĐ0 doesn't need normalized joins.
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -30,7 +31,9 @@ from sqlalchemy import (
     Numeric,
     Text,
     UniqueConstraint,
+    Uuid,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -451,6 +454,70 @@ class WebhookEventLog(Base):
     shop_id: Mapped[str] = mapped_column(Text, nullable=False)
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class Outbox(Base):
+    """Hàng đợi sự kiện inbound (A5, design §5.4 §6.1 §6.2) — webhook ghi, worker drain.
+
+    ĐÂY LÀ QUEUE DUY NHẤT (design §10 cấm Redis/RabbitMQ/SQS: broker ngoài = dual-write
+    = vỡ C1). Webhook ghi row này CÙNG MỘT CÂU với `webhook_event_log` (CTE §6.1, I7 —
+    xem `OutboxRepo.record_and_enqueue`); worker claim bằng §6.2 `FOR UPDATE SKIP LOCKED`.
+
+    Lệch design-đích, có chủ đích (adopt-plan §1 — tên phẳng trong `public`):
+    - FK **compound** `(channel, platform_msg_id)` → `webhook_event_log`, thay cho
+      `event_id bigint REFERENCES seller.webhook_seen`: event log hiện tại PK compound,
+      không có surrogate id. Di cư schema `seller` thật sẽ đổi cả hai bảng cùng lúc.
+    - `payload` là message ĐÃ PARSE với ID NỘI BỘ (`{customer_id, conversation_id, text}`),
+      KHÔNG phải `raw_event` của platform như design §5.4 — O8 (OHB-12, retention NĐ13)
+      đang mở, không import thêm một chỗ giữ PII thô vĩnh viễn. `text` cùng lớp retention
+      với `messages` (đằng nào cũng đã lưu ở đó).
+    - `payload` nullable: worker NULL-out khi `done` (O8 trim — draft/messages đã giữ phần
+      cần giữ). Row `failed` giữ payload để ops nhìn được mình đã fail với input gì.
+
+    I13: `claimed_at` + status `processing` là một CLAIM ⇒ PHẢI có reaper gỡ
+    (`OutboxRepo.reap_stuck`, worker loop 2). Đừng thêm trạng thái claim mới ở đây mà
+    không nối nó vào reaper.
+    """
+
+    __tablename__ = "outbox"
+
+    outbox_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    channel: Mapped[str] = mapped_column(Text, nullable=False)
+    platform_msg_id: Mapped[str] = mapped_column(Text, nullable=False)
+    shop_id: Mapped[str] = mapped_column(Text, ForeignKey("shops.id"), nullable=False)
+    payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="pending")
+    attempts: Mapped[int] = mapped_column(nullable=False, server_default="0")
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    trace_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["channel", "platform_msg_id"],
+            ["webhook_event_log.channel", "webhook_event_log.platform_msg_id"],
+            name="fk_outbox_event",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'processing', 'done', 'failed')",
+            name="ck_outbox_status",
+        ),
+        # Hai partial index nguyên văn design §5.4 — đường quét của claim §6.2 (pending
+        # theo created_at) và của reaper (processing theo claimed_at).
+        Index(
+            "idx_outbox_pending_created",
+            "created_at",
+            postgresql_where=text("status = 'pending'"),
+        ),
+        Index(
+            "idx_outbox_processing_claimed",
+            "claimed_at",
+            postgresql_where=text("status = 'processing'"),
+        ),
     )
 
 
