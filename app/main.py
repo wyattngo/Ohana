@@ -10,10 +10,10 @@ it were mounted first, it would shadow every `/api/*` request.
 
 `api/inbox.py` and `api/mock_auth.py` are mounted since P0. `api/admin.py` is mounted here as
 of spec 04 Phase P2, gated by `auth.identity.require_admin` on its one route — it never lands
-unguarded (P0's note above was the reason it waited). The embedder wired in is
-`api/admin.py`'s `default_embedder()`, a deterministic GD0.5 placeholder — see that function's
-docstring for why the real `agent/providers/openai_embedder.OpenAIEmbedder` isn't used yet (no
-`app/config.py` exists anywhere in this repo). `api/webhook.py` is intentionally NOT mounted:
+unguarded (P0's note above was the reason it waited). The embedder wired in comes from
+`agent/embedder.py::default_embedder()` (the I5b seam) — env-selecting, real adapter when a
+key is configured, dev fallback otherwise; see that function's docstring.
+`api/webhook.py` is intentionally NOT mounted:
 `agent/drafter.py::LLMDrafter` shipped in spec 13, so the Drafter contract has a real
 implementation — but mounting the webhook opens the customer-inbound path, which requires
 Zalo signature-verify + creds (`GD0-ZALO`, PRE-004, blocked on Tân) and starts the PDPL 60-day
@@ -35,8 +35,8 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response as StarletteResponse
 
+from agent.embedder import default_embedder
 from api.admin import build_router as build_admin_router
-from api.admin import default_embedder
 from api.chat import build_router as build_chat_router
 from api.inbox import build_router as build_inbox_router
 from api.mock_auth import build_router as build_mock_auth_router

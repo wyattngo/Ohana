@@ -244,3 +244,26 @@ class LLMClient(ABC):
                 accumulated_tool_calls=[],
                 usage=result.usage,
             )
+
+
+def default_llm_client() -> LLMClient:
+    """Factory — chỗ DUY NHẤT call-site lấy LLM client (I5b: đổi provider chỉ sửa ở đây).
+    Chuyển từ `api/chat.py::get_llm_client` sang seam ở fix I5b; call-site giữ phần cache.
+
+    Import TRONG hàm, cả ba:
+    - `TogetherClient`: SDK `openai` validate credentials ngay trong `AsyncOpenAI.__init__`
+      (kiểm ở G0), thiếu `TOGETHER_API_KEY` lúc import sẽ sập cả app — dựng lười ⇒ hỏng
+      đúng phạm vi route chat.
+    - `alert_service`: module-level `from app import alert_service` tái lập coupling
+      provider→app mà G0 đã gỡ (spec 12 W0, ISSUE-010). Hook đếm 429 fire-and-forget,
+      re-raise `RateLimitError` nguyên vẹn.
+    - `PIIFilteringClient` (spec 16 B0): bọc để MỌI call-site đi qua LLMClient tự động
+      redact PII trước khi payload rời máy — chokepoint nằm trên interface, call-site
+      thứ N thêm sau vẫn an toàn.
+    """
+    from agent.pii_client import PIIFilteringClient
+    from agent.providers.together_client import TogetherClient
+    from app import alert_service
+
+    inner = TogetherClient(on_rate_limit=alert_service.record_provider_429)
+    return PIIFilteringClient(inner)

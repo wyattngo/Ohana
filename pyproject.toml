@@ -167,11 +167,9 @@ forbidden_modules = ["openai", "anthropic", "together", "langfuse"]
 # provider cụ thể. Thiết kế nói đổi provider chỉ sửa một chỗ; nếu contract này
 # đỏ thì đổi provider phải sửa cả call-site.
 #
-# Đo 2026-07-30 — BROKEN, 3 edge:
-#   api.chat  -> agent.providers.together_client   (l.90)
-#   api.admin -> agent.providers.openai_embedder   (l.21)
-#   api.admin -> agent.providers.together_embedder (l.22)
-# Ba edge đó là scope của A4. Đừng sửa để nó xanh ở commit dựng hàng rào.
+# KEPT kể từ fix I5b (2026-07-30): 3 edge cũ (api.chat/api.admin → providers) đã gỡ —
+# call-site giờ gọi `agent.llm_client.default_llm_client` / `agent.embedder.default_embedder`.
+# `agent.llm_client` + `agent.embedder` CỐ Ý vắng mặt trong source_modules: factory sống ở đó.
 name = "I5b · call-site không bind provider cụ thể"
 type = "forbidden"
 allow_indirect_imports = true

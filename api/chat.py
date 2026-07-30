@@ -30,7 +30,7 @@ from xml.sax.saxutils import escape as xml_escape
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
-from agent.llm_client import LLMClient
+from agent.llm_client import LLMClient, default_llm_client
 from auth.identity import Identity
 
 logger = logging.getLogger(__name__)
@@ -73,7 +73,7 @@ _client_cache: LLMClient | None = None
 
 
 def get_llm_client() -> LLMClient:
-    """FastAPI dependency — `TogetherClient` dựng LƯỜI, cache lại sau lần đầu.
+    """FastAPI dependency — client dựng LƯỜI qua `default_llm_client()`, cache sau lần đầu.
 
     KHÔNG dựng ở module scope: SDK `openai` validate credentials ngay trong `AsyncOpenAI.
     __init__` (đã kiểm bằng test ở G0, `test_missing_key_fails_at_construction_not_at_call`),
@@ -81,25 +81,15 @@ def get_llm_client() -> LLMClient:
     check chết theo, chỉ vì một endpoint chat chưa cấu hình. Dựng lười ⇒ hỏng đúng phạm vi:
     `/api/chat` trả 500, phần còn lại vẫn sống.
 
+    Việc CHỌN provider + bọc PII filter + hook 429 nằm trong `default_llm_client` (seam,
+    fix I5b) — module này không biết provider cụ thể nào đứng sau.
+
     Test override dependency này (`app.dependency_overrides`) nên không có request mạng nào
     trong suite.
     """
     global _client_cache
     if _client_cache is None:
-        from agent.pii_client import PIIFilteringClient
-        from agent.providers.together_client import TogetherClient
-
-        # Spec 12 W0 (ISSUE-010): tiêm bộ đếm 429 làm `on_rate_limit`. Import TRONG hàm —
-        # module-level `from app import alert_service` sẽ tái lập chính coupling mà G0 gỡ và
-        # `test_openai_client_imports_without_alert_service` canh. Hook fire-and-forget, re-raise
-        # `RateLimitError` nguyên vẹn (funnel `OpenAIClient._create`).
-        from app import alert_service
-
-        # Spec 16 B0: bọc `PIIFilteringClient` để mọi call-site đi qua LLMClient tự động
-        # redact PII TRƯỚC khi payload rời máy. Chokepoint pattern — call-site thứ 4 thêm
-        # sau vẫn an toàn vì filter nằm trên interface, không rải ở nơi gọi.
-        inner = TogetherClient(on_rate_limit=alert_service.record_provider_429)
-        _client_cache = PIIFilteringClient(inner)
+        _client_cache = default_llm_client()
     return _client_cache
 
 
