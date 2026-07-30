@@ -1,0 +1,82 @@
+# CI — mọi step là HARD gate, không có chế độ warn-only (quyết định 2026-07-30:
+# lint-imports vào CI ngay sau khi I5b xanh, để không sinh ra gate mềm rồi quên siết).
+#
+# Thứ tự khớp "Verify tối thiểu" của skill ohana-be-coder:
+#   ruff → mypy → lint-imports → alembic (bằng ohana_migrator) → pytest
+#
+# DB: pgvector service + bootstrap_roles + alembic BẰNG ROLE ohana_migrator — cùng
+# đường với local dev. Chạy alembic bằng owner `ohana` dù chỉ một lần là mọi bảng
+# sinh sau rơi khỏi default privileges (I2 hỏng im lặng) — xem docstring migration a1.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: ohana
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ohana
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ohana -d ohana"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Mật khẩu throwaway — service container sống đúng một job run.
+      MIGRATOR_PW: ci_migrator
+      SVC_A_PW: ci_svc_a
+      SVC_B_PW: ci_svc_b
+      MCP_RO_PW: ci_mcp_ro
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Pin 3.11 (adopt-plan Q1: nâng 3.12 là PR riêng, không ghép vào đây).
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Ruff
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Mypy
+        run: mypy app agent retrieval parsing db bridge tools api auth
+
+      - name: Import contracts (I1 · I5 · I5b)
+        run: lint-imports
+
+      - name: Bootstrap roles + vector extension
+        # CREATE EXTENSION cần superuser — chạy bằng owner `ohana` TRƯỚC alembic,
+        # để `CREATE EXTENSION IF NOT EXISTS` trong migration 0001 thành no-op.
+        run: |
+          PGPASSWORD=ci psql -h localhost -U ohana -d ohana -c "CREATE EXTENSION IF NOT EXISTS vector"
+          SUPERUSER_DSN="postgresql://ohana:ci@localhost:5432/ohana" python scripts/bootstrap_roles.py
+
+      - name: Alembic upgrade head (bằng ohana_migrator)
+        run: alembic upgrade head
+        env:
+          DATABASE_URL: postgresql+psycopg://ohana_migrator:${{ env.MIGRATOR_PW }}@localhost:5432/ohana
+
+      - name: Pytest (kèm contract I14/I15)
+        run: pytest -q
+        env:
+          MIGRATOR_DSN: postgresql://ohana_migrator:${{ env.MIGRATOR_PW }}@localhost:5432/ohana
+          SVC_A_DSN: postgresql://svc_ohana_ai:${{ env.SVC_A_PW }}@localhost:5432/ohana
+          SVC_B_DSN: postgresql://svc_seller:${{ env.SVC_B_PW }}@localhost:5432/ohana
+          MCP_RO_DSN: postgresql://mcp_readonly:${{ env.MCP_RO_PW }}@localhost:5432/ohana
