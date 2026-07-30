@@ -213,6 +213,10 @@ class Conversation(Base):
     # KHÔNG có trong design §5.5 (lỗ doc — Wyatt ký 2026-07-30, A7): chỗ trace G6 đi qua
     # conversation khi compose sống ở loop debounce. Batch coalesce ⇒ trace của TIN CUỐI.
     debounce_trace_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
+    # A9 — trần thử lại cho đường compose (nơi duy nhất gọi LLM): lỗi ⇒ +1, thành công ⇒ 0,
+    # đạt trần ⇒ worker NULL timer và GIỮ counter cho vận hành query (poison conversation
+    # không được phép đốt LLM mỗi 5' vĩnh viễn). Xem worker_seller.MAX_COMPOSE_FAILURES.
+    compose_failures: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -253,6 +257,13 @@ class Conversation(Base):
             "idx_conversations_debounce_due",
             "next_debounce_at",
             postgresql_where=text("next_debounce_at IS NOT NULL AND debounce_claimed_at IS NULL"),
+        ),
+        # A9 — phần BÙ của index trên, cho R3: chỉ chứa claim đang treo (vài row) để reaper
+        # 10s là index probe thay vì seq-scan toàn bảng.
+        Index(
+            "idx_conversations_debounce_claimed",
+            "debounce_claimed_at",
+            postgresql_where=text("debounce_claimed_at IS NOT NULL"),
         ),
     )
 
@@ -375,6 +386,13 @@ class PendingReply(Base):
             ["shop_id", "customer_id"],
             ["customers.shop_id", "customers.id"],
             name="fk_pending_reply_customer_same_shop",
+        ),
+        # A9 — đường quét của reaper R1 (draft quá TTL, mỗi 10s): index cũ dẫn đầu bằng
+        # shop_id nên R1 không dùng được; partial này chỉ chứa draft đang chờ có TTL.
+        Index(
+            "idx_pending_reply_ttl",
+            "expires_at",
+            postgresql_where=text("status = 'pending'"),
         ),
     )
 
@@ -544,6 +562,9 @@ class Outbox(Base):
         server_default="pending",
     )
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    # A9 (amend §6.2): job lỗi chờ 2^attempts giây trước khi claim lại — không có backoff
+    # thì 5 attempts cháy trong ~1s và lỗi thoáng qua cũng thành dead.
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     trace_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)

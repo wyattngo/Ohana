@@ -57,7 +57,9 @@ SQL_6_2 = """
 UPDATE outbox SET status='processing', claimed_at=now(), attempts=attempts+1
 WHERE outbox_id IN (
   SELECT outbox_id FROM outbox
-   WHERE status='pending' ORDER BY created_at
+   WHERE status='pending'
+     AND (next_retry_at IS NULL OR next_retry_at <= now())
+   ORDER BY created_at
    FOR UPDATE SKIP LOCKED LIMIT 20
 )
 RETURNING outbox_id, status, attempts
@@ -134,6 +136,28 @@ def test_6_2_claim_exactly_once(svc_b: psycopg.Connection) -> None:
     assert (status, attempts) == ("processing", 1)
 
     assert svc_b.execute(SQL_6_2).fetchall() == []  # không còn pending ⇒ worker sau tay không
+
+
+def test_6_2_backoff_row_waits_out_its_delay(
+    migrator: psycopg.Connection, svc_b: psycopg.Connection
+) -> None:
+    """§6.2 (amend a9) · row đang trong backoff KHÔNG bị claim; hết hạn chờ thì claim được.
+
+    Không có điều kiện này, row lỗi là row CŨ NHẤT nên bị claim lại ngay tick 200ms kế
+    tiếp — 5 attempts cháy trong ~1 giây và lỗi thoáng qua cũng thành dead (review A5-A8).
+    """
+    _deliver(svc_b)
+    migrator.execute(
+        "UPDATE outbox SET next_retry_at = now() + interval '1 hour' WHERE shop_id = %s",
+        (SHOP,),
+    )
+    assert svc_b.execute(SQL_6_2).fetchall() == []  # đang chờ backoff — không claim
+
+    migrator.execute(
+        "UPDATE outbox SET next_retry_at = now() - interval '1 second' WHERE shop_id = %s",
+        (SHOP,),
+    )
+    assert len(svc_b.execute(SQL_6_2).fetchall()) == 1  # hết hạn chờ — claim bình thường
 
 
 def test_c1_worker_double_process_writes_one_message(

@@ -259,3 +259,53 @@ def test_r1_reaper_expires_overdue_drafts(
         ).fetchall()
     )
     assert rows == {"r1-overdue": "expired", "r1-nottl": "pending"}
+
+
+# Câu finish của repo (KHÔNG phải SQL nguyên văn design — đây là test HÀNH VI, khớp
+# db/repos.py::_FINISH_DEBOUNCE): timer chỉ bị xoá khi VẪN là giá trị đã claim (echo).
+SQL_FINISH = """
+UPDATE conversations
+   SET debounce_claimed_at = NULL,
+       next_debounce_at = CASE WHEN next_debounce_at = %(due_at)s
+                               THEN NULL ELSE next_debounce_at END
+ WHERE id = %(conversation_id)s
+"""
+
+
+def test_finish_preserves_timer_set_mid_compose(
+    migrator: psycopg.Connection, svc_b: psycopg.Connection
+) -> None:
+    """Review A5-A8 #1 · tin đến GIỮA lúc compose dời timer — finish không được nuốt nó,
+    kể cả khi timer mới cũng đã quá hạn lúc finish (compose LLM thường > 5s)."""
+    _arm_debounce_past(migrator)
+    (due_at,) = svc_b.execute(
+        "SELECT next_debounce_at FROM conversations WHERE id = %s", (CONVERSATION,)
+    ).fetchone()
+    assert svc_b.execute(SQL_6_3, {"conversation_id": CONVERSATION}).fetchone() is not None
+
+    # Tin B đến giữa lúc compose: outbox loop dời timer. Mô phỏng ca ÁC nhất — timer mới
+    # cũng đã quá hạn tại thời điểm finish (compose lâu hơn DEBOUNCE_DELAY_SECONDS).
+    migrator.execute(
+        "UPDATE conversations SET next_debounce_at = now() - interval '1 millisecond', "
+        "debounce_trace_id = %s WHERE id = %s",
+        (uuid.uuid4(), CONVERSATION),
+    )
+
+    svc_b.execute(SQL_FINISH, {"conversation_id": CONVERSATION, "due_at": due_at})
+    new_timer, claimed = svc_b.execute(
+        "SELECT next_debounce_at, debounce_claimed_at FROM conversations WHERE id = %s",
+        (CONVERSATION,),
+    ).fetchone()
+    assert claimed is None  # claim thả
+    assert new_timer is not None  # timer của tin B SỐNG — sẽ được compose ở lượt sau
+
+    # Đối chứng: không có tin mới ⇒ finish với đúng echo xoá timer như trước.
+    (due_at2,) = svc_b.execute(
+        "SELECT next_debounce_at FROM conversations WHERE id = %s", (CONVERSATION,)
+    ).fetchone()
+    svc_b.execute(SQL_6_3, {"conversation_id": CONVERSATION})
+    svc_b.execute(SQL_FINISH, {"conversation_id": CONVERSATION, "due_at": due_at2})
+    (cleared,) = svc_b.execute(
+        "SELECT next_debounce_at FROM conversations WHERE id = %s", (CONVERSATION,)
+    ).fetchone()
+    assert cleared is None

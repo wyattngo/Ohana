@@ -312,6 +312,7 @@ CREATE TABLE seller.outbox (
   payload    jsonb  NOT NULL,
   status     seller.outbox_status NOT NULL DEFAULT 'pending',
   attempts   int    NOT NULL DEFAULT 0,
+  next_retry_at timestamptz,   -- backoff 2^attempts giây khi lỗi; NULL = claim được ngay (amend 2026-07-30, review A5-A8)
   claimed_at timestamptz,
   last_error text,
   trace_id   uuid   NOT NULL,
@@ -480,12 +481,19 @@ RETURNING outbox_id;
 UPDATE seller.outbox SET status='processing', claimed_at=now(), attempts=attempts+1
 WHERE outbox_id IN (
   SELECT outbox_id FROM seller.outbox
-   WHERE status='pending' ORDER BY created_at
+   WHERE status='pending'
+     AND (next_retry_at IS NULL OR next_retry_at <= now())
+   ORDER BY created_at
    FOR UPDATE SKIP LOCKED LIMIT 20
 )
 RETURNING *;
 ```
 Commit ngay sau claim. **MUST NOT** giữ transaction mở trong lúc gọi LLM.
+
+Điều kiện `next_retry_at` (amend 2026-07-30, review A5–A8): job lỗi quay về `pending` với
+`next_retry_at = now() + 2^attempts giây`. Thiếu điều kiện này, row lỗi (cũ nhất theo
+`created_at`) bị claim lại NGAY tick kế tiếp — 5 attempts cháy trong ~1 giây trước khi một
+lỗi thoáng qua kịp hết, và tin khách thành `dead` oan.
 
 ### §6.3 Claim debounce (PRE-010 C2)
 ```sql

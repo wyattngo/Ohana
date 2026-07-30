@@ -127,23 +127,23 @@ async def run_outbox_loop(deps: WorkerDeps, *, run_once: bool = False) -> None:
 # ── Loop 2 · debounce (§6.3) ─────────────────────────────────────────────────────────────
 
 
-async def compose_due(item: DebounceDue, deps: WorkerDeps) -> None:
-    """Compose draft cho một conversation ĐÃ claim.
+async def compose_due(item: DebounceDue, deps: WorkerDeps) -> bool:
+    """Compose draft cho một conversation ĐÃ claim. Trả `True` = đã compose (caller finish),
+    `False` = không có tin khách nào để trả lời — caller KHÔNG finish (xem loop bên dưới).
 
-    `message` = tin KHÁCH mới nhất (draft trả lời cụm tin mà nó khép lại); tin phía shop
-    chen giữa không phải câu cần trả lời. Không còn tin khách nào (đã bị dọn/edge) ⇒ bỏ
-    qua êm — không có gì để trả lời thì không draft.
+    `message` = tin KHÁCH mới nhất, query đúng 1 row `role='user'` ở SQL — KHÔNG lọc trong
+    cửa sổ last-N (review A5-A8 #8: N tin phía shop liên tiếp làm pre-scan mù tin khách,
+    draft bị nuốt êm).
 
     `trace_id` từ `debounce_trace_id` (G6 — trace của tin cuối batch); row từ trước A7
     chưa có ⇒ sinh mới, hợp lệ theo contract của `receive_and_draft`.
     """
     async with deps.session_factory() as session:
-        history = await MessageRepo(session, shop_scope=item.shop_id).last_n(
-            item.conversation_id, limit=20
-        )
-    latest_customer = next((m for m in reversed(history) if m.role == "user"), None)
+        latest_customer = await MessageRepo(
+            session, shop_scope=item.shop_id
+        ).latest_customer_message(item.conversation_id)
     if latest_customer is None:
-        return
+        return False
 
     await receive_and_draft(
         shop_id=item.shop_id,
@@ -154,6 +154,7 @@ async def compose_due(item: DebounceDue, deps: WorkerDeps) -> None:
         session_factory=deps.session_factory,
         trace_id=item.trace_id if item.trace_id is not None else uuid.uuid4(),
     )
+    return True
 
 
 async def run_debounce_loop(deps: WorkerDeps, *, run_once: bool = False) -> None:
@@ -173,12 +174,22 @@ async def run_debounce_loop(deps: WorkerDeps, *, run_once: bool = False) -> None
             if not claimed:
                 continue
             try:
-                await compose_due(item, deps)
+                composed = await compose_due(item, deps)
             except Exception:
                 logger.exception("compose lỗi, để R3 gỡ claim: %s", item.conversation_id)
                 continue
+            if not composed:
+                # Không có tin khách để trả lời — BẤT THƯỜNG (timer chỉ được arm sau khi
+                # append_inbound). KHÔNG finish: finish sẽ nuốt timer và nếu tin khách vào
+                # muộn (race) thì không ai draft. Để claim treo cho R3 gỡ + thử lại có nhịp.
+                logger.warning(
+                    "debounce đến hạn nhưng không có tin khách: %s", item.conversation_id
+                )
+                continue
             async with deps.session_factory() as session:
-                await SchedulerRepo(session).finish_debounce(item.conversation_id)
+                await SchedulerRepo(session).finish_debounce(
+                    item.conversation_id, due_at=item.due_at
+                )
 
         if run_once:
             return

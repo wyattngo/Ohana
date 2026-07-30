@@ -288,6 +288,25 @@ class MessageRepo:
         await self._session.commit()
         return inserted is not None
 
+    async def latest_customer_message(self, conversation_id: str) -> Message | None:
+        """Tin KHÁCH mới nhất của conversation — cho loop debounce tìm 'câu cần trả lời'.
+
+        Query đúng 1 row `role='user'`, KHÔNG phải last_n rồi lọc ở Python (bug review
+        A5-A8 #8): lọc trong cửa sổ N row là hàm của N — N tin phía shop liên tiếp là
+        pre-scan mù tin khách và draft bị bỏ qua êm, trong khi WHERE ở SQL thì không có
+        cửa sổ nào để trượt. Trả None = conversation chưa có tin khách nào (row ghi tay/
+        edge) — caller quyết, không raise.
+        """
+        stmt = (
+            select(Message)
+            .where(Message.shop_id == self._shop_scope)
+            .where(Message.conversation_id == conversation_id)
+            .where(Message.role == "user")
+            .order_by(Message.created_at.desc(), Message.id.desc())
+            .limit(1)
+        )
+        return (await self._session.execute(stmt)).scalar_one_or_none()
+
     async def last_n(self, conversation_id: str, *, limit: int = 20) -> list[Message]:
         """N message GẦN NHẤT của conversation này, trả theo thứ tự thời gian TĂNG dần.
 
@@ -452,27 +471,34 @@ class WebhookEventRepo:
         return int(row[0]) if row is not None else None
 
 
-# §6.2 NGUYÊN VĂN (design) — chỉ đổi tên bảng theo ánh xạ adopt-plan §1. LIMIT 20 là của doc.
-# `FOR UPDATE SKIP LOCKED` trong subquery + UPDATE ngoài là MỘT câu: N worker cùng chạy thì
-# mỗi row đúng một chủ, không chờ lock của nhau. 🚫 Bỏ `SKIP LOCKED` = worker serialize;
-# tách SELECT rồi UPDATE = hai worker claim cùng row.
+# §6.2 NGUYÊN VĂN (design, amend 2026-07-30 thêm điều kiện next_retry_at) — chỉ đổi tên
+# bảng theo ánh xạ adopt-plan §1. LIMIT 20 là của doc. `FOR UPDATE SKIP LOCKED` trong
+# subquery + UPDATE ngoài là MỘT câu: N worker cùng chạy thì mỗi row đúng một chủ, không
+# chờ lock của nhau. 🚫 Bỏ `SKIP LOCKED` = worker serialize; tách SELECT rồi UPDATE = hai
+# worker claim cùng row. 🚫 Bỏ điều kiện `next_retry_at` = row lỗi bị claim lại ngay tick
+# kế tiếp, 5 attempts cháy trong ~1 giây (lý do amend — xem doc §6.2).
 _CLAIM_OUTBOX = text("""
     UPDATE outbox SET status='processing', claimed_at=now(), attempts=attempts+1
     WHERE outbox_id IN (
       SELECT outbox_id FROM outbox
-       WHERE status='pending' ORDER BY created_at
+       WHERE status='pending'
+         AND (next_retry_at IS NULL OR next_retry_at <= now())
+       ORDER BY created_at
        FOR UPDATE SKIP LOCKED LIMIT 20
     )
     RETURNING *
 """)
 
 # Lỗi ⇒ pending (thử lại) hay dead (chạm trần) quyết trong MỘT câu UPDATE — đọc attempts
-# rồi update ở Python là check-then-act, cùng họ race mà §6.5 cấm.
+# rồi update ở Python là check-then-act, cùng họ race mà §6.5 cấm. Backoff 2^attempts giây
+# (2·4·8·16s): đủ sống qua blip DB vài giây, đủ ngắn để không giam tin khách; power/
+# make_interval tính trong DB từ attempts ĐÃ ghi lúc claim — không có số nào ở Python.
 _MARK_FAILED = text("""
     UPDATE outbox
        SET status = CASE WHEN attempts >= :max_attempts
                          THEN 'dead'::outbox_status
                          ELSE 'pending'::outbox_status END,
+           next_retry_at = now() + make_interval(secs => power(2, attempts)),
            last_error = :error
      WHERE outbox_id = :outbox_id
 """)
@@ -573,8 +599,9 @@ _SET_DEBOUNCE = text("""
 """).bindparams(bindparam("trace_id", type_=Uuid()))
 
 # Đọc đúng theo partial index idx_conversations_debounce_due (predicate trùng khít).
+# `next_debounce_at` đi kèm làm ECHO cho finish — xem _FINISH_DEBOUNCE.
 _DUE_CONVERSATIONS = text("""
-    SELECT id, shop_id, customer_id, channel, debounce_trace_id
+    SELECT id, shop_id, customer_id, channel, debounce_trace_id, next_debounce_at
       FROM conversations
      WHERE next_debounce_at IS NOT NULL AND debounce_claimed_at IS NULL
        AND next_debounce_at <= now()
@@ -582,13 +609,15 @@ _DUE_CONVERSATIONS = text("""
      LIMIT :limit
 """)
 
-# Thả claim sau khi compose xong. `next_debounce_at` chỉ về NULL khi vẫn là timer CŨ đã
-# đến hạn — tin mới đến GIỮA lúc compose đã đặt timer tương lai thì giữ nguyên ⇒ compose
-# lại sau (O9: coalesce chỉ TRƯỚC compose; tin đến trong compose sinh draft mới sau).
+# Thả claim sau khi compose xong. `next_debounce_at` chỉ về NULL khi VẪN LÀ ĐÚNG timer đã
+# claim (echo-compare :due_at) — tin đến GIỮA lúc compose đặt timer MỚI thì giữ nguyên ⇒
+# compose lại sau (O9). 🚫 Đừng "đơn giản hoá" thành so `<= now()`: compose (LLM) thường
+# lâu hơn DEBOUNCE_DELAY_SECONDS, timer mới cũng đã quá hạn tại thời điểm finish — so với
+# now() là nuốt luôn tin B, hội thoại im lặng (bug review A5-A8 #1).
 _FINISH_DEBOUNCE = text("""
     UPDATE conversations
        SET debounce_claimed_at = NULL,
-           next_debounce_at = CASE WHEN next_debounce_at <= now()
+           next_debounce_at = CASE WHEN next_debounce_at = :due_at
                                    THEN NULL ELSE next_debounce_at END
      WHERE id = :conversation_id
 """)
@@ -639,6 +668,7 @@ class DebounceDue:
     customer_id: str
     channel: str
     trace_id: uuid.UUID | None  # None: row từ trước A7 / ghi tay — caller tự sinh trace mới
+    due_at: datetime  # giá trị timer LÚC ĐỌC — echo cho finish_debounce, xem _FINISH_DEBOUNCE
 
 
 class SchedulerRepo:
@@ -679,6 +709,7 @@ class SchedulerRepo:
                 customer_id=r[2],
                 channel=r[3],
                 trace_id=r[4],
+                due_at=r[5],
             )
             for r in rows
         ]
@@ -692,10 +723,14 @@ class SchedulerRepo:
         await self._session.commit()
         return row is not None
 
-    async def finish_debounce(self, conversation_id: str) -> None:
-        """Thả claim sau compose. Compose LỖI thì ĐỪNG gọi — để claim treo cho R3 gỡ sau
-        5' là đường retry có nhịp, không retry nóng mỗi tick 500ms."""
-        await self._session.execute(_FINISH_DEBOUNCE, {"conversation_id": conversation_id})
+    async def finish_debounce(self, conversation_id: str, *, due_at: datetime) -> None:
+        """Thả claim sau compose. `due_at` = timer lúc claim (`DebounceDue.due_at`) — timer
+        chỉ bị xoá nếu VẪN là giá trị đó; tin đến giữa lúc compose đã dời timer thì giữ.
+        Compose LỖI thì ĐỪNG gọi — để claim treo cho R3 gỡ sau 5' là đường retry có nhịp,
+        không retry nóng mỗi tick 500ms."""
+        await self._session.execute(
+            _FINISH_DEBOUNCE, {"conversation_id": conversation_id, "due_at": due_at}
+        )
         await self._session.commit()
 
     async def reap(self) -> dict[str, int]:
