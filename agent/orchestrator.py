@@ -1,9 +1,10 @@
-"""F3 receive-and-draft orchestrator (spec 01 §3 Sub-task E).
+"""F3 receive-and-draft orchestrator (spec 01 §3 Sub-task E → A8).
 
-Glues inbound customer message → draft (from a `Drafter` — F1+F2 context injected by the
-LLM adapter later) → `policy_gate.decide` → either `sender.send(...)` or a parked
-`PendingReply` row scoped to `shop_id`. The two branches are the ONLY outcomes; there is no
-side channel that sends without gating.
+Glues inbound customer message → draft (from a `Drafter`) → `policy_gate.decide` → a
+parked `PendingReply` row scoped to `shop_id`, carrying `escalation_reasons`. PARK là
+đường ra DUY NHẤT (A8 · I10): nhánh auto-send đã XOÁ khỏi codebase — phase 1 không có
+code path nào đưa draft tới khách mà thiếu seller; mở lại là việc của w§8.1, không phải
+của một refactor tiện tay.
 
 Identity contract (spec 06 F1 — was a shim before):
   - `customer_id` and `conversation_id` are OURS, already resolved. This module never sees
@@ -28,12 +29,11 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Protocol
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent.policy_gate import DraftContext, decide
-from bridge.zalo_sender import ZaloSender
 from db.models import Message
 from db.repos import MessageRepo, PendingReplyRepo
 
@@ -92,9 +92,9 @@ class Drafter(Protocol):
 
 @dataclass(frozen=True)
 class ReceiveOutcome:
-    action: Literal["auto_send", "park"]
-    reason: str
-    reply_id: str | None  # set only for park; None for auto_send
+    reply_id: str
+    # Từ policy_gate, đã sắp theo SEVERITY_RANK — rỗng = draft thường (vẫn park).
+    escalation_reasons: list[str]
 
 
 async def receive_and_draft(
@@ -104,19 +104,15 @@ async def receive_and_draft(
     conversation_id: str,
     message: str,
     drafter: Drafter,
-    sender: ZaloSender,
     session_factory: async_sessionmaker[AsyncSession],
-    shop_auto_enabled_intents: frozenset[str],
     trace_id: uuid.UUID,
 ) -> ReceiveOutcome:
-    """Draft → decide → send OR park. Returns the outcome for the caller to log/telemetrize.
+    """Draft → gate → PARK. Một đường ra duy nhất (A8 · I10 — phase 1 không có nhánh gửi;
+    tham số `sender` + `shop_auto_enabled_intents` đã XOÁ, không phải tạm ẩn: code path
+    gửi không tồn tại thì không có gì để bảo vệ bằng if).
 
-    `shop_id` MUST come from verified auth; the sender is called with the SAME `shop_id`
-    (no way to redirect a send to another shop). Park path writes ONLY to a repo scoped to
+    `shop_id` MUST come from verified auth. Park path writes ONLY to a repo scoped to
     the same `shop_id` — no cross-shop mutation possible even under a buggy caller.
-
-    `shop_auto_enabled_intents` is the shop-level opt-in set for auto-send. If the intent
-    the drafter emits isn't in this set, the gate parks even at high confidence.
 
     `trace_id` BẮT BUỘC (A5/G6) — sinh tại webhook, tới đây qua outbox job. Đường gọi
     không-qua-webhook (test, script) tự sinh `uuid.uuid4()` là hợp lệ: trace mới cho một
@@ -144,35 +140,17 @@ async def receive_and_draft(
         shop_id=shop_id, customer_id=customer_id, message=message, history=history
     )
 
-    decision = decide(
-        DraftContext(
-            confidence=draft.confidence,
-            intent=draft.intent,
-            shop_auto_enabled_for_intent=(draft.intent in shop_auto_enabled_intents),
-        )
-    )
+    # Gate không còn quyết gửi/không (không có nhánh gửi để quyết) — nó xếp hạng lý do
+    # seller cần chú ý. Pipeline hôm nay mới cấp `intent`; các cờ khác B7 wire dần (xem
+    # docstring DraftContext).
+    gate = decide(DraftContext(intent=draft.intent))
 
-    if decision.action == "auto_send":
-        await sender.send(shop_id=shop_id, customer_id=customer_id, text=draft.text)
-        # Ghi SAU khi gửi thành công, không phải trước (spec 10 H1). `send()` nổ ⇒ ngoại lệ
-        # bay lên và KHÔNG có row nào — lịch sử không bao giờ khai một điều chưa xảy ra.
-        # Ghi trước sẽ làm AI lượt sau tưởng nó đã trả lời khách rồi, và im lặng.
-        async with session_factory() as session:
-            await MessageRepo(session, shop_scope=shop_id).append(
-                conversation_id=conversation_id,
-                customer_id=customer_id,
-                role="assistant",
-                content=draft.text,
-            )
-        return ReceiveOutcome(action="auto_send", reason=decision.reason, reply_id=None)
-
-    # Park path — new PendingReply row, shop_id BAKED from repo scope (not caller args).
+    # Park — đường ra DUY NHẤT. shop_id BAKED from repo scope (not caller args).
     #
     # CỐ Ý KHÔNG ghi `messages` ở đây (PRE-1004, Wyatt ký 2026-07-20). `PendingReply` đã là
     # bản ghi của nhánh này, và chưa có worker nào thực sự gửi (`api/inbox.py` approve chỉ
     # flip status). Ghi lúc park hay lúc approve đều là khai "đã gửi" trong khi không ai gửi.
     # Hệ quả đã chấp nhận: reply seller duyệt không vào history cho tới khi worker gửi land.
-    # Gate: tests/test_message_history.py::test_park_writes_no_assistant_message.
     reply_id = uuid.uuid4().hex
     async with session_factory() as session:
         repo = PendingReplyRepo(session, shop_scope=shop_id)
@@ -184,5 +162,6 @@ async def receive_and_draft(
             intent=draft.intent,
             confidence=draft.confidence,
             trace_id=trace_id,
+            escalation_reasons=gate.escalation_reasons,
         )
-    return ReceiveOutcome(action="park", reason=decision.reason, reply_id=reply_id)
+    return ReceiveOutcome(reply_id=reply_id, escalation_reasons=gate.escalation_reasons)

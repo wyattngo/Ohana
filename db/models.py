@@ -38,8 +38,8 @@ from sqlalchemy import (
     func,
     text,
 )
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.dialects.postgresql import ENUM as PG_ENUM
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from agent.persona import PERSONA_MAX_CHARS
@@ -341,6 +341,12 @@ class PendingReply(Base):
     # G6 (A5): trace sinh tại webhook, xuyên webhook_event_log → outbox → đây. NOT NULL và
     # KHÔNG default — caller phải mang trace thật từ đường ingest, không được để DB bịa.
     trace_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
+    # A8 (design §5.5 · C5, I10): output của policy_gate — lý do seller cần chú ý, sắp theo
+    # SEVERITY_RANK. Rỗng = draft thường, vẫn park (phase 1 không có nhánh gửi). CHECK ở
+    # __table_args__ chặn typo tầng DB — label bẩn đầu độc training set w§8.1.
+    escalation_reasons: Mapped[list[str]] = mapped_column(
+        ARRAY(Text), nullable=False, server_default="{}"
+    )
 
     # spec 06 F0: `conversation_id` / `customer_id` were bare Text with nothing behind them —
     # they could point at ids that never existed and Postgres accepted it. Now composite FKs,
@@ -351,6 +357,14 @@ class PendingReply(Base):
         CheckConstraint(
             "label IS NULL OR label IN ('approved', 'rejected', 'edited')",
             name="ck_pending_reply_label",
+        ),
+        # NGUYÊN VĂN design §5.5 — bảy giá trị khớp policy_gate.SEVERITY_RANK.
+        CheckConstraint(
+            "escalation_reasons <@ ARRAY["
+            "'sensitive_intent','injection_attempt','data_unavailable',"
+            "'media_content','window_closed','cost_cap','window_unknown'"
+            "]::text[]",
+            name="escalation_reasons_known",
         ),
         ForeignKeyConstraint(
             ["shop_id", "conversation_id"],

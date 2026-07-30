@@ -101,6 +101,7 @@ class PendingReplyRepo:
         intent: str,
         confidence: float,
         trace_id: uuid.UUID,
+        escalation_reasons: list[str] | None = None,
         snapshot: dict[str, Any] | None = None,
         expires_at: datetime | None = None,
     ) -> PendingReply:
@@ -110,6 +111,10 @@ class PendingReplyRepo:
 
         `trace_id` BẮT BUỘC (A5/G6): trace sinh tại webhook, xuyên webhook_event_log →
         outbox → đây. Không default — draft không trace là draft không đối chiếu được §9.
+
+        `escalation_reasons` (A8/C5): output của policy_gate, đã sắp theo SEVERITY_RANK —
+        repo ghi nguyên trạng, KHÔNG sắp lại (thứ tự là quyết định của gate, một chỗ).
+        Giá trị lạ bị CHECK `escalation_reasons_known` từ chối ở tầng DB.
 
         `snapshot` / `expires_at` are OPTIONAL (spec 14 A0) — the tier-1 T0 snapshot and the
         TTL are captured by deferred runtime; today every call-site omits them and the row
@@ -125,6 +130,7 @@ class PendingReplyRepo:
             confidence=confidence,
             status="pending",
             trace_id=trace_id,
+            escalation_reasons=escalation_reasons if escalation_reasons is not None else [],
             snapshot=snapshot,
             expires_at=expires_at,
         )

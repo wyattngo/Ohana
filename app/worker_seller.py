@@ -11,9 +11,9 @@ draft. Lỗi compose ⇒ để claim treo cho R3 gỡ sau 5' — retry có nhị
 Lỗ "row kẹt processing khi worker chết" khai ở A5 đã ĐÓNG bằng R2 (I13 tròn: mọi claim —
 outbox, debounce, reservation — đều có reaper gỡ).
 
-Auto-send KHÔNG wire ở đây: `shop_auto_enabled` rỗng ⇒ policy_gate luôn park, và sender
-là chốt-nổ (`RefuseSender`) để một nhánh auto-send ngoài dự kiến chết to thay vì gửi im
-lặng ra ngoài (I10 — phase 1 không có đường tự gửi).
+Auto-send KHÔNG TỒN TẠI (A8 · I10): `receive_and_draft` chỉ có đường park — worker này
+không cầm sender nào, và đó là cách I10 được cưỡng chế: không phải cấu hình tắt, mà là
+code path không có. (RefuseSender chốt-nổ của A5–A7 đã xoá cùng nhánh nó canh.)
 
 Cùng role DB với `main_seller` (`svc_seller`), process riêng:
 
@@ -27,15 +27,13 @@ import asyncio
 import logging
 import sys
 import uuid
-from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent.llm_client import default_llm_client
 from agent.orchestrator import Drafter, receive_and_draft
 from app.runtime import setup_logging
-from bridge.zalo_sender import ZaloSender
 from db.repos import DebounceDue, MessageRepo, OutboxJob, OutboxRepo, SchedulerRepo
 from db.session import make_session_factory
 
@@ -52,35 +50,16 @@ REAPER_TICK_SECONDS = 10.0  # design §3 — chu kỳ reaper
 DEBOUNCE_DELAY_SECONDS = 5.0
 
 
-class RefuseSender:
-    """Sender duy nhất của worker hôm nay — NỔ khi bị gọi.
-
-    `shop_auto_enabled` rỗng nghĩa là `policy_gate` luôn park, nên `send()` không có đường
-    nào tới được. Nếu nó vẫn được gọi thì một nhánh auto-send ngoài dự kiến đã mở — đó là
-    vi phạm I10, phải chết to tại chỗ chứ không gửi im lặng ra khách. Outbound thật (Zalo
-    HttpZaloSender + token) wire khi GD0-ZALO mở, qua `WorkerDeps.senders`.
-    """
-
-    name = "refuse"
-
-    async def send(self, *, shop_id: str, customer_id: str, text: str) -> None:
-        raise RuntimeError(
-            "worker_seller: send() bị gọi trong khi auto-send chưa wire — nhánh auto-send "
-            f"ngoài dự kiến (I10). shop_id={shop_id!r}"
-        )
-
-
-_REFUSE_SENDER = RefuseSender()
-
-
 @dataclass(frozen=True)
 class WorkerDeps:
-    """Wiring của worker — DI như `build_router` để test thay được từng mảnh."""
+    """Wiring của worker — DI như `build_router` để test thay được từng mảnh.
+
+    KHÔNG có sender (A8 · I10): đường duy nhất ra khách là seller bấm duyệt — worker gửi
+    sau approve là việc của B5, wire riêng ở đó, không phải một field ngủ sẵn ở đây.
+    """
 
     session_factory: async_sessionmaker[AsyncSession]
     drafter: Drafter
-    senders: Mapping[str, ZaloSender] = field(default_factory=dict)
-    shop_auto_enabled: Mapping[str, frozenset[str]] = field(default_factory=dict)
 
 
 # ── Loop 1 · outbox (§6.2) ───────────────────────────────────────────────────────────────
@@ -172,9 +151,7 @@ async def compose_due(item: DebounceDue, deps: WorkerDeps) -> None:
         conversation_id=item.conversation_id,
         message=latest_customer.content,
         drafter=deps.drafter,
-        sender=deps.senders.get(item.channel, _REFUSE_SENDER),
         session_factory=deps.session_factory,
-        shop_auto_enabled_intents=deps.shop_auto_enabled.get(item.shop_id, frozenset()),
         trace_id=item.trace_id if item.trace_id is not None else uuid.uuid4(),
     )
 

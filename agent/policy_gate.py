@@ -1,31 +1,43 @@
-"""Draft-to-customer policy gate (spec 01 §3 Sub-task E, §4 acceptance-blocking).
+"""Cổng chính sách draft (spec 01 Sub-task E → A8 · design C5 · I10).
 
-The ONE code path that lets a draft reach a customer without a seller in the loop. Every
-decision surface flows through `decide(...)`; there is no back-door for auto-send.
+**Phase 1 KHÔNG có nhánh tự gửi — mọi draft đều park chờ seller duyệt.** I10 được cưỡng
+chế bằng KHÔNG TỒN TẠI code path: `decide()` không trả `action`, không có threshold, và
+orchestrator không nhận sender. Khôi phục nhánh AUTO_SEND là vi phạm bị cấm tường minh
+(design §10) — mở lại chỉ khi w§8.1 có label thật + noise floor ≥85%.
 
-Rule precedence (highest wins):
+Việc của gate bây giờ: biến ngữ cảnh draft thành `escalation_reasons: list[str]` — lý do
+draft này cần seller chú ý — sắp theo severity rank TẤT ĐỊNH. Inbox sort trên field này
+(§7: ESCALATE lên đầu), và `CHECK escalation_reasons_known` ở DB (§5.5) từ chối mọi giá
+trị ngoài danh sách — typo ở đây nổ lúc INSERT, không đầu độc training set (w§8.1).
 
-  1. Sensitive intent (complaint, refund, price_negotiation, specific_order) → PARK.
-     Applies even when confidence is 1.0 and the shop has opted into auto-send. Spec §4
-     "user trust" flag: these categories BURN the seller if AI gets them wrong.
-  2. Confidence below `threshold` → PARK. Prevents a low-quality draft from riding the
-     safe-intent lane just because the shop opted in.
-  3. Shop not opted into auto-send for this intent → PARK. Shop-level consent.
-  4. Otherwise → AUTO_SEND.
-
-The blocklist is a `frozenset` — a stray `.discard()` in a later refactor would raise at
-runtime rather than silently poke a hole through the gate.
+`SEVERITY_RANK` chính là bảng precedence cũ, thăng cấp thành dữ liệu (C5): kết quả chỉ
+phụ thuộc CỜ NÀO bật, không phụ thuộc thứ tự ai kiểm tra trước — hoán vị rule cho cùng
+output, và `tests/contract/test_c5_severity.py` canh đúng tính chất đó.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
 
-# Conservative default (spec §4 "gate là điều kiện ship, không optional"). Bumping this
-# DOWN is an F3-scope change and must land as its own spec revision, not a config toggle.
-DEFAULT_CONFIDENCE_THRESHOLD = 0.85
+# Rank cao → thấp: an toàn/tin cậy trước, vận hành sau (Wyatt ký 2026-07-30, lượt duyệt
+# A8). ⚠️ Thứ tự chốt tại A8 để có ràng buộc tất định từ đầu — B4 (rules + severity, gate
+# C5 của §11 bước 4) tinh chỉnh lại khi bảng rules thật đổ bộ. Tuple, không set: THỨ TỰ
+# là nội dung của C5.
+#
+# Bảy giá trị này khớp NGUYÊN VĂN `CHECK escalation_reasons_known` (§5.5 + migration a8)
+# — thêm/bớt một bên mà quên bên kia thì contract test DB đỏ ngay.
+SEVERITY_RANK: tuple[str, ...] = (
+    "sensitive_intent",
+    "injection_attempt",
+    "data_unavailable",
+    "media_content",
+    "window_closed",
+    "window_unknown",
+    "cost_cap",
+)
 
+# Blocklist giữ nguyên từ spec 01 — frozenset để một `.discard()` lạc trong refactor sau
+# này raise lúc chạy thay vì lặng lẽ chọc thủng gate.
 SENSITIVE_INTENTS: frozenset[str] = frozenset(
     {"complaint", "refund", "price_negotiation", "specific_order"}
 )
@@ -33,24 +45,49 @@ SENSITIVE_INTENTS: frozenset[str] = frozenset(
 
 @dataclass(frozen=True)
 class DraftContext:
-    confidence: float  # 0..1, the drafter's own self-reported confidence
-    intent: str  # code — matched against SENSITIVE_INTENTS
-    shop_auto_enabled_for_intent: bool  # shop-level opt-in for THIS intent
+    """Ngữ cảnh một draft tại thời điểm qua gate.
+
+    Các cờ default False vì pipeline hôm nay mới cấp được `intent` — B7 wire dần từng cờ
+    (data_unavailable khi API tầng-1 fail, cost_cap_hit khi §6.5 trả None, window_* từ
+    §6.8, injection từ tầng PII/C0, media từ parse). Cờ chưa wire = không bao giờ bật =
+    không bao giờ phát reason tương ứng — an toàn theo chiều thiếu, không theo chiều bịa.
+    """
+
+    intent: str  # code — so với SENSITIVE_INTENTS
+    injection_detected: bool = False
+    data_unavailable: bool = False
+    has_media: bool = False
+    window_closed: bool = False
+    window_unknown: bool = False
+    cost_cap_hit: bool = False
 
 
 @dataclass(frozen=True)
-class DraftDecision:
-    action: Literal["auto_send", "park"]
-    # stable code: park:sensitive_intent | park:low_confidence
-    #            | park:auto_disabled_for_intent | send:within_policy
-    reason: str
+class GateResult:
+    # Sắp theo SEVERITY_RANK, dedup — ghi thẳng vào `pending_reply.escalation_reasons`.
+    # Rỗng = draft thường: vẫn PARK (phase 1 không có nhánh nào khác), chỉ là không cần
+    # seller ưu tiên.
+    escalation_reasons: list[str]
 
 
-def decide(ctx: DraftContext, *, threshold: float = DEFAULT_CONFIDENCE_THRESHOLD) -> DraftDecision:
-    if ctx.intent in SENSITIVE_INTENTS:
-        return DraftDecision(action="park", reason="park:sensitive_intent")
-    if ctx.confidence < threshold:
-        return DraftDecision(action="park", reason="park:low_confidence")
-    if not ctx.shop_auto_enabled_for_intent:
-        return DraftDecision(action="park", reason="park:auto_disabled_for_intent")
-    return DraftDecision(action="auto_send", reason="send:within_policy")
+def decide(ctx: DraftContext) -> GateResult:
+    """Cờ ngữ cảnh → danh sách lý do escalate, thứ tự tất định theo SEVERITY_RANK.
+
+    Thu thập cờ bật vào set rồi CHIẾU QUA RANK — không if-chain theo thứ tự viết code, nên
+    hoán vị chỗ nào bật cờ trước cũng cùng kết quả (C5). Không có nhánh trả "gửi": hàm này
+    không quyết gửi hay không — phase 1 không ai gửi, nó chỉ quyết seller nhìn cái gì trước.
+    """
+    flagged = {
+        reason
+        for reason, active in (
+            ("sensitive_intent", ctx.intent in SENSITIVE_INTENTS),
+            ("injection_attempt", ctx.injection_detected),
+            ("data_unavailable", ctx.data_unavailable),
+            ("media_content", ctx.has_media),
+            ("window_closed", ctx.window_closed),
+            ("window_unknown", ctx.window_unknown),
+            ("cost_cap", ctx.cost_cap_hit),
+        )
+        if active
+    }
+    return GateResult(escalation_reasons=[r for r in SEVERITY_RANK if r in flagged])
