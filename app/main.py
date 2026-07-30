@@ -1,7 +1,15 @@
-"""FastAPI entrypoint — GD0.5 adds `/api/*` (spec 01 backend, mounted here for the first
+"""FastAPI entrypoint COMBINED — dev-only kể từ A4.
+
+⚠️ A4 (I1) tách hai luồng ra hai process: `app/main_ohana_ai.py` (luồng A, role
+svc_ohana_ai) và `app/main_seller.py` (luồng B, role svc_seller) + `app/worker_seller.py`.
+File này giữ nguyên cho local dev một-process và cho tới khi compose có service riêng
+(adopt-plan §5) — nó chạy CẢ HAI luồng chung một `DATABASE_URL`, tức KHÔNG có ranh giới
+I1/I2 nào; đừng deploy nó.
+
+GD0.5 adds `/api/*` (spec 01 backend, mounted here for the first
 time) and the built SPA shell at `/` (spec 04 Phase P0). Router construction stays
-factory-based (`build_router(...)`) to match the existing `api/inbox.py` shape — this file
-is the ONLY place that wires concrete dependencies (session factory, identity dependency)
+factory-based (`build_router(...)`) to match the existing `api/inbox.py` shape — entrypoint
+là nơi DUY NHẤT wire concrete dependencies (session factory, identity dependency)
 into those factories.
 
 Mount order matters: API routers are included BEFORE the `web/dist` static mount. Starlette
@@ -24,47 +32,23 @@ belongs to `GD0-ZALO` after those two blockers clear.
 
 from __future__ import annotations
 
-import logging
-import os
-import secrets
 from pathlib import Path
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
-from starlette.middleware.base import RequestResponseEndpoint
-from starlette.responses import Response as StarletteResponse
 
 from agent.embedder import default_embedder
 from api.admin import build_router as build_admin_router
 from api.chat import build_router as build_chat_router
 from api.inbox import build_router as build_inbox_router
 from api.mock_auth import build_router as build_mock_auth_router
-from auth.identity import (
-    CSRF_COOKIE_NAME,
-    CSRF_HEADER_NAME,
-    build_active_shop_dep,
-    build_admin_dep,
-)
+from app.runtime import install_csrf, setup_logging
+from auth.identity import build_active_shop_dep, build_admin_dep
 from db.session import make_session_factory
 
-# ---- Logging ------------------------------------------------------------------------------
-# Uvicorn cấu hình logger CỦA NÓ (`uvicorn.*`) rồi để root KHÔNG có handler và mức mặc định
-# WARNING. Nên mọi `logger.info(...)` của app bị NUỐT im lặng khi chạy thật.
-#
-# Đã cháy thật (2026-07-19): G1 yêu cầu log `model/token_in/token_out/latency_ms/shop_id` mỗi
-# request chat. Test dùng `caplog.at_level(logging.INFO)` — pytest TỰ ÉP mức, nên test xanh —
-# nhưng server thật không in một dòng nào. Phát hiện khi mở trình duyệt bấm thử rồi grep log
-# không thấy gì. Bài học: caplog chứng minh "code có gọi logger", KHÔNG chứng minh "log xuất
-# hiện ở production".
-#
-# `force=True` vì uvicorn đã chạy dictConfig trước khi import module này; không có nó thì
-# basicConfig thấy root đã được đụng tới và lặng lẽ không làm gì.
-logging.basicConfig(
-    level=os.environ.get("OHANA_LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    force=True,
-)
+# Logging + CSRF chuyển sang app/runtime.py ở A4 — ba entrypoint dùng chung, xem
+# docstring bên đó cho bài học caplog/force=True và contract double-submit.
+setup_logging()
 
 app = FastAPI(title="Ohana AI Seller", version="0.1.0")
 
@@ -101,30 +85,7 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-# ---- CSRF (double-submit cookie) ----------------------------------------------------------
-# Only state-mutating requests under /api are checked. `/api/mock/authorize` is exempt: it's
-# the bootstrap route that MINTS the session (and the CSRF cookie itself) — there is no
-# session yet for a forged cross-site POST to ride on, and requiring the header here would
-# make the route uncallable from a fresh browser with no cookies at all. The routes this
-# actually protects are `POST /api/inbox/{id}/approve|reject`, mounted in Phase P1.
-_CSRF_EXEMPT_PATHS = {"/api/mock/authorize"}
-_CSRF_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
-
-
-@app.middleware("http")
-async def enforce_csrf_double_submit(
-    request: Request, call_next: RequestResponseEndpoint
-) -> StarletteResponse:
-    if request.method not in _CSRF_SAFE_METHODS and request.url.path not in _CSRF_EXEMPT_PATHS:
-        cookie_token = request.cookies.get(CSRF_COOKIE_NAME)
-        header_token = request.headers.get(CSRF_HEADER_NAME)
-        if (
-            not cookie_token
-            or not header_token
-            or not secrets.compare_digest(cookie_token, header_token)
-        ):
-            return JSONResponse(status_code=403, content={"detail": "csrf_check_failed"})
-    return await call_next(request)
+install_csrf(app)
 
 
 # ---- Static SPA shell (spec 04 Phase P0) --------------------------------------------------

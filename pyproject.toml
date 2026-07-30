@@ -140,10 +140,20 @@ root_packages = ["api", "agent", "app", "auth", "channels", "db",
 include_external_packages = true
 
 [[tool.importlinter.contracts]]
+# `app.main_ohana_ai` vào source từ A4: entrypoint luồng A là chỗ I1 thành process
+# boundary thật — mount nhầm router luồng B là lint-imports đỏ ngay, không chờ deploy.
 name = "I1 · luồng A không thấy luồng B"
 type = "forbidden"
-source_modules = ["api.chat", "retrieval", "parsing"]
+source_modules = ["api.chat", "retrieval", "parsing", "app.main_ohana_ai"]
 forbidden_modules = ["api.webhook", "api.inbox", "agent.drafter", "channels", "bridge"]
+
+[[tool.importlinter.contracts]]
+# Chiều ngược lại của A4: process seller không mount luồng A. `app.main` (combined,
+# dev-only) CỐ Ý vắng mặt — nó chạy cả hai luồng cho local dev, xem docstring của nó.
+name = "I1b · entrypoint seller không mount luồng A"
+type = "forbidden"
+source_modules = ["app.main_seller", "app.worker_seller"]
+forbidden_modules = ["api.chat"]
 
 [[tool.importlinter.contracts]]
 # `agent.providers` CỐ Ý không có trong source_modules — đó là seam duy nhất được
