@@ -53,10 +53,7 @@ def install_csrf(app: FastAPI) -> None:
     async def enforce_csrf_double_submit(
         request: Request, call_next: RequestResponseEndpoint
     ) -> StarletteResponse:
-        if (
-            request.method not in _CSRF_SAFE_METHODS
-            and request.url.path not in _CSRF_EXEMPT_PATHS
-        ):
+        if request.method not in _CSRF_SAFE_METHODS and request.url.path not in _CSRF_EXEMPT_PATHS:
             cookie_token = request.cookies.get(CSRF_COOKIE_NAME)
             header_token = request.headers.get(CSRF_HEADER_NAME)
             if (
