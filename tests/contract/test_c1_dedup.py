@@ -26,14 +26,10 @@ from collections.abc import Iterator
 
 import psycopg
 import pytest
+from conftest import requires_dsn, seed_tenant, wipe_tenant
 from psycopg.types.json import Jsonb
 
-_REQUIRED = ("MIGRATOR_DSN", "SVC_A_DSN", "SVC_B_DSN", "MCP_RO_DSN")
-
-pytestmark = pytest.mark.skipif(
-    any(not os.environ.get(k) for k in _REQUIRED),
-    reason="cần 4 DSN role — xem SETUP.md §4",
-)
+pytestmark = requires_dsn
 
 # Định danh test cố định + dọn trước-và-sau ⇒ chạy lặp trên cùng DB vẫn tất định.
 CHANNEL = "c1test"
@@ -66,30 +62,15 @@ RETURNING outbox_id, status, attempts
 """
 
 
-def _wipe(conn: psycopg.Connection) -> None:
-    # Thứ tự theo FK: outbox → sổ webhook; messages → conversations → customers → shops.
-    conn.execute(
-        "DELETE FROM outbox WHERE event_id IN "
-        "(SELECT event_id FROM webhook_event_log WHERE channel = %s)",
-        (CHANNEL,),
-    )
-    conn.execute("DELETE FROM webhook_event_log WHERE channel = %s", (CHANNEL,))
-    conn.execute("DELETE FROM messages WHERE shop_id = %s", (SHOP,))
-    conn.execute("DELETE FROM pending_reply WHERE shop_id = %s", (SHOP,))
-    conn.execute("DELETE FROM conversations WHERE shop_id = %s", (SHOP,))
-    conn.execute("DELETE FROM customers WHERE shop_id = %s", (SHOP,))
-    conn.execute("DELETE FROM shops WHERE id = %s", (SHOP,))
-
-
 @pytest.fixture
 def migrator() -> Iterator[psycopg.Connection]:
     """Connection dọn dẹp/seed — svc_seller cố ý KHÔNG có DELETE (a1), nên dọn bằng migrator."""
     with psycopg.connect(os.environ["MIGRATOR_DSN"], autocommit=True) as conn:
-        _wipe(conn)
+        wipe_tenant(conn, shop=SHOP, channel=CHANNEL)
         try:
             yield conn
         finally:
-            _wipe(conn)
+            wipe_tenant(conn, shop=SHOP, channel=CHANNEL)
 
 
 @pytest.fixture
@@ -126,16 +107,22 @@ def test_6_1_retry_is_noop_in_one_statement(svc_b: psycopg.Connection) -> None:
     assert (seen, queued) == (1, 1)
 
 
+def _claim_ids(conn: psycopg.Connection) -> dict[int, tuple[str, int]]:
+    """Chạy §6.2, trả {outbox_id: (status, attempts)}. Câu claim tự nó KHÔNG scope theo
+    shop (đúng hành vi worker thật) — test lọc theo id CỦA MÌNH khi assert, để row pending
+    của nguồn khác trên DB dùng chung không làm assert đỏ (review A5-A8)."""
+    return {r[0]: (r[1], r[2]) for r in conn.execute(SQL_6_2).fetchall()}
+
+
 def test_6_2_claim_exactly_once(svc_b: psycopg.Connection) -> None:
-    """§6.2 · claim đánh dấu processing + attempts=1; claim lại thấy queue rỗng."""
-    _deliver(svc_b)
+    """§6.2 · claim đánh dấu processing + attempts=1; claim lại không thấy row của mình."""
+    oid = _deliver(svc_b)
+    assert oid is not None
 
-    claimed = svc_b.execute(SQL_6_2).fetchall()
-    assert len(claimed) == 1
-    _, status, attempts = claimed[0]
-    assert (status, attempts) == ("processing", 1)
+    claimed = _claim_ids(svc_b)
+    assert claimed.get(oid) == ("processing", 1)
 
-    assert svc_b.execute(SQL_6_2).fetchall() == []  # không còn pending ⇒ worker sau tay không
+    assert oid not in _claim_ids(svc_b)  # hết pending ⇒ lượt sau không thấy row này nữa
 
 
 def test_6_2_backoff_row_waits_out_its_delay(
@@ -146,18 +133,18 @@ def test_6_2_backoff_row_waits_out_its_delay(
     Không có điều kiện này, row lỗi là row CŨ NHẤT nên bị claim lại ngay tick 200ms kế
     tiếp — 5 attempts cháy trong ~1 giây và lỗi thoáng qua cũng thành dead (review A5-A8).
     """
-    _deliver(svc_b)
+    oid = _deliver(svc_b)
     migrator.execute(
         "UPDATE outbox SET next_retry_at = now() + interval '1 hour' WHERE shop_id = %s",
         (SHOP,),
     )
-    assert svc_b.execute(SQL_6_2).fetchall() == []  # đang chờ backoff — không claim
+    assert oid not in _claim_ids(svc_b)  # đang chờ backoff — không claim
 
     migrator.execute(
         "UPDATE outbox SET next_retry_at = now() - interval '1 second' WHERE shop_id = %s",
         (SHOP,),
     )
-    assert len(svc_b.execute(SQL_6_2).fetchall()) == 1  # hết hạn chờ — claim bình thường
+    assert oid in _claim_ids(svc_b)  # hết hạn chờ — claim bình thường
 
 
 def test_c1_worker_double_process_writes_one_message(
@@ -165,15 +152,7 @@ def test_c1_worker_double_process_writes_one_message(
 ) -> None:
     """C1 · ghi tin khách hai lần cùng khoá (job requeue) ⇒ đúng 1 row messages."""
     # Seed cây tenant bằng migrator — test này canh khoá C1, không canh grant seed-path.
-    migrator.execute("INSERT INTO shops (id, name) VALUES (%s, 'C1 Test Shop')", (SHOP,))
-    migrator.execute(
-        "INSERT INTO customers (id, shop_id, channel, external_id) VALUES (%s, %s, %s, 'ext-1')",
-        (CUSTOMER, SHOP, CHANNEL),
-    )
-    migrator.execute(
-        "INSERT INTO conversations (id, shop_id, customer_id, channel) VALUES (%s, %s, %s, %s)",
-        (CONVERSATION, SHOP, CUSTOMER, CHANNEL),
-    )
+    seed_tenant(migrator, shop=SHOP, customer=CUSTOMER, conversation=CONVERSATION, channel=CHANNEL)
 
     insert = (
         "INSERT INTO messages "

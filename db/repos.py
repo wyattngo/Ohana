@@ -439,6 +439,23 @@ class WebhookEventRepo:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
+    async def was_seen(self, *, channel: str, platform_msg_id: str) -> bool:
+        """Point-read PK — đường RẺ cho retry storm (review A5-A8 #14): platform retry một
+        event đã ACK là ca thường gặp nhất của webhook, không đáng trả giá
+        `resolve_conversation` (~5 round-trip) chỉ để §6.1 bảo "đã có". CHỈ là tối ưu
+        đường nóng: miss (kể cả miss do race hai bản sao ĐẦU TIÊN) vẫn rơi qua
+        `record_and_enqueue` atomic — dedup thật sống ở §6.1, không ở đây."""
+        row = (
+            await self._session.execute(
+                text(
+                    "SELECT 1 FROM webhook_event_log "
+                    "WHERE channel = :channel AND platform_msg_id = :platform_msg_id"
+                ),
+                {"channel": channel, "platform_msg_id": platform_msg_id},
+            )
+        ).first()
+        return row is not None
+
     async def record_and_enqueue(
         self,
         *,
@@ -546,10 +563,13 @@ class OutboxPayload:
 
 @dataclass(frozen=True)
 class OutboxJob:
-    """Một row outbox đã claim — snapshot để worker xử lý SAU khi transaction claim đã đóng."""
+    """Một row outbox đã claim — snapshot để worker xử lý SAU khi transaction claim đã đóng.
+
+    Chỉ mang field worker THẬT SỰ đọc — `event_id` từng nằm đây mà không ai dùng (review
+    A5-A8: field chết quảng cáo một khả năng không được duy trì; cần link về sổ webhook
+    thì JOIN qua bảng, đừng chở suông)."""
 
     outbox_id: int
-    event_id: int
     shop_id: str
     payload: dict[str, Any]
     attempts: int
@@ -594,7 +614,6 @@ class OutboxRepo:
             (
                 OutboxJob(
                     outbox_id=r["outbox_id"],
-                    event_id=r["event_id"],
                     shop_id=r["shop_id"],
                     payload=r["payload"],
                     attempts=r["attempts"],
@@ -650,7 +669,7 @@ _SET_DEBOUNCE = text("""
 # Đọc đúng theo partial index idx_conversations_debounce_due (predicate trùng khít).
 # `next_debounce_at` đi kèm làm ECHO cho finish — xem _FINISH_DEBOUNCE.
 _DUE_CONVERSATIONS = text("""
-    SELECT id, shop_id, customer_id, channel, debounce_trace_id, next_debounce_at
+    SELECT id, shop_id, customer_id, debounce_trace_id, next_debounce_at
       FROM conversations
      WHERE next_debounce_at IS NOT NULL AND debounce_claimed_at IS NULL
        AND next_debounce_at <= now()
@@ -747,12 +766,16 @@ _REAP_R4_STUCK_RESERVATIONS = text("""
 
 @dataclass(frozen=True)
 class DebounceDue:
-    """Một conversation đến hạn compose — snapshot cho loop debounce."""
+    """Một conversation đến hạn compose — snapshot cho loop debounce.
+
+    Không mang `channel` (review A5-A8: từ A8 compose không cầm sender nào — field đó
+    quảng cáo debounce là channel-aware trong khi không ai duy trì ngữ nghĩa; routing gửi
+    thật của B5 phải đọc từ row conversation TẠI THỜI ĐIỂM GỬI, không phải snapshot này).
+    """
 
     conversation_id: str
     shop_id: str
     customer_id: str
-    channel: str
     trace_id: uuid.UUID | None  # None: row từ trước A7 / ghi tay — caller tự sinh trace mới
     due_at: datetime  # giá trị timer LÚC ĐỌC — echo cho finish_debounce, xem _FINISH_DEBOUNCE
 
@@ -793,9 +816,8 @@ class SchedulerRepo:
                 conversation_id=r[0],
                 shop_id=r[1],
                 customer_id=r[2],
-                channel=r[3],
-                trace_id=r[4],
-                due_at=r[5],
+                trace_id=r[3],
+                due_at=r[4],
             )
             for r in rows
         ]

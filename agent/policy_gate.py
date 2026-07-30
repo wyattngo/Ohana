@@ -73,21 +73,20 @@ class GateResult:
 def decide(ctx: DraftContext) -> GateResult:
     """Cờ ngữ cảnh → danh sách lý do escalate, thứ tự tất định theo SEVERITY_RANK.
 
-    Thu thập cờ bật vào set rồi CHIẾU QUA RANK — không if-chain theo thứ tự viết code, nên
-    hoán vị chỗ nào bật cờ trước cũng cùng kết quả (C5). Không có nhánh trả "gửi": hàm này
-    không quyết gửi hay không — phase 1 không ai gửi, nó chỉ quyết seller nhìn cái gì trước.
+    Map cờ rồi CHIẾU QUA RANK — không if-chain theo thứ tự viết code, nên hoán vị chỗ nào
+    bật cờ trước cũng cùng kết quả (C5). `active[reason]` truy cập THẲNG (không .get):
+    reason có trong RANK mà thiếu trong map ⇒ KeyError ngay lượt decide đầu tiên — desync
+    giữa hai cấu trúc chết to thay vì âm thầm không bao giờ phát reason đó (review A5-A8).
+    Không có nhánh trả "gửi": hàm này không quyết gửi hay không — phase 1 không ai gửi,
+    nó chỉ quyết seller nhìn cái gì trước.
     """
-    flagged = {
-        reason
-        for reason, active in (
-            ("sensitive_intent", ctx.intent in SENSITIVE_INTENTS),
-            ("injection_attempt", ctx.injection_detected),
-            ("data_unavailable", ctx.data_unavailable),
-            ("media_content", ctx.has_media),
-            ("window_closed", ctx.window_closed),
-            ("window_unknown", ctx.window_unknown),
-            ("cost_cap", ctx.cost_cap_hit),
-        )
-        if active
+    active = {
+        "sensitive_intent": ctx.intent in SENSITIVE_INTENTS,
+        "injection_attempt": ctx.injection_detected,
+        "data_unavailable": ctx.data_unavailable,
+        "media_content": ctx.has_media,
+        "window_closed": ctx.window_closed,
+        "window_unknown": ctx.window_unknown,
+        "cost_cap": ctx.cost_cap_hit,
     }
-    return GateResult(escalation_reasons=[r for r in SEVERITY_RANK if r in flagged])
+    return GateResult(escalation_reasons=[r for r in SEVERITY_RANK if active[r]])

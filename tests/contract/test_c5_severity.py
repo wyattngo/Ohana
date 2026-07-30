@@ -21,6 +21,7 @@ from dataclasses import fields
 
 import psycopg
 import pytest
+from conftest import requires_dsn, seed_tenant, wipe_tenant
 
 from agent import policy_gate
 from agent.policy_gate import SEVERITY_RANK, DraftContext, decide
@@ -85,41 +86,22 @@ def test_no_auto_send_code_path() -> None:
 
 # ── 3 · DB CHECK (cần DSN) ───────────────────────────────────────────────────────────────
 
-_REQUIRED = ("MIGRATOR_DSN", "SVC_A_DSN", "SVC_B_DSN", "MCP_RO_DSN")
-_HAS_DSN = all(os.environ.get(k) for k in _REQUIRED)
-
 SHOP = "c5test_shop"
 CUSTOMER = "c5test_customer"
 CONVERSATION = "c5test_conversation"
-
-
-def _wipe(conn: psycopg.Connection) -> None:
-    conn.execute("DELETE FROM pending_reply WHERE shop_id = %s", (SHOP,))
-    conn.execute("DELETE FROM conversations WHERE shop_id = %s", (SHOP,))
-    conn.execute("DELETE FROM customers WHERE shop_id = %s", (SHOP,))
-    conn.execute("DELETE FROM shops WHERE id = %s", (SHOP,))
+CHANNEL = "c5test"
 
 
 @pytest.fixture
 def svc_b() -> Iterator[psycopg.Connection]:
     with psycopg.connect(os.environ["MIGRATOR_DSN"], autocommit=True) as mig:
-        _wipe(mig)
-        mig.execute("INSERT INTO shops (id, name) VALUES (%s, 'C5 Test Shop')", (SHOP,))
-        mig.execute(
-            "INSERT INTO customers (id, shop_id, channel, external_id) "
-            "VALUES (%s, %s, 'c5test', 'ext-1')",
-            (CUSTOMER, SHOP),
-        )
-        mig.execute(
-            "INSERT INTO conversations (id, shop_id, customer_id, channel) "
-            "VALUES (%s, %s, %s, 'c5test')",
-            (CONVERSATION, SHOP, CUSTOMER),
-        )
+        wipe_tenant(mig, shop=SHOP, channel=CHANNEL)
+        seed_tenant(mig, shop=SHOP, customer=CUSTOMER, conversation=CONVERSATION, channel=CHANNEL)
         try:
             with psycopg.connect(os.environ["SVC_B_DSN"], autocommit=True) as conn:
                 yield conn
         finally:
-            _wipe(mig)
+            wipe_tenant(mig, shop=SHOP, channel=CHANNEL)
 
 
 def _insert_draft(conn: psycopg.Connection, reply_id: str, reasons: list[str]) -> None:
@@ -131,10 +113,18 @@ def _insert_draft(conn: psycopg.Connection, reply_id: str, reasons: list[str]) -
     )
 
 
-@pytest.mark.skipif(not _HAS_DSN, reason="cần 4 DSN role — xem SETUP.md §4")
+@requires_dsn
 def test_db_check_rejects_unknown_reason(svc_b: psycopg.Connection) -> None:
     """CHECK escalation_reasons_known · giá trị hợp lệ vào, typo bị DB từ chối."""
     _insert_draft(svc_b, "c5-ok", ["sensitive_intent", "cost_cap"])
 
     with pytest.raises(psycopg.errors.CheckViolation):
         _insert_draft(svc_b, "c5-typo", ["sensitive_intents"])  # thừa 's' — đúng loại typo thật
+
+
+@requires_dsn
+def test_db_check_accepts_full_rank(svc_b: psycopg.Connection) -> None:
+    """TOÀN BỘ SEVERITY_RANK phải qua CHECK của DB THẬT — đây mới là test chống drift
+    code↔DB (review A5-A8): rename một reason trong rank + model mà migration không đổi
+    ⇒ đỏ ở đây, không phải CheckViolation ở compose production."""
+    _insert_draft(svc_b, "c5-all", list(SEVERITY_RANK))

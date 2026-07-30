@@ -28,7 +28,6 @@ Explicitly deferred to Phase 5+:
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
 from typing import Protocol
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -90,13 +89,6 @@ class Drafter(Protocol):
     ) -> _Draft: ...
 
 
-@dataclass(frozen=True)
-class ReceiveOutcome:
-    reply_id: str
-    # Từ policy_gate, đã sắp theo SEVERITY_RANK — rỗng = draft thường (vẫn park).
-    escalation_reasons: list[str]
-
-
 async def receive_and_draft(
     *,
     shop_id: str,
@@ -106,7 +98,7 @@ async def receive_and_draft(
     drafter: Drafter,
     session_factory: async_sessionmaker[AsyncSession],
     trace_id: uuid.UUID,
-) -> ReceiveOutcome:
+) -> str:
     """Draft → gate → PARK. Một đường ra duy nhất (A8 · I10 — phase 1 không có nhánh gửi;
     tham số `sender` + `shop_auto_enabled_intents` đã XOÁ, không phải tạm ẩn: code path
     gửi không tồn tại thì không có gì để bảo vệ bằng if).
@@ -122,13 +114,14 @@ async def receive_and_draft(
     # trả rỗng chứ không raise (xem `MessageRepo.last_n`), nên một `conversation_id` sai
     # cho ra "không có ngữ cảnh", không cho ra ngữ cảnh của người khác.
     #
-    # ⚠️ History NÀY ĐÃ CHỨA tin nhắn hiện tại. `api/webhook.py` (H1) cố ý ghi inbound
-    # TRƯỚC khi gọi hàm này — để tin khách không mất nếu LLM nổ — nên `last_n` thấy luôn
-    # nó ở cuối. Hệ quả: `message` và `history[-1].content` trùng nhau khi đi qua webhook.
-    # Giữ cả hai là có chủ ý: `message` là "câu cần trả lời", `history` là "hội thoại tới
-    # giờ", và implementation của `Drafter` cần phân biệt được hai vai đó. Đừng "sửa" bằng
-    # cách bỏ phần tử cuối — gọi trực tiếp (không qua webhook) thì phần tử cuối KHÔNG phải
-    # tin hiện tại, và cắt mù sẽ ăn mất một lượt thật.
+    # ⚠️ History NÀY ĐÃ CHỨA tin nhắn hiện tại. Từ A5/A7 người ghi inbound là outbox loop
+    # của `app/worker_seller.py` (`append_inbound`, TRƯỚC khi set debounce — tin bền rồi
+    # compose mới chạy ≥5s sau), nên `last_n` thấy luôn nó ở cuối. Hệ quả: `message` và
+    # `history[-1].content` trùng nhau trên đường debounce. Giữ cả hai là có chủ ý:
+    # `message` là "câu cần trả lời", `history` là "hội thoại tới giờ", và implementation
+    # của `Drafter` cần phân biệt được hai vai đó. Đừng "sửa" bằng cách bỏ phần tử cuối —
+    # gọi trực tiếp (không qua worker) thì phần tử cuối KHÔNG phải tin hiện tại, và cắt
+    # mù sẽ ăn mất một lượt thật.
     async with session_factory() as session:
         history = _trim_history(
             await MessageRepo(session, shop_scope=shop_id).last_n(
@@ -151,6 +144,9 @@ async def receive_and_draft(
     # bản ghi của nhánh này, và chưa có worker nào thực sự gửi (`api/inbox.py` approve chỉ
     # flip status). Ghi lúc park hay lúc approve đều là khai "đã gửi" trong khi không ai gửi.
     # Hệ quả đã chấp nhận: reply seller duyệt không vào history cho tới khi worker gửi land.
+    #
+    # Trả về CHỈ reply_id: escalation_reasons đã bền trên row — trả thêm bản sao là hai
+    # nguồn cho cùng một fact (review A5-A8), ai cần thì đọc PendingReply.
     reply_id = uuid.uuid4().hex
     async with session_factory() as session:
         repo = PendingReplyRepo(session, shop_scope=shop_id)
@@ -164,4 +160,4 @@ async def receive_and_draft(
             trace_id=trace_id,
             escalation_reasons=gate.escalation_reasons,
         )
-    return ReceiveOutcome(reply_id=reply_id, escalation_reasons=gate.escalation_reasons)
+    return reply_id

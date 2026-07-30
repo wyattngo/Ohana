@@ -22,14 +22,10 @@ from collections.abc import Iterator
 
 import psycopg
 import pytest
+from conftest import requires_dsn, seed_tenant, wipe_tenant
 from psycopg.types.json import Jsonb
 
-_REQUIRED = ("MIGRATOR_DSN", "SVC_A_DSN", "SVC_B_DSN", "MCP_RO_DSN")
-
-pytestmark = pytest.mark.skipif(
-    any(not os.environ.get(k) for k in _REQUIRED),
-    reason="cần 4 DSN role — xem SETUP.md §4",
-)
+pytestmark = requires_dsn
 
 CHANNEL = "c2test"
 SHOP = "c2test_shop"
@@ -82,41 +78,16 @@ UPDATE outbox
 MAX_ATTEMPTS = 5  # khớp db/repos.py::OutboxRepo.MAX_ATTEMPTS
 
 
-def _wipe(conn: psycopg.Connection) -> None:
-    conn.execute(
-        "DELETE FROM outbox WHERE event_id IN "
-        "(SELECT event_id FROM webhook_event_log WHERE channel = %s)",
-        (CHANNEL,),
-    )
-    conn.execute("DELETE FROM webhook_event_log WHERE channel = %s", (CHANNEL,))
-    conn.execute("DELETE FROM cost_reservation WHERE shop_id = %s", (SHOP,))
-    conn.execute("DELETE FROM cost_budget WHERE shop_id = %s", (SHOP,))
-    conn.execute("DELETE FROM pending_reply WHERE shop_id = %s", (SHOP,))
-    conn.execute("DELETE FROM messages WHERE shop_id = %s", (SHOP,))
-    conn.execute("DELETE FROM conversations WHERE shop_id = %s", (SHOP,))
-    conn.execute("DELETE FROM customers WHERE shop_id = %s", (SHOP,))
-    conn.execute("DELETE FROM shops WHERE id = %s", (SHOP,))
-
-
 @pytest.fixture
 def migrator() -> Iterator[psycopg.Connection]:
     """Dọn/seed/backdate bằng migrator — svc_seller không việc gì phải sửa được đồng hồ."""
     with psycopg.connect(os.environ["MIGRATOR_DSN"], autocommit=True) as conn:
-        _wipe(conn)
-        conn.execute("INSERT INTO shops (id, name) VALUES (%s, 'C2 Test Shop')", (SHOP,))
-        conn.execute(
-            "INSERT INTO customers (id, shop_id, channel, external_id) "
-            "VALUES (%s, %s, %s, 'ext-1')",
-            (CUSTOMER, SHOP, CHANNEL),
-        )
-        conn.execute(
-            "INSERT INTO conversations (id, shop_id, customer_id, channel) VALUES (%s, %s, %s, %s)",
-            (CONVERSATION, SHOP, CUSTOMER, CHANNEL),
-        )
+        wipe_tenant(conn, shop=SHOP, channel=CHANNEL)
+        seed_tenant(conn, shop=SHOP, customer=CUSTOMER, conversation=CONVERSATION, channel=CHANNEL)
         try:
             yield conn
         finally:
-            _wipe(conn)
+            wipe_tenant(conn, shop=SHOP, channel=CHANNEL)
 
 
 @pytest.fixture
@@ -150,19 +121,30 @@ def test_c2_two_schedulers_one_claim(migrator: psycopg.Connection) -> None:
 def test_r3_reaper_frees_stuck_claim(
     migrator: psycopg.Connection, svc_b: psycopg.Connection
 ) -> None:
-    """I13/R3 · claim rồi 'worker chết' ⇒ §6.9 gỡ ⇒ conversation claim lại được."""
+    """I13/R3 · claim rồi 'worker chết' ⇒ §6.9 gỡ ⇒ conversation claim lại được.
+
+    Câu reaper vốn chạy KHÔNG scope (đúng hành vi worker) — assert theo ROW CỦA MÌNH thay
+    vì rowcount toàn cục, để dữ liệu nguồn khác trên DB dùng chung không làm test đỏ."""
     _arm_debounce_past(migrator)
     assert svc_b.execute(SQL_6_3, {"conversation_id": CONVERSATION}).fetchone() is not None
 
+    def _my_claim() -> object:
+        (claimed,) = svc_b.execute(
+            "SELECT debounce_claimed_at FROM conversations WHERE id = %s", (CONVERSATION,)
+        ).fetchone()
+        return claimed
+
     # Treo dưới 5' ⇒ reaper KHÔNG đụng (không gỡ claim của worker đang sống).
-    assert svc_b.execute(SQL_6_9).rowcount == 0
+    svc_b.execute(SQL_6_9)
+    assert _my_claim() is not None
 
     # Worker chết 6' trước — backdate mốc claim bằng migrator.
     migrator.execute(
         "UPDATE conversations SET debounce_claimed_at = now() - interval '6 minutes' WHERE id = %s",
         (CONVERSATION,),
     )
-    assert svc_b.execute(SQL_6_9).rowcount == 1
+    svc_b.execute(SQL_6_9)
+    assert _my_claim() is None
     # Timer vẫn còn (chưa compose) ⇒ hệ tự hồi: claim lại được ngay, không im lặng vĩnh viễn.
     assert svc_b.execute(SQL_6_3, {"conversation_id": CONVERSATION}).fetchone() is not None
 
@@ -276,15 +258,22 @@ def test_r2_reaper_requeues_stuck_outbox(
     )
 
     params = {"max_attempts": MAX_ATTEMPTS}
-    assert svc_b.execute(SQL_R2, params).rowcount == 0  # trong hạn — worker có thể còn sống
+
+    def _my_status() -> str:
+        (status,) = svc_b.execute(
+            "SELECT status FROM outbox WHERE shop_id = %s", (SHOP,)
+        ).fetchone()
+        return status
+
+    svc_b.execute(SQL_R2, params)
+    assert _my_status() == "processing"  # trong hạn — worker có thể còn sống, R2 không đụng
 
     migrator.execute(
         "UPDATE outbox SET claimed_at = now() - interval '6 minutes' WHERE shop_id = %s",
         (SHOP,),
     )
-    assert svc_b.execute(SQL_R2, params).rowcount == 1
-    (status,) = svc_b.execute("SELECT status FROM outbox WHERE shop_id = %s", (SHOP,)).fetchone()
-    assert status == "pending"  # attempts giữ nguyên — §6.2 mới là chỗ đếm lần thử
+    svc_b.execute(SQL_R2, params)
+    assert _my_status() == "pending"  # attempts giữ nguyên — §6.2 mới là chỗ đếm lần thử
 
     # Job GIẾT CHẾT process không bao giờ đi qua mark_failed (review A5-A8 #4) — cạn
     # attempts thì R2 phải là chỗ chốt dead, không requeue crash-loop vĩnh viễn.
@@ -293,7 +282,7 @@ def test_r2_reaper_requeues_stuck_outbox(
         "claimed_at = now() - interval '6 minutes' WHERE shop_id = %s",
         (MAX_ATTEMPTS, SHOP),
     )
-    assert svc_b.execute(SQL_R2, params).rowcount == 1
+    svc_b.execute(SQL_R2, params)
     status, last_error = svc_b.execute(
         "SELECT status, last_error FROM outbox WHERE shop_id = %s", (SHOP,)
     ).fetchone()
@@ -313,7 +302,7 @@ def test_r1_reaper_expires_overdue_drafts(
             (reply_id, SHOP, CONVERSATION, CUSTOMER, uuid.uuid4()),
         )
 
-    assert svc_b.execute(SQL_R1).rowcount == 1
+    svc_b.execute(SQL_R1)
     rows = dict(
         svc_b.execute(
             "SELECT reply_id, status FROM pending_reply WHERE shop_id = %s", (SHOP,)

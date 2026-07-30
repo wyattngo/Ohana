@@ -133,6 +133,16 @@ def build_router(
                 status_code=422, detail="missing_idempotency_key", headers=trace_header
             )
 
+        # Đường rẻ cho retry storm: point-read PK trước khi trả giá resolve (~5 round-trip
+        # + commit) — duplicate là ca THƯỜNG GẶP nhất của webhook khi platform retry lúc
+        # latency tăng, tức đúng lúc DB đang chậm. Miss vẫn rơi qua §6.1 atomic bên dưới
+        # nên race hai bản sao đầu tiên vẫn đúng-một-bên-thắng; đây chỉ là tối ưu.
+        async with session_factory() as session:
+            if await WebhookEventRepo(session).was_seen(
+                channel=channel, platform_msg_id=msg.platform_msg_id
+            ):
+                return _ack(trace_id, action="duplicate", reason="already_processed")
+
         # External identity → our identity, TRƯỚC khi enqueue: worker nhờ vậy không cần
         # adapter — payload đã mang id CỦA TA. `resolve_conversation` idempotent (ON CONFLICT
         # + re-select) nên chạy trước dedup không đẻ trùng khi platform retry.

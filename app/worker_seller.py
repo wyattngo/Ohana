@@ -97,6 +97,9 @@ async def process_job(job: OutboxJob, deps: WorkerDeps) -> None:
     trước) vẫn set debounce tiếp: draft có thể chưa kịp compose trước khi worker cũ chết.
     """
     payload = OutboxPayload.from_payload(job.payload)
+    # MỘT session cho cả job — hai repo call vẫn commit tuần tự riêng (luật "không
+    # transaction xuyên bước" nói về transaction, không cấm dùng chung connection); tách
+    # session là nhân đôi pool checkout trên hot path 200ms không được gì (review A5-A8).
     async with deps.session_factory() as session:
         await MessageRepo(session, shop_scope=job.shop_id).append_inbound(
             conversation_id=payload.conversation_id,
@@ -104,7 +107,6 @@ async def process_job(job: OutboxJob, deps: WorkerDeps) -> None:
             content=payload.text,
             platform_msg_id=payload.platform_msg_id,
         )
-    async with deps.session_factory() as session:
         await SchedulerRepo(session).set_debounce(
             conversation_id=payload.conversation_id,
             delay_seconds=DEBOUNCE_DELAY_SECONDS,
@@ -163,6 +165,15 @@ async def compose_due(item: DebounceDue, deps: WorkerDeps) -> bool:
         ).latest_customer_message(item.conversation_id)
     if latest_customer is None:
         return False
+
+    if item.trace_id is None:
+        # Trace bịa là ĐỨT CHUỖI G6 — hợp lệ chỉ cho row từ trước A7/ghi tay, nhưng phải
+        # THẤY được: một regression làm set_debounce rơi trace sẽ hiện ở đây thành warning
+        # đều đặn thay vì âm thầm sinh draft không đối chiếu được §9 (review A5-A8).
+        logger.warning(
+            "conversation %s không có debounce_trace_id — sinh trace mới, đứt chuỗi G6",
+            item.conversation_id,
+        )
 
     # Timeout BỌC cả lượt compose (LLM bên trong) — cưỡng chế O10 < 5' của R3/R4 bằng
     # code: compose sống lâu hơn mốc reaper là draft đôi (C2) + reservation bị R4 gỡ oan.

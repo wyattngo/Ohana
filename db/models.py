@@ -43,6 +43,7 @@ from sqlalchemy.dialects.postgresql import ENUM as PG_ENUM
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from agent.persona import PERSONA_MAX_CHARS
+from agent.policy_gate import SEVERITY_RANK
 from app.config import EMBED_DIM
 
 # Alias, KHÔNG phải bản sao — mọi chỗ trong file này vẫn đọc `_EMBED_DIM` như trước, nhưng giá
@@ -369,12 +370,15 @@ class PendingReply(Base):
             "label IS NULL OR label IN ('approved', 'rejected', 'edited')",
             name="ck_pending_reply_label",
         ),
-        # NGUYÊN VĂN design §5.5 — bảy giá trị khớp policy_gate.SEVERITY_RANK.
+        # DERIVE từ policy_gate.SEVERITY_RANK — cùng cơ chế PERSONA_MAX_CHARS ở trên:
+        # model là code SỐNG, chép tay bảy giá trị là nguồn sự thật thứ N (review A5-A8;
+        # migration a8 giữ bản chép — snapshot đóng băng đúng nghĩa migration). B4 đổi
+        # rank thì metadata tự khớp; DB thật cần migration đi kèm — gate là contract test
+        # insert đủ list(SEVERITY_RANK) qua role thật.
         CheckConstraint(
             "escalation_reasons <@ ARRAY["
-            "'sensitive_intent','injection_attempt','data_unavailable',"
-            "'media_content','window_closed','cost_cap','window_unknown'"
-            "]::text[]",
+            + ",".join(f"'{reason}'" for reason in SEVERITY_RANK)
+            + "]::text[]",
             name="escalation_reasons_known",
         ),
         ForeignKeyConstraint(

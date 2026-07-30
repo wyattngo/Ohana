@@ -20,15 +20,12 @@ from collections.abc import Iterator
 
 import psycopg
 import pytest
+from conftest import requires_dsn, wipe_tenant
 
-_REQUIRED = ("MIGRATOR_DSN", "SVC_A_DSN", "SVC_B_DSN", "MCP_RO_DSN")
-
-pytestmark = pytest.mark.skipif(
-    any(not os.environ.get(k) for k in _REQUIRED),
-    reason="cần 4 DSN role — xem SETUP.md §4",
-)
+pytestmark = requires_dsn
 
 SHOP = "i8test_shop"
+CHANNEL = "i8test"
 CAP = 100
 
 SQL_6_5 = """
@@ -58,22 +55,16 @@ UPDATE cost_budget b
 """
 
 
-def _wipe(conn: psycopg.Connection) -> None:
-    conn.execute("DELETE FROM cost_reservation WHERE shop_id = %s", (SHOP,))
-    conn.execute("DELETE FROM cost_budget WHERE shop_id = %s", (SHOP,))
-    conn.execute("DELETE FROM shops WHERE id = %s", (SHOP,))
-
-
 @pytest.fixture
 def migrator() -> Iterator[psycopg.Connection]:
     """Dọn/seed bằng migrator — svc_seller cố ý không có DELETE (a1)."""
     with psycopg.connect(os.environ["MIGRATOR_DSN"], autocommit=True) as conn:
-        _wipe(conn)
+        wipe_tenant(conn, shop=SHOP, channel=CHANNEL)
         conn.execute("INSERT INTO shops (id, name) VALUES (%s, 'I8 Test Shop')", (SHOP,))
         try:
             yield conn
         finally:
-            _wipe(conn)
+            wipe_tenant(conn, shop=SHOP, channel=CHANNEL)
 
 
 @pytest.fixture
