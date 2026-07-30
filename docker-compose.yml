@@ -22,6 +22,10 @@ services:
       POSTGRES_PASSWORD: ${LANGFUSE_DB_PW}
       POSTGRES_DB: langfuse
     volumes: [langfusedata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "langfuse"]
+      interval: 5s
+      retries: 10
 
   # v2, KHÔNG v3 — v3 cần ClickHouse + Redis + MinIO.
   # Self-host là điều kiện để golden set C4 (PII thật) ở lại trong nước.
@@ -34,6 +38,11 @@ services:
       SALT: ${LANGFUSE_SALT}
       TELEMETRY_ENABLED: "false"
     ports: ["3000:3000"]
-    depends_on: [langfuse-db]
+    # `service_healthy`, không phải dạng list trần: app chạy prisma migrate ngay khi
+    # boot — thua cuộc đua với postgres là Exited(1) nằm im, `up -d` trông như xong
+    # mà :3000 chết (dính thật 2026-07-30).
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
 
 volumes: {pgdata: {}, langfusedata: {}}
