@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from sqlalchemy import Uuid, bindparam, select, text, update
+from sqlalchemy import Uuid, bindparam, func, select, text, update
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import CursorResult
@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from agent.persona import PERSONA_MAX_CHARS
 from db.models import (
     Conversation,
+    CostBudget,
     Message,
     Outbox,
     PendingReply,
@@ -541,6 +542,119 @@ class OutboxRepo:
             {"max_attempts": self.MAX_ATTEMPTS, "outbox_id": outbox_id, "error": error},
         )
         await self._session.commit()
+
+
+# §6.5 NGUYÊN VĂN (design — I8, I13), đổi tên bảng theo ánh xạ adopt-plan §1 + bind theo tên.
+#
+# 🚫 Điều kiện cap nằm TRONG WHERE của UPDATE — sức mạnh của câu này. "Đọc budget, so ở
+# Python, rồi UPDATE" là race kinh điển: hai request cùng thấy còn chỗ rồi cùng cộng, shop
+# vượt cap mà không câu nào sai. 🚫 Cộng `reserved_tokens` mà không ghi `cost_reservation`
+# cũng cấm — reservation vô danh thì reaper R4 không gỡ được (I13).
+_RESERVE_COST = text("""
+    WITH upd AS (
+      UPDATE cost_budget
+         SET reserved_tokens = reserved_tokens + :tokens
+       WHERE shop_id = :shop_id AND budget_date = CURRENT_DATE
+         AND reserved_tokens + actual_tokens + :tokens <= cap_tokens
+      RETURNING shop_id, budget_date
+    )
+    INSERT INTO cost_reservation (shop_id, budget_date, tokens, trace_id)
+    SELECT shop_id, budget_date, :tokens, :trace_id FROM upd
+    RETURNING reservation_id
+""").bindparams(bindparam("trace_id", type_=Uuid()))
+
+# §6.5b NGUYÊN VĂN — release + trừ reserved + cộng token THẬT, một câu. Guard
+# `released_at IS NULL` làm double-reconcile thành no-op (CTE rỗng ⇒ UPDATE ngoài 0 row).
+_RECONCILE_COST = text("""
+    WITH rel AS (
+      UPDATE cost_reservation SET released_at = now()
+       WHERE reservation_id = :reservation_id AND released_at IS NULL
+      RETURNING shop_id, budget_date, tokens
+    )
+    UPDATE cost_budget b
+       SET reserved_tokens = b.reserved_tokens - rel.tokens,
+           actual_tokens   = b.actual_tokens   + :actual_tokens
+      FROM rel
+     WHERE b.shop_id = rel.shop_id AND b.budget_date = rel.budget_date
+""")
+
+
+class CostRepo:
+    """Cost cap pre-charge (A6 · design §6.5 §6.5b · I8, I13).
+
+    Shop-scoped như mọi repo tenant: scope bake ở constructor, caller không truyền
+    `shop_id` vào method nào — không có tham số để bẻ. Nhịp dùng (wire ở B7):
+
+        ensure_today(cap) → reserve(ước_lượng, trace) → gọi LLM → reconcile(id, token_thật)
+
+    LLM nổ/timeout giữa reserve và reconcile ⇒ reservation treo, reaper R4 (A7) release
+    sau 5'. Timeout của router (O10) PHẢI ngắn hơn 5' — reconcile đến SAU khi R4 đã
+    release là no-op nhờ guard, token thật của lượt đó không vào sổ.
+    """
+
+    def __init__(self, session: AsyncSession, *, shop_scope: str) -> None:
+        if not shop_scope:
+            raise ValueError("shop_scope is required — no default, no cross-tenant surface")
+        self._session = session
+        self._shop_scope = shop_scope
+
+    async def ensure_today(self, *, cap_tokens: int) -> None:
+        """Tạo row ngân sách CURRENT_DATE nếu chưa có — idempotent, KHÔNG đè cap đang có.
+
+        Tách khỏi `reserve` có chủ đích: §6.5 là UPDATE-first nguyên văn, nhét provisioning
+        vào đó là đổi hình dạng câu lệnh. `cap_tokens` do caller truyền — nguồn cap thật
+        (`shop_config.cost_cap_tokens_day`, design §5.3) chưa có bảng, B7 quyết khi wire;
+        không đặt hằng số mặc định ở đây để khỏi thành nguồn sự thật thứ hai.
+
+        ON CONFLICT DO NOTHING thay vì DO UPDATE: đổi cap giữa ngày là quyết định vận hành
+        có chủ đích (row đã có reserved/actual đang đếm), không phải side-effect của một
+        lần gọi ensure.
+        """
+        stmt = (
+            pg_insert(CostBudget)
+            .values(
+                shop_id=self._shop_scope,
+                budget_date=func.current_date(),
+                cap_tokens=cap_tokens,
+            )
+            .on_conflict_do_nothing(index_elements=["shop_id", "budget_date"])
+        )
+        await self._session.execute(stmt)
+        await self._session.commit()
+
+    async def reserve(self, *, tokens: int, trace_id: uuid.UUID) -> int | None:
+        """Giữ chỗ `tokens` cho hôm nay (§6.5). Trả `reservation_id`, hoặc `None` khi
+        chạm trần HOẶC chưa có row ngân sách hôm nay — hai ca cùng một nghĩa cho caller:
+        KHÔNG gọi LLM, cổng chính sách chuyển GIỮ với `reason='cost_cap'` (w§2.4).
+        Fail-closed có chủ đích: thiếu provisioning thì im lặng không-tốn-tiền, không phải
+        im lặng tốn-không-giới-hạn."""
+        if tokens <= 0:
+            raise ValueError(f"tokens phải > 0, nhận {tokens}")
+        row = (
+            await self._session.execute(
+                _RESERVE_COST,
+                {"shop_id": self._shop_scope, "tokens": tokens, "trace_id": trace_id},
+            )
+        ).first()
+        await self._session.commit()
+        return int(row[0]) if row is not None else None
+
+    async def reconcile(self, *, reservation_id: int, actual_tokens: int) -> bool:
+        """Trả chỗ đã giữ + ghi token THẬT (§6.5b). Trả `False` nếu reservation đã released
+        (double-reconcile, hoặc R4 đã gỡ trước) — no-op, caller chỉ nên log.
+
+        `reservation_id` là danh tính toàn cục (identity), không lọc theo shop trong câu
+        §6.5b nguyên văn — id do chính `reserve` của repo NÀY trả ra trong cùng lượt xử lý,
+        không phải input ngoài."""
+        result = cast(
+            "CursorResult[Any]",
+            await self._session.execute(
+                _RECONCILE_COST,
+                {"reservation_id": reservation_id, "actual_tokens": actual_tokens},
+            ),
+        )
+        await self._session.commit()
+        return int(result.rowcount or 0) > 0
 
 
 class ZaloOATokenRepo:

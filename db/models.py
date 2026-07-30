@@ -14,7 +14,7 @@ ids for those relations since GĐ0 doesn't need normalized joins.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import (
     BigInteger,
     CheckConstraint,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -523,6 +524,68 @@ class Outbox(Base):
         Index("idx_outbox_pending", "created_at", postgresql_where=text("status = 'pending'")),
         Index(
             "idx_outbox_processing", "claimed_at", postgresql_where=text("status = 'processing'")
+        ),
+    )
+
+
+class CostBudget(Base):
+    """Sổ cái cost theo ngày — một shop một ngày một row (A6 · design §5.6 · I8).
+
+    `reserved_tokens` (đang giữ chỗ) và `actual_tokens` (đã reconcile) tách bạch có chủ
+    đích: điều kiện cap của §6.5 đọc CẢ HAI trong WHERE của UPDATE — atomic, không bao giờ
+    check-rồi-update. Đường ghi DUY NHẤT là `CostRepo` (§6.5/§6.5b nguyên văn); UPDATE hai
+    cột đếm ngoài repo đó là phá I8.
+
+    FK về `shops` — KHÁC `outbox`/`webhook_event_log`: ngân sách là dữ liệu tenant thật,
+    không có ca sentinel pre-verify, shop phải tồn tại trước khi có ngân sách.
+
+    Row ngày do `CostRepo.ensure_today` tạo idempotent; §6.5 là UPDATE-first nên thiếu row
+    ⇒ reserve trả 0 row ⇒ fail-closed (coi như chạm trần, không gọi LLM — w§2.4).
+    """
+
+    __tablename__ = "cost_budget"
+
+    shop_id: Mapped[str] = mapped_column(Text, ForeignKey("shops.id"), primary_key=True)
+    budget_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    cap_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    reserved_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    actual_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+
+
+class CostReservation(Base):
+    """Một lần giữ chỗ token, CÓ DANH TÍNH (A6 · design §5.6 · I13).
+
+    Không có bảng này thì LLM timeout ⇒ `reserved_tokens` rò rỉ ⇒ shop bị khoá tới nửa
+    đêm, và reaper không có cách nào biết reservation nào treo. `released_at IS NULL` =
+    đang giữ chỗ; partial index bên dưới là đường quét của reaper R4 (§6.10 — A7).
+
+    `trace_id` nối tiếp G6: webhook → outbox → draft → reservation cùng một trace, đối
+    chiếu được ai giữ chỗ cho lượt nào. Composite FK ghim reservation vào đúng row ngân
+    sách ngày — không bao giờ trỏ vào một ngày không tồn tại.
+    """
+
+    __tablename__ = "cost_reservation"
+
+    reservation_id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    shop_id: Mapped[str] = mapped_column(Text, nullable=False)
+    budget_date: Mapped[date] = mapped_column(Date, nullable=False)
+    tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    trace_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index(
+            "idx_cost_reservation_unreleased",
+            "created_at",
+            postgresql_where=text("released_at IS NULL"),
+        ),
+        ForeignKeyConstraint(
+            ["shop_id", "budget_date"],
+            ["cost_budget.shop_id", "cost_budget.budget_date"],
+            name="cost_reservation_shop_id_budget_date_fkey",
         ),
     )
 
