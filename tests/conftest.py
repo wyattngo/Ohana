@@ -45,6 +45,18 @@ if not _DB_NAME.endswith("_test") and os.environ.get("OHANA_TESTS_DESTRUCTIVE_OK
 
 _FreshDb = Callable[[], Awaitable[tuple[AsyncEngine, async_sessionmaker[AsyncSession]]]]
 
+# ENUM khai `create_type=False` trong models (migration a5 sở hữu type trên DB thật) ⇒
+# `create_all` KHÔNG tạo nó — DB test trắng tinh (CI tạo mới mỗi run) nổ UndefinedObject
+# ở MỌI fixture setup (đo trên CI 2026-07-30; local lọt vì ohana_test còn type từ các lần
+# alembic cũ). Postgres không có CREATE TYPE IF NOT EXISTS cho enum → DO-block nuốt
+# duplicate_object. Giá trị chép NGUYÊN VĂN từ migration a5_outbox_trace.
+_ENSURE_ENUMS = """
+DO $$ BEGIN
+    CREATE TYPE outbox_status AS ENUM ('pending','processing','done','dead');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$
+"""
+
 
 @pytest.fixture(scope="session", autouse=True)
 def _tables_exist_up_front() -> None:
@@ -67,6 +79,7 @@ def _tables_exist_up_front() -> None:
         # trên DB thật, ở đây phải tự lo. Cả hai đều idempotent.
         conn.exec_driver_sql("CREATE EXTENSION IF NOT EXISTS vector")
         conn.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS platform")
+        conn.exec_driver_sql(_ENSURE_ENUMS)
         Base.metadata.create_all(conn)
     engine.dispose()
 
@@ -95,6 +108,9 @@ async def fresh_db() -> AsyncIterator[_FreshDb]:
             # a1 chuyển `embeddings` sang schema `platform`; `create_all` KHÔNG tự tạo
             # schema (đó là việc của migration a1 trên DB thật — DB test không chạy alembic).
             await conn.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS platform")
+            # Type có thể vừa bị test_embedding_dim downgrade-from-zero xoá — đảm bảo lại
+            # mỗi lượt dựng (idempotent, xem _ENSURE_ENUMS).
+            await conn.exec_driver_sql(_ENSURE_ENUMS)
             await conn.run_sync(Base.metadata.drop_all)
             await conn.run_sync(Base.metadata.create_all)
         created.append(engine)
