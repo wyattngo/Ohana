@@ -44,6 +44,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from xml.sax.saxutils import escape as _xml_escape
+
+from agent.types import Scrubbed, Wrapped
 
 # Chữ hoa tiếng Việt viết tường minh. `str.isupper()` xử lý Unicode đúng hơn, nhưng nó
 # sống trong Python còn đây cần điều kiện nằm TRONG regex: nếu để callback loại bỏ sau,
@@ -126,3 +129,27 @@ def redact(text: str) -> RedactionResult:
         return match.group(0)  # pragma: no cover — alternation luôn khớp đúng một nhánh
 
     return RedactionResult(text=_PATTERN.sub(_sub, text), hits=hits)
+
+
+# ── Constructor cho type gate I3/I4 (A3) ─────────────────────────────────────────
+# Hai hàm dưới là chỗ DUY NHẤT trong repo được gọi `Scrubbed(...)` / `Wrapped(...)`.
+# `tests/contract/test_construction_sites.py` canh bất biến đó — NewType không tự
+# chặn được ép kiểu bừa (xem agent/types.py), test + review hai lớp cộng lại mới kín.
+
+
+def scrub(text: str) -> Scrubbed:
+    """Redact rồi đóng dấu kiểu. Call-site cần `hits` cho destination-log thì dùng
+    `redact()` trực tiếp — nhưng chuỗi mang đi LLM phải đi qua đây để có dấu."""
+    return Scrubbed(redact(text).text)
+
+
+def wrap(text: str, *, tag: str) -> Wrapped:
+    """XML-escape + bọc tag chống prompt injection (spec 16 C0).
+
+    Escape `<` `>` `&` để user KHÔNG breakout khỏi tag bằng cách chèn
+    `</tag><system>...`; tag là keyword-only để call-site khai rõ ngữ cảnh
+    (`user_question`, `customer_message`…) thay vì im lặng nhận default.
+    Escape (structural) + directive trong system prompt (contract) = hai lớp
+    defense, mất một vẫn còn một.
+    """
+    return Wrapped(f"<{tag}>{_xml_escape(text)}</{tag}>")
