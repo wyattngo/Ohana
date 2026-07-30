@@ -49,6 +49,18 @@ REAPER_TICK_SECONDS = 10.0  # design §3 — chu kỳ reaper
 # đặt số để có ràng buộc cứng từ đầu, KHÔNG phải vì tin nó đúng. Đo lại khi có traffic.
 DEBOUNCE_DELAY_SECONDS = 5.0
 
+# Trần thời gian một lượt compose (bọc cả LLM) — PHẢI < 5' của reaper: compose sống lâu
+# hơn mốc R3 là claim bị gỡ giữa chừng ⇒ worker khác compose song song ⇒ draft đôi (vỡ
+# C2). 240s chừa 20% lề. Đây là enforcement bằng code của điều kiện O10 vốn chỉ nằm trong
+# docstring (review A5-A8 #5). TimeoutError đi chung đường compose-lỗi (đếm trần poison).
+COMPOSE_TIMEOUT_SECONDS = 240.0
+
+# Trần lỗi compose LIÊN TIẾP trước khi bỏ cuộc một conversation (review A5-A8 #6): thiếu
+# nó, drafter nổ tất định ⇒ R3 gỡ claim mỗi 5' ⇒ gọi LLM lại vĩnh viễn (~288 lần/ngày).
+# Đạt trần ⇒ NULL timer + GIỮ conversations.compose_failures cho vận hành query (quyết
+# 2026-07-30: dừng + counter, không park draft placeholder). Thành công ⇒ reset 0.
+MAX_COMPOSE_FAILURES = 5
+
 
 @dataclass(frozen=True)
 class WorkerDeps:
@@ -145,15 +157,18 @@ async def compose_due(item: DebounceDue, deps: WorkerDeps) -> bool:
     if latest_customer is None:
         return False
 
-    await receive_and_draft(
-        shop_id=item.shop_id,
-        customer_id=item.customer_id,
-        conversation_id=item.conversation_id,
-        message=latest_customer.content,
-        drafter=deps.drafter,
-        session_factory=deps.session_factory,
-        trace_id=item.trace_id if item.trace_id is not None else uuid.uuid4(),
-    )
+    # Timeout BỌC cả lượt compose (LLM bên trong) — cưỡng chế O10 < 5' của R3/R4 bằng
+    # code: compose sống lâu hơn mốc reaper là draft đôi (C2) + reservation bị R4 gỡ oan.
+    async with asyncio.timeout(COMPOSE_TIMEOUT_SECONDS):
+        await receive_and_draft(
+            shop_id=item.shop_id,
+            customer_id=item.customer_id,
+            conversation_id=item.conversation_id,
+            message=latest_customer.content,
+            drafter=deps.drafter,
+            session_factory=deps.session_factory,
+            trace_id=item.trace_id if item.trace_id is not None else uuid.uuid4(),
+        )
     return True
 
 
@@ -170,25 +185,53 @@ async def run_debounce_loop(deps: WorkerDeps, *, run_once: bool = False) -> None
 
         for item in due:
             async with deps.session_factory() as session:
-                claimed = await SchedulerRepo(session).claim_debounce(item.conversation_id)
-            if not claimed:
+                claimed_at = await SchedulerRepo(session).claim_debounce(item.conversation_id)
+            if claimed_at is None:
                 continue
             try:
                 composed = await compose_due(item, deps)
             except Exception:
-                logger.exception("compose lỗi, để R3 gỡ claim: %s", item.conversation_id)
+                # Lỗi (kể cả TimeoutError của COMPOSE_TIMEOUT_SECONDS): đếm trần poison.
+                # Chưa đạt trần ⇒ để claim treo cho R3 gỡ sau 5' — retry có nhịp. Đạt trần
+                # ⇒ bỏ cuộc: thôi retry, giữ counter cho vận hành (không đốt LLM vĩnh viễn).
+                logger.exception("compose lỗi: %s", item.conversation_id)
+                async with deps.session_factory() as session:
+                    failures = await SchedulerRepo(session).record_compose_failure(
+                        item.conversation_id
+                    )
+                if failures >= MAX_COMPOSE_FAILURES:
+                    async with deps.session_factory() as session:
+                        await SchedulerRepo(session).give_up_debounce(
+                            item.conversation_id, claimed_at=claimed_at
+                        )
+                    logger.error(
+                        "compose bỏ cuộc sau %s lỗi liên tiếp: %s "
+                        "(conversations.compose_failures giữ nguyên cho vận hành)",
+                        failures,
+                        item.conversation_id,
+                    )
                 continue
             if not composed:
                 # Không có tin khách để trả lời — BẤT THƯỜNG (timer chỉ được arm sau khi
                 # append_inbound). KHÔNG finish: finish sẽ nuốt timer và nếu tin khách vào
-                # muộn (race) thì không ai draft. Để claim treo cho R3 gỡ + thử lại có nhịp.
+                # muộn (race) thì không ai draft. Đi cùng đường đếm trần như compose lỗi —
+                # claim treo cho R3, lặp đủ trần thì bỏ cuộc thay vì loop 5' vĩnh viễn.
                 logger.warning(
                     "debounce đến hạn nhưng không có tin khách: %s", item.conversation_id
                 )
+                async with deps.session_factory() as session:
+                    failures = await SchedulerRepo(session).record_compose_failure(
+                        item.conversation_id
+                    )
+                if failures >= MAX_COMPOSE_FAILURES:
+                    async with deps.session_factory() as session:
+                        await SchedulerRepo(session).give_up_debounce(
+                            item.conversation_id, claimed_at=claimed_at
+                        )
                 continue
             async with deps.session_factory() as session:
                 await SchedulerRepo(session).finish_debounce(
-                    item.conversation_id, due_at=item.due_at
+                    item.conversation_id, due_at=item.due_at, claimed_at=claimed_at
                 )
 
         if run_once:

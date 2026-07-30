@@ -609,17 +609,40 @@ _DUE_CONVERSATIONS = text("""
      LIMIT :limit
 """)
 
-# Thả claim sau khi compose xong. `next_debounce_at` chỉ về NULL khi VẪN LÀ ĐÚNG timer đã
-# claim (echo-compare :due_at) — tin đến GIỮA lúc compose đặt timer MỚI thì giữ nguyên ⇒
-# compose lại sau (O9). 🚫 Đừng "đơn giản hoá" thành so `<= now()`: compose (LLM) thường
-# lâu hơn DEBOUNCE_DELAY_SECONDS, timer mới cũng đã quá hạn tại thời điểm finish — so với
-# now() là nuốt luôn tin B, hội thoại im lặng (bug review A5-A8 #1).
+# Thả claim sau khi compose xong — HAI echo, mỗi cái chặn một bug review A5-A8:
+# · :due_at — `next_debounce_at` chỉ về NULL khi VẪN LÀ ĐÚNG timer đã claim; tin đến GIỮA
+#   lúc compose đặt timer MỚI thì giữ nguyên ⇒ compose lại sau (O9). 🚫 Đừng "đơn giản
+#   hoá" thành so `<= now()`: compose (LLM) thường lâu hơn DEBOUNCE_DELAY_SECONDS, timer
+#   mới cũng đã quá hạn lúc finish — so với now() là nuốt luôn tin B (#1).
+# · :claimed_at trong WHERE — token sở hữu: compose treo >5' bị R3 gỡ rồi worker khác
+#   claim lại thì finisher CŨ (mang claimed_at đã bị đè) thành no-op, không xoá claim
+#   của người đang compose ⇒ không draft đôi (#5). Cùng bài với cost_reservation có danh
+#   tính: claim vô danh thì không release an toàn được.
+# `compose_failures = 0`: compose THÀNH CÔNG reset trần poison — chỉ chuỗi lỗi liên tiếp
+# mới tích đủ MAX_COMPOSE_FAILURES.
 _FINISH_DEBOUNCE = text("""
     UPDATE conversations
        SET debounce_claimed_at = NULL,
+           compose_failures = 0,
            next_debounce_at = CASE WHEN next_debounce_at = :due_at
                                    THEN NULL ELSE next_debounce_at END
+     WHERE id = :conversation_id AND debounce_claimed_at = :claimed_at
+""")
+
+# Trần poison (review A5-A8 #6): compose lỗi ⇒ +1 (một câu, không check-then-act).
+_RECORD_COMPOSE_FAILURE = text("""
+    UPDATE conversations SET compose_failures = compose_failures + 1
      WHERE id = :conversation_id
+    RETURNING compose_failures
+""")
+
+# Bỏ cuộc (đạt trần): NULL timer để thôi retry, GIỮ counter cho vận hành query (quyết
+# 2026-07-30: dừng + counter, không park draft ESCALATE). Echo :claimed_at cùng lý do
+# finish — không dọn claim của worker khác đang compose.
+_GIVE_UP_DEBOUNCE = text("""
+    UPDATE conversations
+       SET next_debounce_at = NULL, debounce_claimed_at = NULL
+     WHERE id = :conversation_id AND debounce_claimed_at = :claimed_at
 """)
 
 # ── Reaper — 4 việc, design §3, chạy mỗi 10s. R3/R4 NGUYÊN VĂN §6.9/§6.10. ──────────────
@@ -630,10 +653,18 @@ _REAP_R1_EXPIRED_DRAFTS = text("""
      WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at < now()
 """)
 
-# R2 · outbox kẹt processing >5' → pending — đóng lỗ đã khai ở A5 (worker chết giữa claim
-# và done). attempts KHÔNG tăng ở đây — §6.2 là chỗ duy nhất tăng, lần claim lại sẽ đếm.
+# R2 · outbox kẹt processing >5' → pending, TRỪ KHI đã cạn attempts → dead (review A5-A8
+# #4: job giết chết cả process không bao giờ đi qua mark_failed, nên trần MAX_ATTEMPTS
+# phải được kiểm ở ĐÂY nữa — thiếu nó là crash-loop mỗi 5' vĩnh viễn, kéo sập cả worker).
+# attempts KHÔNG tăng ở đây — §6.2 là chỗ duy nhất tăng, lần claim lại sẽ đếm.
 _REAP_R2_STUCK_OUTBOX = text("""
-    UPDATE outbox SET status = 'pending'
+    UPDATE outbox
+       SET status = CASE WHEN attempts >= :max_attempts
+                         THEN 'dead'::outbox_status
+                         ELSE 'pending'::outbox_status END,
+           last_error = CASE WHEN attempts >= :max_attempts
+                             THEN 'r2_exhausted: worker chết ' || attempts::text || ' lần'
+                             ELSE last_error END
      WHERE status = 'processing' AND claimed_at < now() - interval '5 minutes'
 """)
 
@@ -644,18 +675,24 @@ _REAP_R3_STUCK_DEBOUNCE = text("""
      WHERE debounce_claimed_at < now() - interval '5 minutes'
 """)
 
-# R4 · §6.10 NGUYÊN VĂN — release reservation treo (LLM timeout giữa reserve và
-# reconcile). GREATEST(0, ...) phòng double-release; không thay cho việc release đúng.
+# R4 · §6.10 NGUYÊN VĂN (amend 2026-07-30 thêm CTE agg) — release reservation treo (LLM
+# timeout giữa reserve và reconcile). 🚫 Bỏ `agg` mà join thẳng `rel`: UPDATE…FROM chỉ áp
+# MỘT row FROM mỗi row đích — hai reservation treo cùng shop/ngày chỉ trừ được một, phần
+# còn lại rò trong reserved_tokens tới nửa đêm và không còn gì cho R4 gỡ (lý do amend).
+# GREATEST(0, ...) phòng double-release; không thay cho việc release đúng.
 _REAP_R4_STUCK_RESERVATIONS = text("""
     WITH rel AS (
       UPDATE cost_reservation SET released_at = now()
        WHERE released_at IS NULL AND created_at < now() - interval '5 minutes'
       RETURNING shop_id, budget_date, tokens
+    ), agg AS (
+      SELECT shop_id, budget_date, sum(tokens) AS tokens
+        FROM rel GROUP BY shop_id, budget_date
     )
     UPDATE cost_budget b
-       SET reserved_tokens = GREATEST(0, b.reserved_tokens - r.tokens)
-      FROM rel r
-     WHERE b.shop_id = r.shop_id AND b.budget_date = r.budget_date
+       SET reserved_tokens = GREATEST(0, b.reserved_tokens - a.tokens)
+      FROM agg a
+     WHERE b.shop_id = a.shop_id AND b.budget_date = a.budget_date
 """)
 
 
@@ -714,22 +751,56 @@ class SchedulerRepo:
             for r in rows
         ]
 
-    async def claim_debounce(self, conversation_id: str) -> bool:
-        """§6.3 — `False` = instance khác đã lấy (hoặc chưa đến hạn) ⇒ bỏ qua, KHÔNG chờ.
-        Đúng 1 draft dù N scheduler (C2)."""
+    async def claim_debounce(self, conversation_id: str) -> datetime | None:
+        """§6.3 — trả `debounce_claimed_at` vừa ghi (token sở hữu, echo lúc finish/give-up),
+        `None` = instance khác đã lấy (hoặc chưa đến hạn) ⇒ bỏ qua, KHÔNG chờ. Đúng 1
+        draft dù N scheduler (C2). Token đọc bằng SELECT sau claim trong CÙNG session —
+        §6.3 giữ nguyên văn (RETURNING id), không nới RETURNING."""
         row = (
             await self._session.execute(_CLAIM_DEBOUNCE, {"conversation_id": conversation_id})
         ).first()
+        if row is None:
+            await self._session.commit()
+            return None
+        claimed_at = (
+            await self._session.execute(
+                text("SELECT debounce_claimed_at FROM conversations WHERE id = :cid"),
+                {"cid": conversation_id},
+            )
+        ).scalar_one()
         await self._session.commit()
-        return row is not None
+        return cast("datetime", claimed_at)
 
-    async def finish_debounce(self, conversation_id: str, *, due_at: datetime) -> None:
-        """Thả claim sau compose. `due_at` = timer lúc claim (`DebounceDue.due_at`) — timer
-        chỉ bị xoá nếu VẪN là giá trị đó; tin đến giữa lúc compose đã dời timer thì giữ.
-        Compose LỖI thì ĐỪNG gọi — để claim treo cho R3 gỡ sau 5' là đường retry có nhịp,
-        không retry nóng mỗi tick 500ms."""
+    async def finish_debounce(
+        self, conversation_id: str, *, due_at: datetime, claimed_at: datetime
+    ) -> None:
+        """Thả claim sau compose THÀNH CÔNG (reset luôn compose_failures). Hai echo:
+        `due_at` giữ timer tin-giữa-compose, `claimed_at` chặn finisher cũ xoá claim của
+        worker khác (xem _FINISH_DEBOUNCE). Compose LỖI thì ĐỪNG gọi — đi đường
+        `record_compose_failure`, để claim treo cho R3 gỡ sau 5'."""
         await self._session.execute(
-            _FINISH_DEBOUNCE, {"conversation_id": conversation_id, "due_at": due_at}
+            _FINISH_DEBOUNCE,
+            {"conversation_id": conversation_id, "due_at": due_at, "claimed_at": claimed_at},
+        )
+        await self._session.commit()
+
+    async def record_compose_failure(self, conversation_id: str) -> int:
+        """Compose lỗi ⇒ +1, trả số lỗi LIÊN TIẾP hiện tại — caller so với trần để bỏ cuộc.
+        Không reset ở đây; reset sống trong _FINISH_DEBOUNCE (chỉ thành công mới xoá)."""
+        count = (
+            await self._session.execute(
+                _RECORD_COMPOSE_FAILURE, {"conversation_id": conversation_id}
+            )
+        ).scalar_one()
+        await self._session.commit()
+        return int(count)
+
+    async def give_up_debounce(self, conversation_id: str, *, claimed_at: datetime) -> None:
+        """Đạt trần poison: thôi retry (NULL timer + thả claim), GIỮ compose_failures cho
+        vận hành query hội thoại bị bỏ cuộc. Echo `claimed_at` — không dọn claim của
+        worker khác."""
+        await self._session.execute(
+            _GIVE_UP_DEBOUNCE, {"conversation_id": conversation_id, "claimed_at": claimed_at}
         )
         await self._session.commit()
 
@@ -740,13 +811,16 @@ class SchedulerRepo:
         transaction: reaper chạy mỗi 10s, câu nào cũng idempotent, lỗi một câu thì lần
         chạy sau làm lại cả bốn."""
         counts: dict[str, int] = {}
-        for name, stmt in (
-            ("r1_expired_drafts", _REAP_R1_EXPIRED_DRAFTS),
-            ("r2_stuck_outbox", _REAP_R2_STUCK_OUTBOX),
-            ("r3_stuck_debounce", _REAP_R3_STUCK_DEBOUNCE),
-            ("r4_stuck_reservations", _REAP_R4_STUCK_RESERVATIONS),
-        ):
-            result = cast("CursorResult[Any]", await self._session.execute(stmt))
+        params_by_stmt: tuple[tuple[str, Any, dict[str, Any]], ...] = (
+            ("r1_expired_drafts", _REAP_R1_EXPIRED_DRAFTS, {}),
+            # R2 mang trần attempts của OutboxRepo — job giết chết process không đi qua
+            # mark_failed, nên đây là chỗ thứ hai (và cuối cùng) trần được kiểm.
+            ("r2_stuck_outbox", _REAP_R2_STUCK_OUTBOX, {"max_attempts": OutboxRepo.MAX_ATTEMPTS}),
+            ("r3_stuck_debounce", _REAP_R3_STUCK_DEBOUNCE, {}),
+            ("r4_stuck_reservations", _REAP_R4_STUCK_RESERVATIONS, {}),
+        )
+        for name, stmt, params in params_by_stmt:
+            result = cast("CursorResult[Any]", await self._session.execute(stmt, params))
             counts[name] = int(result.rowcount or 0)
         await self._session.commit()
         return counts

@@ -592,13 +592,22 @@ WITH rel AS (
   UPDATE seller.cost_reservation SET released_at = now()
    WHERE released_at IS NULL AND created_at < now() - interval '5 minutes'
   RETURNING shop_id, budget_date, tokens
+), agg AS (
+  SELECT shop_id, budget_date, sum(tokens) AS tokens
+    FROM rel GROUP BY shop_id, budget_date
 )
 UPDATE seller.cost_budget b
-   SET reserved_tokens = GREATEST(0, b.reserved_tokens - r.tokens)
-  FROM rel r
- WHERE b.shop_id = r.shop_id AND b.budget_date = r.budget_date;
+   SET reserved_tokens = GREATEST(0, b.reserved_tokens - a.tokens)
+  FROM agg a
+ WHERE b.shop_id = a.shop_id AND b.budget_date = a.budget_date;
 ```
 `GREATEST(0, ...)` phòng double-release; không thay cho việc release đúng.
+
+CTE `agg` (amend 2026-07-30, review A5–A8): `UPDATE … FROM` của Postgres chỉ áp MỘT row
+FROM cho mỗi row đích — bản cũ join thẳng `rel` nên hai reservation treo cùng
+`(shop_id, budget_date)` chỉ trừ được một, phần còn lại rò trong `reserved_tokens` tới
+nửa đêm và không còn reservation chưa-release nào để R4 gỡ nữa. GROUP BY trước rồi mới
+UPDATE thì N reservation trừ đúng tổng N.
 
 ---
 

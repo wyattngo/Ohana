@@ -54,11 +54,14 @@ WITH rel AS (
   UPDATE cost_reservation SET released_at = now()
    WHERE released_at IS NULL AND created_at < now() - interval '5 minutes'
   RETURNING shop_id, budget_date, tokens
+), agg AS (
+  SELECT shop_id, budget_date, sum(tokens) AS tokens
+    FROM rel GROUP BY shop_id, budget_date
 )
 UPDATE cost_budget b
-   SET reserved_tokens = GREATEST(0, b.reserved_tokens - r.tokens)
-  FROM rel r
- WHERE b.shop_id = r.shop_id AND b.budget_date = r.budget_date
+   SET reserved_tokens = GREATEST(0, b.reserved_tokens - a.tokens)
+  FROM agg a
+ WHERE b.shop_id = a.shop_id AND b.budget_date = a.budget_date
 """
 
 SQL_R1 = """
@@ -67,9 +70,16 @@ UPDATE pending_reply SET status = 'expired'
 """
 
 SQL_R2 = """
-UPDATE outbox SET status = 'pending'
+UPDATE outbox
+   SET status = CASE WHEN attempts >= %(max_attempts)s
+                     THEN 'dead'::outbox_status
+                     ELSE 'pending'::outbox_status END,
+       last_error = CASE WHEN attempts >= %(max_attempts)s
+                         THEN 'r2_exhausted: worker chết ' || attempts::text || ' lần'
+                         ELSE last_error END
  WHERE status = 'processing' AND claimed_at < now() - interval '5 minutes'
 """
+MAX_ATTEMPTS = 5  # khớp db/repos.py::OutboxRepo.MAX_ATTEMPTS
 
 
 def _wipe(conn: psycopg.Connection) -> None:
@@ -203,6 +213,42 @@ def test_r4_reaper_releases_stuck_reservation(
     assert reserved == 0
 
 
+def test_r4_releases_multiple_reservations_same_budget(
+    migrator: psycopg.Connection, svc_b: psycopg.Connection
+) -> None:
+    """§6.10 (amend agg) · N reservation treo cùng shop/ngày ⇒ trừ đúng TỔNG N.
+
+    Bản chưa amend join thẳng `rel`: UPDATE…FROM chỉ áp MỘT row FROM mỗi row đích — hai
+    reservation chỉ trừ được một, 40 token rò tới nửa đêm và không còn gì cho R4 gỡ
+    (review A5-A8 #3). CTE agg GROUP BY trước là toàn bộ nội dung của amend.
+    """
+    svc_b.execute(
+        "INSERT INTO cost_budget (shop_id, budget_date, cap_tokens, reserved_tokens) "
+        "VALUES (%s, CURRENT_DATE, 200, 100)",
+        (SHOP,),
+    )
+    for tokens in (60, 40):
+        svc_b.execute(
+            "INSERT INTO cost_reservation (shop_id, budget_date, tokens, trace_id) "
+            "VALUES (%s, CURRENT_DATE, %s, %s)",
+            (SHOP, tokens, uuid.uuid4()),
+        )
+    migrator.execute(
+        "UPDATE cost_reservation SET created_at = now() - interval '6 minutes' WHERE shop_id = %s",
+        (SHOP,),
+    )
+
+    svc_b.execute(SQL_6_10)
+    reserved, unreleased = svc_b.execute(
+        "SELECT b.reserved_tokens, "
+        "(SELECT count(*) FROM cost_reservation r "
+        " WHERE r.shop_id = b.shop_id AND r.released_at IS NULL) "
+        "FROM cost_budget b WHERE b.shop_id = %s",
+        (SHOP,),
+    ).fetchone()
+    assert (reserved, unreleased) == (0, 0)  # 100 - (60+40) = 0, cả hai đều released
+
+
 def test_r2_reaper_requeues_stuck_outbox(
     migrator: psycopg.Connection, svc_b: psycopg.Connection
 ) -> None:
@@ -229,15 +275,30 @@ def test_r2_reaper_requeues_stuck_outbox(
         (SHOP,),
     )
 
-    assert svc_b.execute(SQL_R2).rowcount == 0  # đang trong hạn — worker có thể còn sống
+    params = {"max_attempts": MAX_ATTEMPTS}
+    assert svc_b.execute(SQL_R2, params).rowcount == 0  # trong hạn — worker có thể còn sống
 
     migrator.execute(
         "UPDATE outbox SET claimed_at = now() - interval '6 minutes' WHERE shop_id = %s",
         (SHOP,),
     )
-    assert svc_b.execute(SQL_R2).rowcount == 1
+    assert svc_b.execute(SQL_R2, params).rowcount == 1
     (status,) = svc_b.execute("SELECT status FROM outbox WHERE shop_id = %s", (SHOP,)).fetchone()
     assert status == "pending"  # attempts giữ nguyên — §6.2 mới là chỗ đếm lần thử
+
+    # Job GIẾT CHẾT process không bao giờ đi qua mark_failed (review A5-A8 #4) — cạn
+    # attempts thì R2 phải là chỗ chốt dead, không requeue crash-loop vĩnh viễn.
+    migrator.execute(
+        "UPDATE outbox SET status='processing', attempts=%s, "
+        "claimed_at = now() - interval '6 minutes' WHERE shop_id = %s",
+        (MAX_ATTEMPTS, SHOP),
+    )
+    assert svc_b.execute(SQL_R2, params).rowcount == 1
+    status, last_error = svc_b.execute(
+        "SELECT status, last_error FROM outbox WHERE shop_id = %s", (SHOP,)
+    ).fetchone()
+    assert status == "dead"
+    assert "r2_exhausted" in last_error
 
 
 def test_r1_reaper_expires_overdue_drafts(
@@ -262,14 +323,24 @@ def test_r1_reaper_expires_overdue_drafts(
 
 
 # Câu finish của repo (KHÔNG phải SQL nguyên văn design — đây là test HÀNH VI, khớp
-# db/repos.py::_FINISH_DEBOUNCE): timer chỉ bị xoá khi VẪN là giá trị đã claim (echo).
+# db/repos.py::_FINISH_DEBOUNCE): timer chỉ bị xoá khi VẪN là giá trị đã claim (echo
+# :due_at), và CHỈ chủ claim mới finish được (echo :claimed_at trong WHERE).
 SQL_FINISH = """
 UPDATE conversations
    SET debounce_claimed_at = NULL,
+       compose_failures = 0,
        next_debounce_at = CASE WHEN next_debounce_at = %(due_at)s
                                THEN NULL ELSE next_debounce_at END
- WHERE id = %(conversation_id)s
+ WHERE id = %(conversation_id)s AND debounce_claimed_at = %(claimed_at)s
 """
+
+
+def _claim_and_get_token(conn: psycopg.Connection) -> object:
+    assert conn.execute(SQL_6_3, {"conversation_id": CONVERSATION}).fetchone() is not None
+    (claimed_at,) = conn.execute(
+        "SELECT debounce_claimed_at FROM conversations WHERE id = %s", (CONVERSATION,)
+    ).fetchone()
+    return claimed_at
 
 
 def test_finish_preserves_timer_set_mid_compose(
@@ -281,7 +352,7 @@ def test_finish_preserves_timer_set_mid_compose(
     (due_at,) = svc_b.execute(
         "SELECT next_debounce_at FROM conversations WHERE id = %s", (CONVERSATION,)
     ).fetchone()
-    assert svc_b.execute(SQL_6_3, {"conversation_id": CONVERSATION}).fetchone() is not None
+    claimed_at = _claim_and_get_token(svc_b)
 
     # Tin B đến giữa lúc compose: outbox loop dời timer. Mô phỏng ca ÁC nhất — timer mới
     # cũng đã quá hạn tại thời điểm finish (compose lâu hơn DEBOUNCE_DELAY_SECONDS).
@@ -291,7 +362,10 @@ def test_finish_preserves_timer_set_mid_compose(
         (uuid.uuid4(), CONVERSATION),
     )
 
-    svc_b.execute(SQL_FINISH, {"conversation_id": CONVERSATION, "due_at": due_at})
+    svc_b.execute(
+        SQL_FINISH,
+        {"conversation_id": CONVERSATION, "due_at": due_at, "claimed_at": claimed_at},
+    )
     new_timer, claimed = svc_b.execute(
         "SELECT next_debounce_at, debounce_claimed_at FROM conversations WHERE id = %s",
         (CONVERSATION,),
@@ -303,9 +377,44 @@ def test_finish_preserves_timer_set_mid_compose(
     (due_at2,) = svc_b.execute(
         "SELECT next_debounce_at FROM conversations WHERE id = %s", (CONVERSATION,)
     ).fetchone()
-    svc_b.execute(SQL_6_3, {"conversation_id": CONVERSATION})
-    svc_b.execute(SQL_FINISH, {"conversation_id": CONVERSATION, "due_at": due_at2})
+    claimed_at2 = _claim_and_get_token(svc_b)
+    svc_b.execute(
+        SQL_FINISH,
+        {"conversation_id": CONVERSATION, "due_at": due_at2, "claimed_at": claimed_at2},
+    )
     (cleared,) = svc_b.execute(
         "SELECT next_debounce_at FROM conversations WHERE id = %s", (CONVERSATION,)
     ).fetchone()
     assert cleared is None
+
+
+def test_stale_finisher_cannot_release_new_claim(
+    migrator: psycopg.Connection, svc_b: psycopg.Connection
+) -> None:
+    """Review A5-A8 #5 · compose treo >5' bị R3 gỡ, worker B claim lại — finisher CŨ của A
+    (token đã bị đè) phải thành no-op, không xoá claim của B ⇒ không draft đôi."""
+    _arm_debounce_past(migrator)
+    (due_at,) = svc_b.execute(
+        "SELECT next_debounce_at FROM conversations WHERE id = %s", (CONVERSATION,)
+    ).fetchone()
+    stale_token = _claim_and_get_token(svc_b)  # worker A claim rồi treo
+
+    # R3 gỡ (worker A treo quá 5'), worker B claim lại ⇒ token MỚI.
+    migrator.execute(
+        "UPDATE conversations SET debounce_claimed_at = now() - interval '6 minutes' WHERE id = %s",
+        (CONVERSATION,),
+    )
+    svc_b.execute(SQL_6_9)
+    fresh_token = _claim_and_get_token(svc_b)
+    assert fresh_token != stale_token
+
+    # Worker A tỉnh dậy finish bằng token CŨ ⇒ no-op: claim của B còn nguyên.
+    cur = svc_b.execute(
+        SQL_FINISH,
+        {"conversation_id": CONVERSATION, "due_at": due_at, "claimed_at": stale_token},
+    )
+    assert cur.rowcount == 0
+    (claimed,) = svc_b.execute(
+        "SELECT debounce_claimed_at FROM conversations WHERE id = %s", (CONVERSATION,)
+    ).fetchone()
+    assert claimed == fresh_token
