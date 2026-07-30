@@ -39,9 +39,17 @@ from db.repos import MessageRepo, PendingReplyRepo
 
 
 class _Draft(Protocol):
-    text: str
-    intent: str
-    confidence: float
+    # Property, KHÔNG phải attribute trần: attribute trong Protocol là KHẢ GHI, mà impl thật
+    # (`agent.drafter.DraftResult`) là frozen dataclass — mypy từ chối đúng luật (read-only
+    # không thay được read-write). Orchestrator chỉ ĐỌC draft, nên read-only là contract đúng.
+    @property
+    def text(self) -> str: ...
+
+    @property
+    def intent(self) -> str: ...
+
+    @property
+    def confidence(self) -> float: ...
 
 
 # Cap KÉP cho history nạp vào draft (spec 10 H2, PRE-1003 — Wyatt ký 2026-07-20).
@@ -99,6 +107,7 @@ async def receive_and_draft(
     sender: ZaloSender,
     session_factory: async_sessionmaker[AsyncSession],
     shop_auto_enabled_intents: frozenset[str],
+    trace_id: uuid.UUID,
 ) -> ReceiveOutcome:
     """Draft → decide → send OR park. Returns the outcome for the caller to log/telemetrize.
 
@@ -108,6 +117,10 @@ async def receive_and_draft(
 
     `shop_auto_enabled_intents` is the shop-level opt-in set for auto-send. If the intent
     the drafter emits isn't in this set, the gate parks even at high confidence.
+
+    `trace_id` BẮT BUỘC (A5/G6) — sinh tại webhook, tới đây qua outbox job. Đường gọi
+    không-qua-webhook (test, script) tự sinh `uuid.uuid4()` là hợp lệ: trace mới cho một
+    lượt mới, miễn là draft nào cũng đối chiếu được §9.
     """
     # History load TRƯỚC khi draft. Repo scope theo `shop_id` ⇒ conversation của shop khác
     # trả rỗng chứ không raise (xem `MessageRepo.last_n`), nên một `conversation_id` sai
@@ -170,5 +183,6 @@ async def receive_and_draft(
             draft_text=draft.text,
             intent=draft.intent,
             confidence=draft.confidence,
+            trace_id=trace_id,
         )
     return ReceiveOutcome(action="park", reason=decision.reason, reply_id=reply_id)

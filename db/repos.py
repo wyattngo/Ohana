@@ -18,11 +18,14 @@ write. Baking the scope into the repo removes the parameter a caller could get w
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from sqlalchemy import select, update
+from sqlalchemy import Uuid, bindparam, select, text, update
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,10 +34,10 @@ from agent.persona import PERSONA_MAX_CHARS
 from db.models import (
     Conversation,
     Message,
+    Outbox,
     PendingReply,
     ShopKnowledge,
     ShopProfile,
-    WebhookEventLog,
     ZaloOAToken,
 )
 
@@ -96,12 +99,16 @@ class PendingReplyRepo:
         draft_text: str,
         intent: str,
         confidence: float,
+        trace_id: uuid.UUID,
         snapshot: dict[str, Any] | None = None,
         expires_at: datetime | None = None,
     ) -> PendingReply:
         """Insert a new parked draft. `shop_id` is baked from the repo scope — the caller
         does NOT pass it, so a compromised caller cannot cause a row to land under a shop
         other than the one this repo was scoped to.
+
+        `trace_id` BẮT BUỘC (A5/G6): trace sinh tại webhook, xuyên webhook_event_log →
+        outbox → đây. Không default — draft không trace là draft không đối chiếu được §9.
 
         `snapshot` / `expires_at` are OPTIONAL (spec 14 A0) — the tier-1 T0 snapshot and the
         TTL are captured by deferred runtime; today every call-site omits them and the row
@@ -116,6 +123,7 @@ class PendingReplyRepo:
             intent=intent,
             confidence=confidence,
             status="pending",
+            trace_id=trace_id,
             snapshot=snapshot,
             expires_at=expires_at,
         )
@@ -185,13 +193,14 @@ class MessageRepo:
     `agent/policy_gate.py`; drain bảng này để gửi là bypass gate — nếu bạn đang định viết
     một worker đọc từ đây rồi gọi sender, dừng lại và đọc `agent/orchestrator.py` trước.
 
-    **Idempotency KHÔNG có ở tầng này** (spec 10 H1 GOAL-AMEND, Wyatt ký 2026-07-20).
-    `messages` không có khoá dedup, nên gọi `append()` hai lần với cùng nội dung tạo HAI
-    row. Đó là hành vi đã biết và đã chấp nhận, không phải thiếu sót: cơ chế chống trùng là
-    `webhook_event_log` (`event_id` PRIMARY KEY) thuộc spec 03 Phase 2, đang BLOCKED chờ
-    PRE-004. 🚫 Đừng "vá tạm" bằng select-then-insert ở đây — đó đúng là ISSUE-017 mà spec
-    09 vừa đóng: hai webhook đồng thời vẫn lọt cả hai, test đơn luồng vẫn xanh, và nó chỉ
-    TRÔNG như đã vá. Dedup phải ở tầng DB hoặc không làm.
+    **Idempotency: `append()` KHÔNG có, `append_inbound()` CÓ — cố ý hai mức** (spec 10 H1
+    GOAL-AMEND → A5/C1). `append()` phục vụ message KHÔNG mang khoá platform (assistant/
+    seller/system): gọi hai lần tạo HAI row, đúng như đã ký 2026-07-20. `append_inbound()`
+    phục vụ tin khách từ outbox worker, mang `platform_msg_id` — khoá UNIQUE
+    `(conversation_id, platform_msg_id)` (C1, design §9) làm lần ghi thứ hai thành no-op ở
+    TẦNG DB: reaper R2 requeue một job kẹt thì tin khách không nhân đôi. 🚫 Đừng "vá" bằng
+    select-then-insert ở bất kỳ mức nào — ISSUE-017: hai writer đồng thời vẫn lọt cả hai,
+    test đơn luồng vẫn xanh. Dedup phải ở tầng DB hoặc không làm.
     """
 
     def __init__(self, session: AsyncSession, *, shop_scope: str) -> None:
@@ -215,11 +224,10 @@ class MessageRepo:
         hoặc bị chiếm quyền vẫn không ghi được row sang shop khác. Composite FK của H0 là
         lớp thứ hai — Postgres từ chối nếu `(shop_id, conversation_id)` không khớp.
 
-        `commit=False` (spec 17 P3): KHÔNG commit — caller gộp `append` cùng transaction với
-        `WebhookEventRepo.record_event` để "message đã ghi" ⟺ "event idempotency đã ghi" atomic
-        (append lỗi ⇒ event cũng rollback ⇒ retry reprocess, không mất tin). Đây là transaction
-        control, KHÔNG phải idempotency-in-append (class docstring vẫn đúng: messages không có
-        khoá dedup; dedup ở `webhook_event_log`, nay commit CÙNG append thay vì tách rời).
+        `commit=False` (spec 17 P3): KHÔNG commit — caller gộp `append` với việc ghi khác
+        trong MỘT transaction. Từ A5 đường webhook không đi qua đây nữa (webhook chỉ ghi
+        sổ + enqueue §6.1; tin khách do worker ghi bằng `append_inbound`), nhưng transaction
+        control này vẫn đúng cho caller tương lai cần atomic-với-append.
         """
         if role not in _MESSAGE_ROLES:
             raise ValueError(f"invalid role: {role!r} (hợp lệ: {sorted(_MESSAGE_ROLES)})")
@@ -236,6 +244,42 @@ class MessageRepo:
         else:
             await self._session.flush()  # đẩy INSERT xuống DB (bắt FK sớm) nhưng chưa commit
         return row
+
+    async def append_inbound(
+        self,
+        *,
+        conversation_id: str,
+        customer_id: str,
+        content: str,
+        platform_msg_id: str,
+    ) -> bool:
+        """Ghi tin KHÁCH từ outbox worker — idempotent qua khoá C1. Trả `True` nếu row mới,
+        `False` nếu tin đã có (job requeue bởi R2 / double-claim hụt) — caller coi `False`
+        là "đã ghi rồi", tiếp tục bước sau bình thường, KHÔNG phải lỗi.
+
+        `platform_msg_id` BẮT BUỘC — đường không-có-khoá đi `append()`. Role đóng cứng
+        `user`: tin từ webhook là của khách; assistant/seller/system không có platform id
+        và không đi đường này.
+
+        MỘT câu `INSERT ... ON CONFLICT DO NOTHING RETURNING` — cùng kỷ luật ISSUE-017 với
+        mọi dedup khác trong repo: race hai worker thì Postgres cho đúng một bên thắng.
+        """
+        stmt = (
+            pg_insert(Message)
+            .values(
+                shop_id=self._shop_scope,
+                conversation_id=conversation_id,
+                customer_id=customer_id,
+                role="user",
+                content=content,
+                platform_msg_id=platform_msg_id,
+            )
+            .on_conflict_do_nothing(index_elements=["conversation_id", "platform_msg_id"])
+            .returning(Message.id)
+        )
+        inserted = (await self._session.execute(stmt)).first()
+        await self._session.commit()
+        return inserted is not None
 
     async def last_n(self, conversation_id: str, *, limit: int = 20) -> list[Message]:
         """N message GẦN NHẤT của conversation này, trả theo thứ tự thời gian TĂNG dần.
@@ -325,8 +369,32 @@ class ShopProfileRepo:
         return row
 
 
+# §6.1 NGUYÊN VĂN (design — I7, w§2.1), chỉ đổi hai thứ so với doc: tên bảng theo ánh xạ
+# adopt-plan §1 (`seller.webhook_seen` → `webhook_event_log`, `seller.outbox` → `outbox`) và
+# placeholder $1…$6 → bind theo tên (chi tiết driver, không đổi hình dạng câu lệnh).
+#
+# 🚫 MUỐN "REFACTOR" THÀNH HAI INSERT: DỪNG LẠI. `ON CONFLICT DO NOTHING` không báo cho câu
+# sau biết nó có thật sự insert hay không — tách đôi là draft đôi khi retry, trong khi
+# `webhook_event_log` vẫn TRÔNG đúng. Đây là bug im lặng số 1 mà I7 tồn tại để chặn.
+_RECORD_AND_ENQUEUE = text("""
+    WITH ins AS (
+      INSERT INTO webhook_event_log (channel, platform_msg_id, shop_id, raw_event, trace_id)
+      VALUES (:channel, :platform_msg_id, :shop_id, :raw_event, :trace_id)
+      ON CONFLICT (channel, platform_msg_id) DO NOTHING
+      RETURNING event_id, shop_id, trace_id
+    )
+    INSERT INTO outbox (event_id, shop_id, payload, trace_id)
+    SELECT event_id, shop_id, :payload, trace_id FROM ins
+    RETURNING outbox_id
+""").bindparams(
+    bindparam("raw_event", type_=JSONB),
+    bindparam("payload", type_=JSONB),
+    bindparam("trace_id", type_=Uuid()),
+)
+
+
 class WebhookEventRepo:
-    """Idempotency cho inbound webhook (spec 14 B0, workflow §2.1 #2).
+    """Idempotency + enqueue cho inbound webhook (spec 14 B0 → A5 · workflow §2.1 #2 · I7).
 
     KHÔNG `shop_scope`, KHÁC mọi repo khác trong file này — idempotency là biên giới
     NỀN-TẢNG, không phải dữ liệu tenant. 🚫 Đừng "sửa" thành shop-scoped: `platform_msg_id`
@@ -337,33 +405,142 @@ class WebhookEventRepo:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def record_event(
-        self, *, channel: str, platform_msg_id: str, shop_id: str, commit: bool = True
-    ) -> bool:
-        """Ghi một event lần đầu. Trả `True` nếu đây là lần đầu thấy `(channel, platform_msg_id)`,
-        `False` nếu đã thấy (retry) — caller dùng `False` để bỏ qua, KHÔNG enqueue lại.
+    async def record_and_enqueue(
+        self,
+        *,
+        channel: str,
+        platform_msg_id: str,
+        shop_id: str,
+        raw_event: dict[str, Any],
+        payload: dict[str, Any],
+        trace_id: uuid.UUID,
+    ) -> int | None:
+        """Ghi sổ idempotency + enqueue outbox trong MỘT câu lệnh (§6.1). Trả `outbox_id`
+        nếu đây là lần đầu thấy `(channel, platform_msg_id)`, `None` nếu đã thấy (retry) —
+        caller dùng `None` để ACK 200 rồi dừng, KHÔNG xử lý lại.
 
-        MỘT câu `INSERT ... ON CONFLICT DO NOTHING RETURNING` — race-safe ở tầng DB. KHÔNG
-        select-then-insert: hai webhook đồng thời cùng key sẽ cùng thấy "chưa có" rồi insert
-        cả hai (đúng ISSUE-017 mà spec 09 đóng cho Conversation). Ở đây conflict ⇒ RETURNING
-        rỗng ⇒ `False`, và Postgres đảm bảo đúng một bên thắng.
+        Thay thế `record_event` cũ (A5): trước đây webhook ghi sổ rồi append message cùng
+        transaction; giờ webhook CHỈ ghi sổ + enqueue rồi ACK — message do worker outbox ghi
+        (design §3). Race-safe cùng cơ chế cũ: hai webhook đồng thời cùng key thì Postgres
+        serialize INSERT trên PK, đúng một bên thắng, bên thua nhận CTE rỗng ⇒ `None`.
 
-        `commit=False` (spec 17 P3): KHÔNG commit — caller gộp record_event + `append` vào MỘT
-        transaction để "event đã ghi" ⟺ "message đã ghi" atomic. Nếu commit riêng (mặc định
-        cũ) thì record trước append → append lỗi → retry thấy duplicate → DROP tin khách (bug
-        P3 review HIGH). Với `commit=False`, RETURNING vẫn cho biết new/dup trong transaction
-        (concurrent: Postgres serialize INSERT trên unique index), caller quyết commit/rollback.
+        `raw_event` là payload THÔ (audit + re-derive, O8 retention còn treo); `payload` là
+        bản đã chuẩn hoá + resolve identity mà worker tiêu thụ — resolve ở webhook để worker
+        không cần adapter, và vì `resolve_conversation` vốn idempotent nên chạy trước không
+        phá dedup.
         """
-        stmt = (
-            pg_insert(WebhookEventLog)
-            .values(channel=channel, platform_msg_id=platform_msg_id, shop_id=shop_id)
-            .on_conflict_do_nothing(index_elements=["channel", "platform_msg_id"])
-            .returning(WebhookEventLog.platform_msg_id)
+        result = await self._session.execute(
+            _RECORD_AND_ENQUEUE,
+            {
+                "channel": channel,
+                "platform_msg_id": platform_msg_id,
+                "shop_id": shop_id,
+                "raw_event": raw_event,
+                "payload": payload,
+                "trace_id": trace_id,
+            },
         )
-        inserted = (await self._session.execute(stmt)).first()
-        if commit:
-            await self._session.commit()
-        return inserted is not None
+        row = result.first()
+        await self._session.commit()
+        return int(row[0]) if row is not None else None
+
+
+# §6.2 NGUYÊN VĂN (design) — chỉ đổi tên bảng theo ánh xạ adopt-plan §1. LIMIT 20 là của doc.
+# `FOR UPDATE SKIP LOCKED` trong subquery + UPDATE ngoài là MỘT câu: N worker cùng chạy thì
+# mỗi row đúng một chủ, không chờ lock của nhau. 🚫 Bỏ `SKIP LOCKED` = worker serialize;
+# tách SELECT rồi UPDATE = hai worker claim cùng row.
+_CLAIM_OUTBOX = text("""
+    UPDATE outbox SET status='processing', claimed_at=now(), attempts=attempts+1
+    WHERE outbox_id IN (
+      SELECT outbox_id FROM outbox
+       WHERE status='pending' ORDER BY created_at
+       FOR UPDATE SKIP LOCKED LIMIT 20
+    )
+    RETURNING *
+""")
+
+# Lỗi ⇒ pending (thử lại) hay dead (chạm trần) quyết trong MỘT câu UPDATE — đọc attempts
+# rồi update ở Python là check-then-act, cùng họ race mà §6.5 cấm.
+_MARK_FAILED = text("""
+    UPDATE outbox
+       SET status = CASE WHEN attempts >= :max_attempts
+                         THEN 'dead'::outbox_status
+                         ELSE 'pending'::outbox_status END,
+           last_error = :error
+     WHERE outbox_id = :outbox_id
+""")
+
+
+@dataclass(frozen=True)
+class OutboxJob:
+    """Một row outbox đã claim — snapshot để worker xử lý SAU khi transaction claim đã đóng."""
+
+    outbox_id: int
+    event_id: int
+    shop_id: str
+    payload: dict[str, Any]
+    attempts: int
+    trace_id: uuid.UUID
+
+
+class OutboxRepo:
+    """Claim + chuyển trạng thái queue (A5 · design §6.2 · I13).
+
+    KHÔNG `shop_scope` — cùng biên nền-tảng với `WebhookEventRepo`: worker claim theo thứ
+    tự đến, không theo tenant. Enqueue KHÔNG ở đây mà ở `record_and_enqueue` (§6.1 là một
+    câu, không tách enqueue riêng được).
+    """
+
+    # Trần retry trước khi row thành `dead` (quyết 2026-07-30, cùng lượt duyệt A5): mỗi lần
+    # claim là attempts+1, lỗi lần thứ 5 thì dừng — row độc (payload làm drafter nổ mãi) mà
+    # quay vòng vô hạn là đốt LLM cost theo chu kỳ 200ms. `dead` + `last_error` là chỗ người
+    # vận hành đọc; chưa có đường tự hồi — resurrect là việc của người, có chủ đích.
+    MAX_ATTEMPTS = 5
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def claim_batch(self) -> list[OutboxJob]:
+        """Claim tối đa 20 row pending (§6.2), COMMIT NGAY rồi mới trả về.
+
+        Commit-ngay là yêu cầu của doc ("MUST NOT giữ transaction mở trong lúc gọi LLM"):
+        giữ transaction qua lời gọi LLM là giữ row-lock hàng chục giây — mọi worker khác
+        `SKIP LOCKED` bỏ qua row của mình thì không sao, nhưng vacuum/reaper và chính
+        connection pool sẽ nghẹn. Sau commit, quyền sở hữu row nằm ở `status='processing'`
+        chứ không ở lock; worker chết thì reaper R2 (A7) trả row về pending sau 5'.
+        """
+        rows = (await self._session.execute(_CLAIM_OUTBOX)).mappings().all()
+        await self._session.commit()
+        return [
+            OutboxJob(
+                outbox_id=r["outbox_id"],
+                event_id=r["event_id"],
+                shop_id=r["shop_id"],
+                payload=r["payload"],
+                attempts=r["attempts"],
+                trace_id=r["trace_id"],
+            )
+            for r in rows
+        ]
+
+    async def mark_done(self, outbox_id: int) -> None:
+        """Row xử lý xong. Giữ row (status=done) thay vì DELETE — sổ sách cho
+        `test_trace_propagation` và đối chiếu §9; dọn dẹp là việc của retention sau."""
+        await self._session.execute(
+            update(Outbox).where(Outbox.outbox_id == outbox_id).values(status="done")
+        )
+        await self._session.commit()
+
+    async def mark_failed(self, outbox_id: int, error: str) -> None:
+        """Row lỗi: quay về `pending` để tick sau thử lại, hoặc `dead` khi attempts đã chạm
+        trần. Đếm bằng `attempts` ĐÃ ghi lúc claim (§6.2 là chỗ duy nhất tăng nó) — không
+        tăng ở đây để "claim rồi chết trước khi chạy" (R2 requeue) cũng tính là một lần thử.
+        """
+        await self._session.execute(
+            _MARK_FAILED,
+            {"max_attempts": self.MAX_ATTEMPTS, "outbox_id": outbox_id, "error": error},
+        )
+        await self._session.commit()
 
 
 class ZaloOATokenRepo:
