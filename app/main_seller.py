@@ -11,10 +11,10 @@ Chạy với `DATABASE_URL` trỏ role `svc_seller`: SELECT/INSERT/UPDATE trên 
     DATABASE_URL="postgresql+psycopg://svc_seller:$SVC_B_PW@localhost:5432/ohana" \\
         uvicorn app.main_seller:app --port 8002
 
-⚠️ Trạng thái A4: route wiki-ingest của admin ghi `platform.embeddings` — svc_seller
-chưa có quyền ghi platform (chờ quyết định grant a2: ingest thuộc luồng nào). Các
-route public-only (inbox, onboard shop) chạy đúng quyền. Ghi ở đây để không ai
-tưởng là bỏ quên.
+Wiki ingest + RAG: a2 mở SELECT/INSERT/UPDATE/DELETE trên đúng bảng
+`platform.embeddings` (+ sequence) cho svc_seller — route admin ingest và đường
+drafter→shop_kb→retrieval chạy được; bảng platform tương lai vẫn phải grant
+tường minh (a2 cố ý không đặt default privileges ở platform cho role này).
 """
 
 from __future__ import annotations

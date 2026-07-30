@@ -14,10 +14,10 @@ I1 được cưỡng chế hai tầng:
     DATABASE_URL="postgresql+psycopg://svc_ohana_ai:$SVC_A_PW@localhost:5432/ohana" \\
         uvicorn app.main_ohana_ai:app --port 8001
 
-⚠️ Trạng thái A4: auth hiện tại (`build_active_shop_dep` + mock_auth) còn đọc/ghi
-`public.shops` — role svc_ohana_ai chưa có quyền đó (chờ quyết định grant a2 hoặc
-tách auth riêng cho luồng A). `/health` và ranh giới I2 đã đúng; đường authed sẽ
-503/500 cho tới khi chốt. Ghi ở đây để không ai tưởng là bỏ quên.
+Auth: a2 mở `SELECT public.shops` cho svc_ohana_ai (`shops` đóng vai registry
+`core.account_shop` §8.4) — `build_active_shop_dep` chạy được. Mock login ở dev
+KHÔNG seed được fixture shop dưới role này (a2 cố ý không cho INSERT) — seed bằng
+app seller/combined trước; `mock_auth` log warning chỉ thẳng chỗ đó.
 """
 
 from __future__ import annotations

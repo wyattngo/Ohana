@@ -27,6 +27,7 @@ the `X-CSRF-Token` header on state-mutating requests (approve/reject).
 
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 
@@ -34,6 +35,8 @@ import jwt
 from fastapi import APIRouter, HTTPException, Response
 
 from auth.identity import CSRF_COOKIE_NAME, SESSION_COOKIE_NAME, get_jwt_secret
+
+logger = logging.getLogger(__name__)
 
 _FIXTURE_USER_ID = "dev-user-001"
 _FIXTURE_OA_ID = "fixture-oa-001"
@@ -57,19 +60,33 @@ async def _ensure_fixture_shop() -> None:
     dev-only nên không đáng đánh đổi API của router production.
     """
     from sqlalchemy import text
+    from sqlalchemy.exc import ProgrammingError
 
     from db.session import make_session_factory
 
     session_factory = make_session_factory()
-    async with session_factory() as session:
-        await session.execute(
-            text(
-                "insert into shops (id, name, status) values (:i, :n, 'active') "
-                "on conflict (id) do nothing"
-            ),
-            {"i": _FIXTURE_SHOP_ID, "n": "Dev Fixture Shop"},
+    try:
+        async with session_factory() as session:
+            await session.execute(
+                text(
+                    "insert into shops (id, name, status) values (:i, :n, 'active') "
+                    "on conflict (id) do nothing"
+                ),
+                {"i": _FIXTURE_SHOP_ID, "n": "Dev Fixture Shop"},
+            )
+            await session.commit()
+    except ProgrammingError:
+        # A4/a2: process luồng A chạy role `svc_ohana_ai` — CHỈ SELECT trên `shops`
+        # (a2 cố ý không cho INSERT: tạo tenant không phải việc của luồng A). Seed là
+        # best-effort dưới role hẹp; fixture phải được seed bởi app seller/combined
+        # trước. Nuốt im lặng thì người debug lại đi soi JWT (đúng cái bẫy comment
+        # dưới mô tả) — nên log RÕ rồi đi tiếp: token vẫn mint được, route sau sẽ
+        # 401 kèm dòng warning này chỉ thẳng chỗ sửa.
+        logger.warning(
+            "mock_auth: role hiện tại không INSERT được `shops` — fixture %s phải được "
+            "seed bởi app seller/combined (dev). Nếu các route sau trả 401, đây là lý do.",
+            _FIXTURE_SHOP_ID,
         )
-        await session.commit()
 
 
 def build_router() -> APIRouter:
