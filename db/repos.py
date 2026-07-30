@@ -18,11 +18,14 @@ write. Baking the scope into the repo removes the parameter a caller could get w
 
 from __future__ import annotations
 
+import json
+import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any, cast
 
 from sqlalchemy import select, update
+from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -474,3 +477,146 @@ class ZaloOATokenRepo:
         """
         lock_stmt = select(ZaloOAToken).where(ZaloOAToken.shop_id == shop_id).with_for_update()
         await self._session.execute(lock_stmt)
+
+
+class OutboxRepo:
+    """Queue inbound (A5) — ghi bằng CTE §6.1 (I7), claim bằng §6.2 (SKIP LOCKED).
+
+    KHÔNG `shop_scope`, cùng lý do `WebhookEventRepo`: queue là hạ tầng nền-tảng, worker
+    drain mọi shop. Isolation theo shop nằm ở downstream (`receive_and_draft` nhận
+    `shop_id` từ ROW, và mọi repo nó chạm đều shop-scoped).
+
+    ⚠️ Hai câu SQL trong `record_and_enqueue` và `claim_batch` là §6.1/§6.2 của design —
+    thuộc danh sách "10 câu giữ nguyên văn". Muốn refactor: DỪNG, hỏi người.
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def record_and_enqueue(
+        self,
+        *,
+        channel: str,
+        platform_msg_id: str,
+        shop_id: str,
+        payload: dict[str, Any],
+        trace_id: uuid.UUID,
+        commit: bool = True,
+    ) -> int | None:
+        """§6.1 — `webhook_event_log` + `outbox` trong MỘT câu (I7). Trả `outbox_id`,
+        hoặc `None` nếu event đã thấy trước đó (retry ⇒ 0 row từ CTE ⇒ không enqueue lại).
+
+        MUST NOT tách thành hai INSERT — `ON CONFLICT DO NOTHING` không báo cho câu sau
+        biết nó có thật sự insert hay không (nguyên văn cảnh báo design §6.1).
+
+        Lệch nguyên bản §6.1, đã ghi ở docstring model `Outbox`: RETURNING compound key
+        thay `event_id`; KHÔNG có cột `raw_event` (O8 — payload là message đã parse).
+
+        `commit=False`: caller gộp cùng transaction với `MessageRepo.append` — "event ghi
+        nhận" ⟺ "message đã lưu" ⟺ "đã vào queue" atomic (cùng bài spec 17 P3).
+        """
+        stmt = sa_text(
+            """
+            WITH ins AS (
+              INSERT INTO webhook_event_log (channel, platform_msg_id, shop_id)
+              VALUES (:channel, :msg_id, :shop_id)
+              ON CONFLICT (channel, platform_msg_id) DO NOTHING
+              RETURNING channel, platform_msg_id, shop_id
+            )
+            INSERT INTO outbox (channel, platform_msg_id, shop_id, payload, trace_id)
+            SELECT channel, platform_msg_id, shop_id, CAST(:payload AS jsonb), :trace_id
+              FROM ins
+            RETURNING outbox_id
+            """
+        )
+        row = (
+            await self._session.execute(
+                stmt,
+                {
+                    "channel": channel,
+                    "msg_id": platform_msg_id,
+                    "shop_id": shop_id,
+                    "payload": json.dumps(payload, ensure_ascii=False),
+                    "trace_id": trace_id,
+                },
+            )
+        ).first()
+        if commit:
+            await self._session.commit()
+        return None if row is None else int(row[0])
+
+    async def claim_batch(self, *, limit: int = 20) -> Sequence[Any]:
+        """§6.2 — claim ≤`limit` row cũ nhất, `FOR UPDATE SKIP LOCKED` nên hai worker
+        đồng thời không bao giờ trùng row. Caller PHẢI commit NGAY sau khi gọi — giữ
+        transaction mở qua lời gọi LLM là cấm (nguyên văn design §6.2).
+
+        `attempts` tăng TẠI claim (không phải tại fail): worker chết giữa chừng vẫn
+        được đếm là một lần thử — không có nó thì row độc (làm worker chết) được thử
+        lại vô hạn.
+        """
+        stmt = sa_text(
+            """
+            UPDATE outbox SET status='processing', claimed_at=now(), attempts=attempts+1
+            WHERE outbox_id IN (
+              SELECT outbox_id FROM outbox
+               WHERE status='pending' ORDER BY created_at
+               FOR UPDATE SKIP LOCKED LIMIT :limit
+            )
+            RETURNING *
+            """
+        )
+        return (await self._session.execute(stmt, {"limit": limit})).mappings().all()
+
+    async def mark_done(self, outbox_id: int, *, commit: bool = True) -> None:
+        """Hoàn tất ⇒ `done` + NULL-out payload (O8 trim — draft/messages đã giữ phần
+        cần giữ; queue không phải chỗ lưu trữ)."""
+        stmt = sa_text(
+            "UPDATE outbox SET status='done', payload=NULL, claimed_at=NULL "
+            "WHERE outbox_id=:id AND status='processing'"
+        )
+        await self._session.execute(stmt, {"id": outbox_id})
+        if commit:
+            await self._session.commit()
+
+    async def settle_failure(
+        self, outbox_id: int, *, error: str, max_attempts: int = 3, commit: bool = True
+    ) -> str:
+        """Xử lý lỗi ⇒ còn lượt thì về `pending` (retry ở vòng claim sau), hết lượt thì
+        `failed` + giữ payload cho ops. Trả status sau cùng. Điều kiện trong WHERE +
+        CASE trong SET — một câu, không check-rồi-update."""
+        stmt = sa_text(
+            """
+            UPDATE outbox
+               SET status = CASE WHEN attempts >= :max_attempts THEN 'failed' ELSE 'pending' END,
+                   claimed_at = NULL,
+                   last_error = :error
+             WHERE outbox_id = :id AND status = 'processing'
+            RETURNING status
+            """
+        )
+        row = (
+            await self._session.execute(
+                stmt, {"id": outbox_id, "max_attempts": max_attempts, "error": error[:2000]}
+            )
+        ).first()
+        if commit:
+            await self._session.commit()
+        return "missing" if row is None else str(row[0])
+
+    async def reap_stuck(self, *, older_than_minutes: int = 5, commit: bool = True) -> int:
+        """Reaper cho claim outbox (I13): `processing` kẹt quá hạn ⇒ về `pending`.
+        Worker chết sau claim thì row sống lại ở đây — không có loop này thì tin khách
+        kẹt `processing` vĩnh viễn, đúng kiểu hỏng I13 cấm."""
+        stmt = sa_text(
+            """
+            UPDATE outbox SET status='pending', claimed_at=NULL
+             WHERE status='processing'
+               AND claimed_at < now() - make_interval(mins => :mins)
+            """
+        )
+        result = cast(
+            CursorResult[Any], await self._session.execute(stmt, {"mins": older_than_minutes})
+        )
+        if commit:
+            await self._session.commit()
+        return result.rowcount or 0

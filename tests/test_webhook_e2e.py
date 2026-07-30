@@ -98,8 +98,12 @@ async def _count(session_factory, model) -> int:
 
 
 @pytest.mark.asyncio
-async def test_e2e_signed_payload_parks_reply(fresh_db):
-    """Full path: signed real envelope → verify → parse → park. PendingReply row landed."""
+async def test_e2e_signed_payload_queues_then_worker_parks(fresh_db):
+    """Full path A5: signed envelope → verify → parse → QUEUED (webhook không draft inline
+    nữa — ACK ≤2s, design §7) → worker dispatch → park. PendingReply chỉ có SAU worker."""
+    from app.worker_seller import OutboxWorker
+    from db.models import Outbox
+
     _, session_factory = await fresh_db()
     await _seed(session_factory)
     client = _client(session_factory)
@@ -111,12 +115,24 @@ async def test_e2e_signed_payload_parks_reply(fresh_db):
         headers={"X-ZEvent-Signature": _sig(_APP_ID, raw, ts, _OA_SECRET)},
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["action"] == "park"
+    assert resp.json()["action"] == "queued"
+    assert resp.headers.get("X-Trace-Id"), "trace_id phải ra header (design §9)"
 
-    # Identity thật + tin khách ghi + draft park
+    # Webhook xong: identity + tin khách + queue row — CHƯA có draft
     assert await _count(session_factory, Customer) == 1
     assert await _count(session_factory, Conversation) == 1
     assert await _count(session_factory, Message) == 1  # tin khách
+    assert await _count(session_factory, Outbox) == 1
+    assert await _count(session_factory, PendingReply) == 0, "draft là việc của worker"
+
+    # Worker drain → park
+    worker = OutboxWorker(
+        drafter=_LowConfDrafter(),
+        senders={"zalo": MockZaloSender()},
+        session_factory=session_factory,
+        shop_auto_enabled={},
+    )
+    assert await worker.run_dispatch_once() == 1
     assert await _count(session_factory, PendingReply) == 1
 
 
@@ -133,11 +149,15 @@ async def test_e2e_duplicate_msg_id_idempotent(fresh_db):
     r1 = client.post("/webhook/zalo/EP1", content=raw, headers=headers)
     r2 = client.post("/webhook/zalo/EP1", content=raw, headers=headers)
     assert r1.status_code == 200
+    assert r1.json()["action"] == "queued"
     assert r2.status_code == 200, "retry cùng msg_id vẫn ACK 200 (không lỗi)"
+    assert r2.json()["action"] == "duplicate"
 
-    # Idempotent: KHÔNG nhân đôi row
+    # Idempotent: KHÔNG nhân đôi row — kể cả trong queue (I7: event ⟺ outbox một câu)
+    from db.models import Outbox
+
     assert await _count(session_factory, Message) == 1, "duplicate msg_id không được tạo 2 messages"
-    assert await _count(session_factory, PendingReply) == 1
+    assert await _count(session_factory, Outbox) == 1, "duplicate không được enqueue lần hai"
 
 
 @pytest.mark.asyncio
@@ -185,12 +205,14 @@ async def test_e2e_append_failure_does_not_lose_message_on_retry(fresh_db, monke
     r1 = client.post("/webhook/zalo/EP1", content=raw, headers=headers)
     assert r1.status_code == 500
 
-    # webhook_event_log KHÔNG được có row 'flaky-msg' (đã rollback cùng append)
-    from db.models import WebhookEventLog
+    # webhook_event_log VÀ outbox KHÔNG được có row 'flaky-msg' (CTE §6.1 rollback cùng
+    # append — I7 nghĩa là hai bảng đó sống chết có nhau)
+    from db.models import Outbox, WebhookEventLog
 
     assert await _count(session_factory, WebhookEventLog) == 0, (
-        "record_event phải rollback cùng append lỗi — nếu không retry sẽ bị coi duplicate"
+        "event log phải rollback cùng append lỗi — nếu không retry sẽ bị coi duplicate"
     )
+    assert await _count(session_factory, Outbox) == 0, "outbox phải rollback cùng (I7)"
 
     # Lần 2 (Zalo retry): append lần này OK → tin khách reprocess, KHÔNG mất
     r2 = client.post("/webhook/zalo/EP1", content=raw, headers=headers)
