@@ -49,3 +49,41 @@ async def test_ollama_answers_a_real_request() -> None:
     assert step.usage, "thiếu usage — không đo được cost"
     assert step.usage.get("prompt_tokens", 0) > 0
     assert step.usage.get("completion_tokens", 0) > 0
+
+
+@pytest.mark.asyncio
+async def test_ollama_model_can_call_tools() -> None:
+    """Tiêu chí THẬT cho đường drafter: model đang cấu hình phải gọi được tool qua wire
+    OpenAI-compat — `LLMDrafter` bắt buộc `emit_reply` là tool call, model không
+    tool-capable (codellama...) sẽ trả content trần và drafter fail-loud.
+
+    Test đỏ ⇒ OLLAMA_MODEL đang trỏ model không dùng được cho drafter, đổi model đi
+    (qwen2.5/llama3.1+), đừng sửa drafter."""
+    _require_server()
+    from agent.providers.ollama_client import OllamaClient
+
+    tool = {
+        "name": "get_stock",
+        "description": "Look up remaining stock for a product. Use this for stock questions.",
+        "parameters": {
+            "type": "object",
+            "properties": {"product": {"type": "string", "description": "product name"}},
+            "required": ["product"],
+        },
+    }
+    client = OllamaClient()
+    step = await client.step(
+        [
+            {"role": "system", "content": "Use the provided tools to answer."},
+            {"role": "user", "content": "How many 'ao thun trang' are left in stock?"},
+        ],
+        tools=[tool],
+        max_tokens=256,
+    )
+
+    assert step.tool_calls, (
+        f"model không gọi tool (content={step.content!r}) — OLLAMA_MODEL hiện tại "
+        "không dùng được cho drafter, đổi sang model tool-capable"
+    )
+    assert step.tool_calls[0].name == "get_stock"
+    assert "product" in step.tool_calls[0].arguments
