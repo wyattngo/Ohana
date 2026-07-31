@@ -33,11 +33,31 @@ type View =
 
 interface ChannelPickerProps {
   onConnected: () => void;
+  /** Gap-3 fix (audit T6): trước đây không đường UI nào mint `role=admin` nên mọi màn admin
+   * chết ở 403 — plumbing hai đầu có sẵn (`mockAuthorize` nhận "admin", server cho phép),
+   * thiếu mỗi lối vào. Dev-fixture-only như toàn bộ mock-authorize; biến mất cùng nó ở spec 05. */
+  onAdminConnected: () => void;
   onError: (message: string) => void;
 }
 
-export function ChannelPicker({ onConnected, onError }: ChannelPickerProps) {
+export function ChannelPicker({ onConnected, onAdminConnected, onError }: ChannelPickerProps) {
   const [view, setView] = useState<View>({ name: "pick" });
+  const [adminConnecting, setAdminConnecting] = useState(false);
+
+  async function handleAdminAuthorize(): Promise<void> {
+    setAdminConnecting(true);
+    try {
+      await mockAuthorize("admin");
+      onAdminConnected();
+    } catch (err) {
+      onError(
+        err instanceof ApiError
+          ? `Kết nối thất bại (mã ${err.status}) — vui lòng thử lại.`
+          : "Kết nối thất bại — vui lòng thử lại.",
+      );
+      setAdminConnecting(false);
+    }
+  }
 
   async function handleAuthorize(channel: Channel): Promise<void> {
     setView({ name: "connecting", channel });
@@ -85,6 +105,21 @@ export function ChannelPicker({ onConnected, onError }: ChannelPickerProps) {
             </li>
           ))}
         </ul>
+        <button
+          type="button"
+          className="dev-admin-link"
+          disabled={adminConnecting}
+          onClick={() => {
+            void handleAdminAuthorize();
+          }}
+        >
+          {adminConnecting ? (
+            <Loader2 className="spin" size={14} aria-hidden="true" />
+          ) : (
+            <ShieldCheck size={14} aria-hidden="true" />
+          )}
+          Vào với quyền quản trị (dev)
+        </button>
       </main>
     );
   }

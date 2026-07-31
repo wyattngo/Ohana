@@ -40,6 +40,17 @@ export interface WikiIngestResult {
 }
 
 /**
+ * Mirrors `ShopOnboardResponse` in `api/admin.py`. `shop_id` is SERVER-generated (uuid4) —
+ * this client never proposes one; if the client could pick the id it would be picking the
+ * tenant identity. Gated like ChatResult/PendingReplyOut:
+ * `tests/test_chat_ui.py::test_shop_onboard_interface_matches_the_python_response_model`.
+ */
+export interface ShopOnboardResult {
+  shop_id: string;
+  name: string;
+}
+
+/**
  * Mirrors `ChatOut` in `api/chat.py`. Kept field-for-field identical on purpose: nothing in
  * the toolchain type-checks Python against TypeScript, so a rename on either side would
  * otherwise surface as a silently `undefined` value rendered as an empty bubble.
@@ -156,4 +167,16 @@ export async function postWikiIngest(text: string, sourceRef: string): Promise<W
     body: JSON.stringify({ text, source_ref: sourceRef }),
   });
   return (await resp.json()) as WikiIngestResult;
+}
+
+/** `POST /api/admin/shops` (admin-only, spec 11 S1) — creates a REAL tenant. The body carries
+ * only `name`; the backend mints `shop_id` itself and a seller cookie gets `ApiError(403)`
+ * (`require_admin` is the sole gate — §4 RED FLAG noted in `api/admin.py`). */
+export async function postShopOnboard(name: string): Promise<ShopOnboardResult> {
+  const resp = await apiFetch("/api/admin/shops", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  return (await resp.json()) as ShopOnboardResult;
 }

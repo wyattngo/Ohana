@@ -167,6 +167,54 @@ def test_escalation_labels_cover_every_severity_rank_value() -> None:
     assert not extra, f"ESCALATION_META có key ngoài SEVERITY_RANK: {sorted(extra)}"
 
 
+def test_shop_onboard_interface_matches_the_python_response_model() -> None:
+    """Gate contract thứ ba cùng họ ChatOut/PendingReplyOut — cho `ShopOnboardResponse`.
+    Thêm cùng lượt với màn onboard (gap 2 audit T6) thay vì chờ drift xảy ra như A8."""
+    from api.admin import ShopOnboardResponse
+
+    expected = set(ShopOnboardResponse.model_fields)
+    assert expected, "ShopOnboardResponse không có field nào — introspection hỏng"
+
+    src = _read(_API_TS)
+    m = re.search(r"interface\s+ShopOnboardResult\s*\{(.*?)\n\}", src, re.S)
+    assert m, "api.ts thiếu `interface ShopOnboardResult`"
+    declared = set(re.findall(r"^\s*(\w+)\s*[?]?:", _strip_comments(m.group(1)), re.M))
+
+    missing = expected - declared
+    assert not missing, f"interface TS thiếu field backend trả về: {sorted(missing)}"
+    extra = declared - expected
+    assert not extra, f"interface TS khai field backend KHÔNG trả về: {sorted(extra)}"
+
+
+def test_api_ts_shop_onboard_never_sends_shop_id() -> None:
+    """`postShopOnboard` POST đúng `/api/admin/shops` qua `apiFetch`, body CHỈ mang `name` —
+    `shop_id` do server sinh (uuid4). Client mà gửi được id là chọn được danh tính tenant,
+    toàn bộ verify của S1 thành vô nghĩa (docstring `api/admin.py::onboard_shop`)."""
+    src = _strip_comments(_read(_API_TS))
+    assert "postShopOnboard" in src, "api.ts chưa có postShopOnboard"
+
+    block = _function_body(src, "postShopOnboard")
+    assert '"/api/admin/shops"' in block, "postShopOnboard không trỏ /api/admin/shops"
+    assert "apiFetch(" in block, "postShopOnboard phải đi qua apiFetch (CSRF tập trung ở đó)"
+    assert 'method: "POST"' in block, "postShopOnboard phải là POST"
+    assert "shop_id" not in block, "client không bao giờ được đề xuất shop_id"
+
+
+def test_ui_reaches_both_admin_surfaces() -> None:
+    """Gap 2+3 audit T6 đóng cùng nhau và phải SỐNG cùng nhau: ChannelPicker có đường mint
+    `role=admin` (trước đây mọi màn admin chết 403 vì UI chỉ mint seller), và shell App
+    route được tới màn onboard đang gọi `postShopOnboard`. Thiếu mảnh nào thì surface admin
+    quay lại trạng thái màn-chết mà audit mô tả."""
+    picker = _strip_comments(_read(_WEB / "screens" / "ChannelPicker.tsx"))
+    assert 'mockAuthorize("admin")' in picker, "ChannelPicker mất đường mint role=admin"
+
+    onboard = _strip_comments(_read(_WEB / "screens" / "AdminShopOnboard.tsx"))
+    assert "postShopOnboard(" in onboard, "AdminShopOnboard không gọi postShopOnboard"
+
+    app = _strip_comments(_read(_APP_TSX))
+    assert "AdminShopOnboard" in app, "App.tsx không route tới màn onboard shop"
+
+
 def test_chat_screen_shows_a_persistent_not_grounded_disclaimer() -> None:
     """Disclaimer hiện thường trực, KHÔNG nấp trong tooltip/title/aria.
 

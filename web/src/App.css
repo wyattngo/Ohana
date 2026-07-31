@@ -244,6 +244,44 @@
   outline-offset: 1px;
 }
 
+/* Shop-onboard result — hiển thị trong màn (không toast): shop_id phải copy được, không
+   được biến mất sau 4s. `user-select: all` để một tap chọn nguyên id. */
+.onboard-result {
+  margin-top: 16px;
+  padding: 12px;
+  border-radius: var(--ohana-radius-card, 16px);
+  background: var(--ohana-color-greyscale-100, #d2d2d2);
+  color: var(--ohana-color-greyscale-700, #2c2c2c);
+  font-size: 14px;
+}
+
+.onboard-result-id {
+  display: block;
+  margin-top: 6px;
+  font-weight: var(--ohana-weight-semibold, 600);
+  user-select: all;
+  word-break: break-all;
+}
+
+/* Lối vào admin dev-only ở ChannelPicker — cố ý mờ (greyscale, cỡ label): đây là công cụ
+   dev, không phải CTA cho seller. */
+.dev-admin-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 20px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-size: var(--ohana-size-label, 12px);
+  color: var(--ohana-color-greyscale-400, #7c7c7c);
+}
+
+.dev-admin-link:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .admin-field-hint {
   font-size: 12px;
   font-weight: var(--ohana-weight-regular, 400);

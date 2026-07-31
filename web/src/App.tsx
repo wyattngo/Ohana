@@ -1,5 +1,6 @@
 import { useCallback, useState } from "react";
 import "./App.css";
+import { AdminShopOnboard } from "./screens/AdminShopOnboard";
 import { AdminWikiIngest } from "./screens/AdminWikiIngest";
 import { ChannelPicker } from "./screens/ChannelPicker";
 import { ChatScreen } from "./screens/Chat";
@@ -32,7 +33,8 @@ type Screen =
   | { name: "inbox" }
   | { name: "review"; reply: PendingReplyOut }
   | { name: "chat" }
-  | { name: "admin" };
+  | { name: "admin" }
+  | { name: "adminShops" };
 
 interface ToastState {
   message: string;
@@ -59,7 +61,7 @@ function App() {
       {/* Chrome dùng chung cho các lối vào phụ. Trước G2 chỉ có một link admin định vị tuyệt
           đối; thêm link Chat cạnh nó bằng cách bọc cả hai vào một hàng — giữ nguyên vị trí
           góc trên phải, không phải nhét thêm một phần tử absolute thứ hai rồi canh tay. */}
-      {screen.name !== "admin" && screen.name !== "chat" && (
+      {screen.name !== "admin" && screen.name !== "adminShops" && screen.name !== "chat" && (
         <div className="shell-chrome">
           <button type="button" className="chrome-link" onClick={() => setScreen({ name: "chat" })}>
             Hỏi AI
@@ -67,12 +69,20 @@ function App() {
           <button type="button" className="chrome-link" onClick={() => setScreen({ name: "admin" })}>
             Quản trị Wiki
           </button>
+          <button
+            type="button"
+            className="chrome-link"
+            onClick={() => setScreen({ name: "adminShops" })}
+          >
+            Tạo shop
+          </button>
         </div>
       )}
 
       {screen.name === "channel" && (
         <ChannelPicker
           onConnected={() => setScreen({ name: "inbox" })}
+          onAdminConnected={() => setScreen({ name: "adminShops" })}
           onError={showError}
         />
       )}
@@ -103,6 +113,10 @@ function App() {
 
       {screen.name === "chat" && (
         <ChatScreen onBack={() => setScreen({ name: "inbox" })} onError={showError} />
+      )}
+
+      {screen.name === "adminShops" && (
+        <AdminShopOnboard onBack={() => setScreen({ name: "inbox" })} onError={showError} />
       )}
 
       {screen.name === "admin" && (
