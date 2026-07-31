@@ -380,6 +380,7 @@ async def test_inbound_persisted_through_real_webhook_route(fresh_db) -> None:
 
     from api.webhook import build_router
     from app.worker_seller import WorkerDeps, run_outbox_loop
+    from bridge.zalo_sender import MockZaloSender
     from channels.base import InboundMessage
     from db.models import Conversation
 
@@ -418,7 +419,7 @@ async def test_inbound_persisted_through_real_webhook_route(fresh_db) -> None:
     assert resp.json()["action"] == "queued"
 
     # Webhook mới chỉ enqueue — chưa có row message nào cho tới khi worker chạy.
-    deps = WorkerDeps(session_factory=sf, drafter=_FakeDrafter())
+    deps = WorkerDeps(session_factory=sf, drafter=_FakeDrafter(), sender=MockZaloSender())
     await run_outbox_loop(deps, run_once=True)
 
     async with sf() as s:

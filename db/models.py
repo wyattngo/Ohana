@@ -359,6 +359,12 @@ class PendingReply(Base):
     escalation_reasons: Mapped[list[str]] = mapped_column(
         ARRAY(Text), nullable=False, server_default="{}"
     )
+    # OHB-23 / a11 — send-worker claim (I13). Nullable: draft chưa được claim gửi thì NULL.
+    # Không cột nào khác trên bảng này ĐANG mang mốc "gửi" nào (decided_at là mốc SELLER
+    # quyết, KHÔNG phải mốc worker gửi — clobber nó là hỏng audit + training label §8.1).
+    # Reaper R5 (§6.9, xem db/repos.py::_REAP_R5_STUCK_SEND_CLAIM) quét cột này qua partial
+    # index `idx_pending_reply_send_claim` khi sent_claimed_at IS NOT NULL.
+    sent_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # spec 06 F0: `conversation_id` / `customer_id` were bare Text with nothing behind them —
     # they could point at ids that never existed and Postgres accepted it. Now composite FKs,
@@ -397,6 +403,14 @@ class PendingReply(Base):
             "idx_pending_reply_ttl",
             "expires_at",
             postgresql_where=text("status = 'pending'"),
+        ),
+        # OHB-23 / a11 — đường quét của reaper R5 (send-worker claim kẹt >5', mỗi 10s):
+        # điều kiện trùng khít WHERE của _REAP_R5_STUCK_SEND_CLAIM (db/repos.py). Sửa một
+        # bên phải sửa cả hai — nếu không R5 seq-scan cả bảng pending_reply mỗi 10s.
+        Index(
+            "idx_pending_reply_send_claim",
+            "sent_claimed_at",
+            postgresql_where=text("sent_claimed_at IS NOT NULL"),
         ),
     )
 

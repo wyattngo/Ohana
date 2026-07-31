@@ -47,6 +47,25 @@ from db.models import (
 _MESSAGE_ROLES = frozenset({"user", "assistant", "seller", "system"})
 
 
+@dataclass(frozen=True)
+class SendJob:
+    """OHB-23 · một draft đã claim send-worker — snapshot cho worker xử lý SAU khi
+    transaction claim đóng.
+
+    Chỉ mang field worker THẬT SỰ đọc để gọi `OutboundChannel.send`: shop_id + customer_id
+    + draft_text là payload thiết yếu; trace_id cho log G6; reply_id + claimed_at là token
+    sở hữu để mark_sent/release. KHÔNG chở intent/confidence/escalation_reasons — worker
+    gửi text đã được seller duyệt, không cần lý do gate."""
+
+    reply_id: str
+    shop_id: str
+    conversation_id: str
+    customer_id: str
+    draft_text: str
+    trace_id: uuid.UUID
+    claimed_at: datetime  # RETURNING sent_claimed_at — token echo cho mark_sent/release
+
+
 class ConversationRepo:
     """Shop-scoped access to `conversations` (spec 06 Phase F0).
 
@@ -155,6 +174,73 @@ class PendingReplyRepo:
             )
         )
         return (await self._session.execute(stmt)).scalars().all()
+
+    async def mark_sent(self, reply_id: str, *, claimed_at: datetime) -> int:
+        """OHB-23 · chuyển 'approved' → 'sent' + clear claim SAU KHI sender.send() xong.
+        Echo `:claimed_at` là token sở hữu (cùng bài _FINISH_DEBOUNCE): nếu R5 đã gỡ
+        claim (worker này treo >5') rồi worker khác claim lại, câu này thành no-op —
+        rowcount=0 báo caller "đã bị soán quyền, không log 'sent' oan".
+
+        `status IN ('approved','sent')` cho double-mark idempotent: retry sau khi sender
+        thành công nhưng crash trước ack ⇒ row đã 'sent' vẫn UPDATE OK (rowcount>0).
+        `shop_id = :scope` là S4 — reply_id shop khác truyền vào repo scoped shop này
+        rowcount=0, không mark chéo."""
+        result = cast(
+            "CursorResult[Any]",
+            await self._session.execute(
+                _MARK_SENT,
+                {
+                    "reply_id": reply_id,
+                    "claimed_at": claimed_at,
+                    "shop_id": self._shop_scope,
+                },
+            ),
+        )
+        await self._session.commit()
+        return int(result.rowcount or 0)
+
+    async def release_send_claim(self, reply_id: str, *, claimed_at: datetime) -> int:
+        """OHB-23 · thả claim khi send LỖI (mạng chớp, sender raise) — draft về lại hàng
+        đợi 'approved' để lượt claim kế thử lại NGAY, không chờ R5 5'. Cùng token echo
+        `:claimed_at` — không dọn claim của worker khác đang gửi.
+
+        `status = 'approved'` là điều kiện: draft đã bị chuyển 'sent' bởi nhánh khác
+        (double-mark race) thì không release oan. `sent/rejected/expired` không phải hàng
+        đợi gửi ⇒ không rơi vào đây. `shop_id = :scope` — S4 belt-and-braces."""
+        result = cast(
+            "CursorResult[Any]",
+            await self._session.execute(
+                _RELEASE_SEND_CLAIM,
+                {
+                    "reply_id": reply_id,
+                    "claimed_at": claimed_at,
+                    "shop_id": self._shop_scope,
+                },
+            ),
+        )
+        await self._session.commit()
+        return int(result.rowcount or 0)
+
+    async def has_pending(self, conversation_id: str) -> bool:
+        """O9=B (OHB-7): conversation này có draft đang `pending` chưa?
+
+        Guard chống compose lượt hai khi seller CHƯA quyết draft hiện tại. Worker gọi TRƯỚC
+        `claim_debounce`: thấy True ⇒ bỏ lượt compose — KHÔNG claim, KHÔNG reserve, KHÔNG
+        finish (timer giữ nguyên due). Tin mới đã bền trong `messages`; lượt compose kế
+        (sau khi draft này approve/reject rời trạng thái pending) cuốn cả cụm tích luỹ.
+        Snapshot T0 của draft cũ không bị đụng (I9): guard chỉ ĐỌC.
+
+        Scoped theo shop (S4): draft của shop khác trả False — không rò, cũng không chặn
+        nhầm. CHỈ `status='pending'` chặn — approved/rejected/sent/expired đã rời hàng đợi
+        review nên lượt compose mới được phép chạy."""
+        stmt = (
+            select(PendingReply.reply_id)
+            .where(PendingReply.shop_id == self._shop_scope)
+            .where(PendingReply.conversation_id == conversation_id)
+            .where(PendingReply.status == "pending")
+            .limit(1)
+        )
+        return (await self._session.execute(stmt)).first() is not None
 
     async def get(self, reply_id: str) -> PendingReply | None:
         """Fetch one parked draft by id — scoped. A reply_id belonging to another shop
@@ -514,6 +600,52 @@ _CLAIM_OUTBOX = text("""
     RETURNING *
 """)
 
+# OHB-23 · claim send-batch: cùng khuôn §6.2 (UPDATE...WHERE id IN SELECT FOR UPDATE SKIP
+# LOCKED) — N send-worker cùng chạy thì mỗi row đúng một chủ, không chờ lock (C2 cho gửi).
+# Điều kiện `sent_claimed_at IS NULL` là toàn bộ nội dung claim: đã claim (dù chưa mark
+# sent) thì bên khác bỏ qua ⇒ không double-send. Reaper R5 (§6.9-style) gỡ claim >5' (I13).
+# 🚫 Bỏ SKIP LOCKED = worker serialize; tách SELECT rồi UPDATE = hai worker claim cùng row.
+# LIMIT 20 khớp §6.2. `status='approved'` là điều kiện đầu vào — sent/rejected/expired
+# không phải hàng đợi gửi.
+_CLAIM_SEND = text("""
+    UPDATE pending_reply SET sent_claimed_at = now()
+    WHERE reply_id IN (
+      SELECT reply_id FROM pending_reply
+       WHERE status = 'approved' AND sent_claimed_at IS NULL
+       ORDER BY created_at
+       FOR UPDATE SKIP LOCKED LIMIT 20
+    )
+    RETURNING reply_id, shop_id, conversation_id, customer_id, draft_text, trace_id,
+              sent_claimed_at
+""")
+
+# Mark sent — cùng token echo pattern như _FINISH_DEBOUNCE (:claimed_at trong WHERE):
+# nếu R5 đã gỡ claim (worker treo >5') rồi worker khác claim lại thì worker CŨ (mang
+# claimed_at đã bị đè hoặc NULL) thành no-op, không ghi đè quyết định của worker mới.
+# `status IN ('approved','sent')` cho double-mark idempotent (retry sau mark thành công
+# nhưng crash trước ack): thấy 'sent' rồi thì rowcount>0 nhưng không đổi gì thêm.
+# `shop_id = :scope` là S4 belt-and-braces: repo caller đã scope, câu này lặp lại để một
+# reply_id shop-A truyền nhầm vào repo shop-B rowcount=0 thay vì âm thầm mark chéo.
+_MARK_SENT = text("""
+    UPDATE pending_reply
+       SET status = 'sent', sent_claimed_at = NULL
+     WHERE reply_id = :reply_id
+       AND shop_id = :shop_id
+       AND status IN ('approved', 'sent')
+       AND sent_claimed_at = :claimed_at
+""")
+
+# Release claim (send lỗi): thả claim để retry lượt sau, KHÔNG đổi status (giữ 'approved'
+# cho draft vào lại hàng đợi gửi). Cùng token echo. Cost/reliability trade-off: retry
+# ngay lượt kế thay vì chờ R5 5' — send lỗi thoáng qua (mạng) không nên giam draft 5'.
+_RELEASE_SEND_CLAIM = text("""
+    UPDATE pending_reply SET sent_claimed_at = NULL
+     WHERE reply_id = :reply_id
+       AND shop_id = :shop_id
+       AND status = 'approved'
+       AND sent_claimed_at = :claimed_at
+""")
+
 # Lỗi ⇒ pending (thử lại) hay dead (chạm trần) quyết trong MỘT câu UPDATE — đọc attempts
 # rồi update ở Python là check-then-act, cùng họ race mà §6.5 cấm. Backoff 2^attempts giây
 # (2·4·8·16s): đủ sống qua blip DB vài giây, đủ ngắn để không giam tin khách; power/
@@ -644,6 +776,49 @@ class OutboxRepo:
         await self._session.commit()
 
 
+class SendQueueRepo:
+    """OHB-23 · claim hàng đợi send (draft `approved`) — loop nền-tảng, KHÔNG `shop_scope`.
+
+    Cùng biên với `OutboxRepo`/`SchedulerRepo`: worker claim theo FIFO `created_at` khắp
+    mọi shop, không theo tenant. Tenant isolation vẫn còn ở bước SAU (worker cầm SendJob
+    có `shop_id` gắn cứng từ ROW, gọi PendingReplyRepo scoped theo giá trị đó cho
+    mark_sent/release — S4 giữ ở cả hai đầu).
+
+    `mark_sent`/`release_send_claim` sống trên `PendingReplyRepo` (scoped): cùng bài phân
+    trách với đường compose (claim §6.3 ở SchedulerRepo unscoped, `PendingReplyRepo.create`
+    scoped). Claim là nền-tảng, ghi/chuyển trạng thái row là tenant.
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def claim_batch(self) -> list[SendJob]:
+        """Claim tối đa 20 draft `approved` chưa được worker khác lấy — CTE `_CLAIM_SEND`
+        (SKIP LOCKED). Commit-ngay: giữ transaction qua sender HTTP là giữ row-lock hàng
+        giây, connection pool nghẹn (cùng lý do `OutboxRepo.claim_batch`). Sau commit,
+        quyền sở hữu ở `sent_claimed_at IS NOT NULL`; worker chết thì R5 gỡ sau 5' (I13).
+
+        RETURNING của UPDATE không bảo toàn ORDER BY subquery — sắp theo `reply_id` để
+        thứ tự xử lý ổn định (không phụ thuộc thứ tự ngẫu nhiên Postgres trả)."""
+        rows = (await self._session.execute(_CLAIM_SEND)).mappings().all()
+        await self._session.commit()
+        return sorted(
+            (
+                SendJob(
+                    reply_id=r["reply_id"],
+                    shop_id=r["shop_id"],
+                    conversation_id=r["conversation_id"],
+                    customer_id=r["customer_id"],
+                    draft_text=r["draft_text"],
+                    trace_id=r["trace_id"],
+                    claimed_at=r["sent_claimed_at"],
+                )
+                for r in rows
+            ),
+            key=lambda j: j.reply_id,
+        )
+
+
 # §6.3 NGUYÊN VĂN (design — PRE-010 C2), đổi tên theo ánh xạ: `seller.conversation` →
 # `conversations`, cột khoá `conversation_id` → `id`.
 #
@@ -713,6 +888,17 @@ _GIVE_UP_DEBOUNCE = text("""
      WHERE id = :conversation_id AND debounce_claimed_at = :claimed_at
 """)
 
+# OHB-22 · SIGTERM release: chỉ NULL claim, GIỮ timer + GIỮ compose_failures. Khác
+# _FINISH_DEBOUNCE (finish reset compose_failures=0 và NULL timer đã đúng due — thành
+# công), khác _GIVE_UP_DEBOUNCE (bỏ cuộc — NULL timer). Cancel do SIGTERM KHÔNG phải lỗi
+# drafter và KHÔNG phải hoàn tất compose — worker khác (hoặc lượt kế của instance restart)
+# claim lại NGAY khi tick sau, không chờ R3 5'. Echo :claimed_at giữ token sở hữu — không
+# dọn claim của worker khác.
+_RELEASE_DEBOUNCE_CLAIM = text("""
+    UPDATE conversations SET debounce_claimed_at = NULL
+     WHERE id = :conversation_id AND debounce_claimed_at = :claimed_at
+""")
+
 # ── Reaper — 4 việc, design §3, chạy mỗi 10s. R3/R4 NGUYÊN VĂN §6.9/§6.10. ──────────────
 # R1 · draft hết TTL → expired. `expires_at IS NOT NULL`: TTL chưa wire (A0 để nullable),
 # row không TTL thì không bao giờ expire — đúng hành vi trước khi B5 wire TTL thật.
@@ -761,6 +947,17 @@ _REAP_R4_STUCK_RESERVATIONS = text("""
        SET reserved_tokens = GREATEST(0, b.reserved_tokens - a.tokens)
       FROM agg a
      WHERE b.shop_id = a.shop_id AND b.budget_date = a.budget_date
+""")
+
+# R5 · OHB-23 · send-worker claim kẹt >5' → NULL (cùng khuôn R3, cùng lý do I13: worker
+# chết sau claim là draft im lặng vĩnh viễn ở `approved`, không ai gửi được). Quét qua
+# partial index `idx_pending_reply_send_claim` — điều kiện WHERE trùng khít index. KHÔNG
+# đổi `status`: draft vẫn 'approved' → lượt claim kế lại vào hàng đợi gửi (đúng nghĩa
+# retry). 🚫 Đừng đổi thành 'sent'/failed nào ở đây — đó là quyết định của worker sau khi
+# thực sự gọi sender, R5 chỉ gỡ token sở hữu (giống R3 chỉ NULL claim, không đụng timer).
+_REAP_R5_STUCK_SEND_CLAIM = text("""
+    UPDATE pending_reply SET sent_claimed_at = NULL
+     WHERE sent_claimed_at IS NOT NULL AND sent_claimed_at < now() - interval '5 minutes'
 """)
 
 
@@ -866,6 +1063,16 @@ class SchedulerRepo:
         await self._session.commit()
         return int(count)
 
+    async def release_debounce_claim(self, conversation_id: str, *, claimed_at: datetime) -> None:
+        """OHB-22 · SIGTERM graceful: thả claim, GIỮ timer + compose_failures. Worker
+        khác (hoặc instance restart) claim lại ngay tick sau — không chờ R3 5', không
+        đếm nhầm poison (cancel không phải lỗi drafter). Cùng echo token như finish."""
+        await self._session.execute(
+            _RELEASE_DEBOUNCE_CLAIM,
+            {"conversation_id": conversation_id, "claimed_at": claimed_at},
+        )
+        await self._session.commit()
+
     async def give_up_debounce(self, conversation_id: str, *, claimed_at: datetime) -> None:
         """Đạt trần poison: thôi retry (NULL timer + thả claim), GIỮ compose_failures cho
         vận hành query hội thoại bị bỏ cuộc. Echo `claimed_at` — không dọn claim của
@@ -889,6 +1096,7 @@ class SchedulerRepo:
             ("r2_stuck_outbox", _REAP_R2_STUCK_OUTBOX, {"max_attempts": OutboxRepo.MAX_ATTEMPTS}),
             ("r3_stuck_debounce", _REAP_R3_STUCK_DEBOUNCE, {}),
             ("r4_stuck_reservations", _REAP_R4_STUCK_RESERVATIONS, {}),
+            ("r5_stuck_send_claim", _REAP_R5_STUCK_SEND_CLAIM, {}),
         )
         for name, stmt, params in params_by_stmt:
             result = cast("CursorResult[Any]", await self._session.execute(stmt, params))

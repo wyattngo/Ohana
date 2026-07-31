@@ -209,7 +209,9 @@ async def test_brand_new_channel_routes_end_to_end_without_touching_core(fresh_d
 
     # Drain queue bằng worker (A5): outbox loop ghi tin, debounce loop compose → park.
     # Timer debounce mặc định là tương lai — backdate để compose ngay trong test.
-    deps = WorkerDeps(session_factory=session_factory, drafter=LowConfDrafter())
+    # `sender` không dùng trong test này (không gọi run_send_loop) — nhưng WorkerDeps
+    # required nên tái dùng `ch` (FakeChannel đã có `send()` cùng chữ ký).
+    deps = WorkerDeps(session_factory=session_factory, drafter=LowConfDrafter(), sender=ch)
     await run_outbox_loop(deps, run_once=True)
     async with session_factory() as s:
         await s.execute(

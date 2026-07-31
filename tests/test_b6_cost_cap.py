@@ -22,6 +22,7 @@ from sqlalchemy import text as sa_text
 
 from app import alert_service
 from app.worker_seller import WorkerDeps, run_debounce_loop
+from bridge.zalo_sender import MockZaloSender
 from db.models import Conversation, Customer, Message, PendingReply, Shop
 from db.repos import CostRepo, SchedulerRepo
 
@@ -121,7 +122,7 @@ async def test_cap_hit_holds_without_calling_llm(fresh_db) -> None:
     await _seed_due(session_factory, cap=100)
 
     drafter = _MustNotBeCalledDrafter()
-    await run_debounce_loop(WorkerDeps(session_factory, drafter), run_once=True)
+    await run_debounce_loop(WorkerDeps(session_factory, drafter, MockZaloSender()), run_once=True)
 
     assert drafter.called == [], "chạm trần mà LLM vẫn bị gọi"
     assert alert_service.cost_cap_hit_count(_SHOP) == 1
@@ -143,7 +144,9 @@ async def test_draft_reconciles_budget_with_real_usage(fresh_db) -> None:
     _, session_factory = await fresh_db()
     await _seed_due(session_factory, cap=200_000)
 
-    await run_debounce_loop(WorkerDeps(session_factory, _UsageDrafter()), run_once=True)
+    await run_debounce_loop(
+        WorkerDeps(session_factory, _UsageDrafter(), MockZaloSender()), run_once=True
+    )
 
     async with session_factory() as s:
         drafts = (await s.execute(select(func.count()).select_from(PendingReply))).scalar_one()
@@ -166,7 +169,7 @@ async def test_llm_failure_releases_reservation_keeps_claim_for_r3(fresh_db) -> 
     _, session_factory = await fresh_db()
     await _seed_due(session_factory, cap=200_000)
 
-    await run_debounce_loop(WorkerDeps(session_factory, _Boom()), run_once=True)
+    await run_debounce_loop(WorkerDeps(session_factory, _Boom(), MockZaloSender()), run_once=True)
 
     async with session_factory() as s:
         conv = await s.get(Conversation, _CONV)
