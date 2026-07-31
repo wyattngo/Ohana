@@ -54,7 +54,11 @@ _ENSURE_ENUMS = """
 DO $$ BEGIN
     CREATE TYPE outbox_status AS ENUM ('pending','processing','done','dead');
 EXCEPTION WHEN duplicate_object THEN NULL;
-END $$
+END $$;
+DO $$ BEGIN
+    CREATE TYPE assistant.msg_role AS ENUM ('user','assistant','system');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 """
 
 
@@ -79,6 +83,9 @@ def _tables_exist_up_front() -> None:
         # trên DB thật, ở đây phải tự lo. Cả hai đều idempotent.
         conn.exec_driver_sql("CREATE EXTENSION IF NOT EXISTS vector")
         conn.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS platform")
+        # Tầng 2 · a12 · schema mới cho Ohana AI Assistant; ENUM phải tạo TRƯỚC
+        # `_ENSURE_ENUMS` chạy (nó qualify `assistant.msg_role`).
+        conn.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS assistant")
         conn.exec_driver_sql(_ENSURE_ENUMS)
         Base.metadata.create_all(conn)
     engine.dispose()
@@ -108,6 +115,9 @@ async def fresh_db() -> AsyncIterator[_FreshDb]:
             # a1 chuyển `embeddings` sang schema `platform`; `create_all` KHÔNG tự tạo
             # schema (đó là việc của migration a1 trên DB thật — DB test không chạy alembic).
             await conn.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS platform")
+            # Tầng 2 · a12 · schema cho Ohana AI Assistant; ENUM `assistant.msg_role`
+            # qualify schema này, phải tạo trước `_ENSURE_ENUMS`.
+            await conn.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS assistant")
             # Type có thể vừa bị test_embedding_dim downgrade-from-zero xoá — đảm bảo lại
             # mỗi lượt dựng (idempotent, xem _ENSURE_ENUMS).
             await conn.exec_driver_sql(_ENSURE_ENUMS)

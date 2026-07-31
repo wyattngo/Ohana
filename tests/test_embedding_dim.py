@@ -70,6 +70,11 @@ def _alembic_owns_this_db() -> None:
     dsn = DATABASE_URL.replace("postgresql+psycopg://", "postgresql://")
     with psycopg.connect(dsn, autocommit=True) as conn:
         conn.execute("DROP SCHEMA IF EXISTS platform CASCADE")
+        # Tầng 2 · a12 · dọn schema `assistant` cùng lý do `platform` — `_tables_exist_up_front`
+        # tạo `assistant.conversations/messages/user_memory` bằng metadata.create_all; loop
+        # drop `sorted_tables` bằng TÊN TRẦN không qualify được, và alembic-from-zero nổ
+        # DuplicateTable ở a12 (đo 2026-07-31).
+        conn.execute("DROP SCHEMA IF EXISTS assistant CASCADE")
         # Đảo thứ tự sorted_tables để con (FK) rơi trước cha; CASCADE đỡ phần còn lại.
         # Drop theo TÊN TRẦN cho mọi bảng, kể cả bảng metadata khai ở schema khác:
         # sau `downgrade 0003`, `embeddings` sống ở PUBLIC (a1 chưa move) — leftover đó

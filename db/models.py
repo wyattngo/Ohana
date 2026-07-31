@@ -707,3 +707,114 @@ class ZaloOAToken(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+# =====================================================================================
+# Tầng 2 · Ohana AI Assistant (Bước 2 Phase 2.1 · a12 · OHB-27)
+#
+# Schema `assistant` tách khỏi `public` (seller data, luồng B) và `platform` (corpus
+# luồng A read-only). Grants: `svc_ohana_ai` FULL trong `assistant.*` (D2 · ADR);
+# `svc_seller` / `mcp_readonly` DENIED. Test gate: tests/contract/test_a12_assistant_schema.py.
+#
+# Prefix class `Assistant*` để không clash với `Message`/`Conversation` hiện có của luồng
+# B (`public.messages` / `public.conversations`) — `__tablename__` giữ ngắn vì schema
+# đã tách. Đường phân biệt là `__table_args__ = {"schema": "assistant"}` (thay vì tên).
+# =====================================================================================
+
+
+class AssistantConversation(Base):
+    """Hội thoại Tầng 2 — key theo `user_id text` (khớp Identity.user_id: str, JWT sub).
+
+    KHÔNG `shop_id`: Tầng 2 là trợ lý cá nhân (per-user), khác Tầng 3 (per-shop). Soft-
+    delete (`deleted_at IS NULL` cho row sống) — Phase 2.4 CRUD dùng. Partial index
+    scope theo predicate đó, list-recent không quét row đã xoá.
+    """
+
+    __tablename__ = "conversations"
+    __table_args__ = (
+        Index(
+            "idx_assistant_conv_user_updated",
+            "user_id",
+            "updated_at",
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
+        {"schema": "assistant"},
+    )
+
+    conversation_id: Mapped[int] = mapped_column(
+        BigInteger, Identity(always=True), primary_key=True
+    )
+    user_id: Mapped[str] = mapped_column(Text, nullable=False)
+    title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AssistantMessage(Base):
+    """Tin nhắn Tầng 2 — role `user`/`assistant`/`system` (ENUM `assistant.msg_role`).
+
+    `user_id` redundant với `conversations.user_id` (lock scope repo Phase 2.3 + chống
+    query lỡ mất WHERE user_id gây leak cross-user memory). `content` RAW — khớp pattern
+    `seller.message.body_raw` §5.5; scrub lúc dựng prompt ở Phase 2.4 (I3-analog luồng A).
+
+    FK `ON DELETE CASCADE`: hard-delete conversation (nếu Phase 2.4 forget dùng) dọn
+    messages theo, không orphan.
+    """
+
+    __tablename__ = "messages"
+    __table_args__ = (
+        Index("idx_assistant_msg_conv_created", "conversation_id", "created_at"),
+        {"schema": "assistant"},
+    )
+
+    message_id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    conversation_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("assistant.conversations.conversation_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    user_id: Mapped[str] = mapped_column(Text, nullable=False)
+    role: Mapped[str] = mapped_column(
+        PG_ENUM(
+            "user",
+            "assistant",
+            "system",
+            name="msg_role",
+            schema="assistant",
+            create_type=False,
+        ),
+        nullable=False,
+    )
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class AssistantUserMemory(Base):
+    """Memory per-user Tầng 2 (namespace `mem:user:{id}` · ADR §3). Append-only tại
+    Phase 2.1 — `forget` endpoint (Phase 2.4) quyết DELETE thật hay `forgotten_at`.
+
+    `embedding vector(1024)` khớp EMBED_DIM=1024 (e5). HNSW index viết tay trong migration
+    (autogen không thấy) — KHÔNG khai ở đây để metadata không mâu thuẫn với DB. Precedent:
+    `Embedding` cũng không khai vector index ở model (retrieval seq-scan/pick Postgres).
+    """
+
+    __tablename__ = "user_memory"
+    __table_args__ = (
+        Index("idx_assistant_user_memory_user", "user_id", "created_at"),
+        {"schema": "assistant"},
+    )
+
+    memory_id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    user_id: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(Vector(_EMBED_DIM), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
