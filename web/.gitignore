@@ -1,0 +1,32 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+# dist is intentionally NOT ignored (spec 04 P0 deviation — flagged for Wyatt): no CI step
+# builds this yet (.github/workflows/ci.yml is out of P0's ALLOWED_FILES scope) and the repo
+# has a real `origin` remote, so the built bundle is committed until a follow-up adds a
+# `pnpm build` CI step. Re-ignore + delete the committed copy once that lands.
+# (root .gitignore has Python-packaging `dist/` and `lib/` patterns that would swallow
+# web/dist and web/src/lib — the negations below are what actually keep them tracked)
+!dist/
+!src/lib/
+dist-ssr
+web.zip
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

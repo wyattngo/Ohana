@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 80" width="80" height="80">
+  <!-- Ohana mark, standalone (transparent background) — the roof/shelter geometry frozen in
+       the brand bundle `Ohana Brand Identity.dc.html` turn 1. Light-surface gradient
+       (primary/600 → primary/900). For in-app rendering use `src/components/Logo.tsx`
+       instead; this file exists for og:image / external embeds / anything outside React. -->
+  <defs>
+    <linearGradient id="ohana-mark-roof" x1="0.5" y1="0" x2="0.5" y2="1">
+      <stop offset="0%" stop-color="#7C3AED"/>
+      <stop offset="100%" stop-color="#4C1D95"/>
+    </linearGradient>
+    <radialGradient id="ohana-mark-spark" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%" stop-color="#7C3AED" stop-opacity="0.5"/>
+      <stop offset="40%" stop-color="#7C3AED" stop-opacity="0.15"/>
+      <stop offset="100%" stop-color="#7C3AED" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <line x1="16" y1="56" x2="40" y2="24" stroke="url(#ohana-mark-roof)" stroke-width="10" stroke-linecap="round"/>
+  <line x1="40" y1="24" x2="64" y2="56" stroke="url(#ohana-mark-roof)" stroke-width="10" stroke-linecap="round"/>
+  <circle cx="40" cy="44" r="5" fill="url(#ohana-mark-spark)"/>
+  <circle cx="40" cy="44" r="2" fill="#6D28D9" opacity="0.8"/>
+</svg>

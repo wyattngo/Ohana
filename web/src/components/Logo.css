@@ -1,0 +1,25 @@
+/* Ohana logo lockup 1a — see Logo.tsx header for why these values are hardcoded rather than
+   pulled from `--ohana-*` tokens. */
+
+.ohana-logo {
+  display: inline-flex;
+  align-items: center;
+  /* Bundle spec: 28px gap at a 56px mark. Kept proportional via em so `size` scales it. */
+  gap: 0.5em;
+  line-height: 1;
+}
+
+.ohana-logo-mark {
+  flex: none;
+  display: block;
+}
+
+.ohana-logo-word {
+  /* Space Grotesk is loaded in index.html. The fallback chain matters more than usual: if
+     the font request fails the wordmark still has to read as a wordmark, so fall back to
+     geometric-ish system faces rather than whatever `sans-serif` resolves to. */
+  font-family: "Space Grotesk", "Avenir Next", "Segoe UI", system-ui, sans-serif;
+  font-weight: 600;
+  letter-spacing: -0.5px;
+  white-space: nowrap;
+}

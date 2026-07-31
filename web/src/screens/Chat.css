@@ -1,0 +1,135 @@
+/* Màn Chat (spec 07 G2). Chỉ dùng token Astronixa đã có từ spec 04 — KHÔNG thêm token mới
+   (spec §7 G2 APPROACH). Mọi `var()` đều kèm fallback, cùng quy ước với ReviewCard.css. */
+
+.chat-screen {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+
+  /* Chiều cao PHẢI xác định, không phải `flex: 1` + `min-height: 0`.
+     Bản đầu chỉ có `flex:1; min-height:0` và HỎNG trên mobile: `.ohana-app` dùng
+     `min-height: 100vh` nên nó *lớn lên* theo nội dung thay vì giới hạn con. Không tổ tiên
+     nào có chiều cao xác định ⇒ `.chat-transcript` không bao giờ chạm trần ⇒ không cuộn nội
+     bộ ⇒ cả trang dài ra và **ô nhập bị đẩy khỏi màn hình** (đo được ở 375×812: trang cao
+     866, đáy composer ở 834). Seller không gõ được gì nếu hội thoại dài.
+     Đặt chiều cao xác định ở ĐÂY chứ không sửa `.ohana-app`: 4 màn kia đang dựa vào việc
+     trang tự cuộn, đổi container chung sẽ bắt cả 4 phải cuộn nội bộ. */
+  height: 100vh;
+  height: 100dvh; /* dvh trừ đi thanh địa chỉ động của trình duyệt mobile; vh ở trên là fallback */
+  box-sizing: border-box;
+
+  /* BẮT BUỘC đi kèm `height` ở trên. `.screen` dùng chung khai `flex: 1`, tức
+     `flex-basis: 0%` — và trong flex container dọc, flex-basis THẮNG height trên trục chính.
+     Nên chỉ đặt `height` thôi thì trình duyệt bỏ qua, đúng như đo được: đặt height xong
+     trang vẫn cao 1247/812 và composer vẫn nằm ngoài màn hình. Trả flex về auto để height
+     có hiệu lực. */
+  flex: 0 0 auto;
+}
+
+.chat-disclaimer {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: var(--ohana-radius-card, 16px);
+  /* Astronixa KHÔNG có palette semantic (danger/warning/success) — DEC-OHANA-01 §U2. Nên
+     dùng greyscale + icon để báo hiệu, đúng cách intent badge đã làm, thay vì bịa ra một
+     màu vàng không có trong design system. */
+  background: var(--ohana-color-greyscale-100, #f4f4f4);
+  color: var(--ohana-color-greyscale-600, #4a4a4a);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.chat-disclaimer svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.chat-transcript {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 4px 0;
+}
+
+.chat-empty {
+  margin: auto 0;
+  padding: 0 8px;
+  color: var(--ohana-color-greyscale-500, #5e5e5e);
+  font-size: 14px;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.chat-turn {
+  max-width: 85%;
+  padding: 10px 14px;
+  border-radius: var(--ohana-radius-card, 16px);
+  font-size: 15px;
+  line-height: 1.5;
+  /* Giữ nguyên xuống dòng của model, và bẻ dòng chuỗi dài (link, mã đơn) thay vì đẩy ngang
+     cả khung. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.chat-turn-user {
+  align-self: flex-end;
+  background: var(--ohana-color-greyscale-800, #151515);
+  color: #fff;
+}
+
+.chat-turn-assistant {
+  align-self: flex-start;
+  background: #fff;
+  color: var(--ohana-color-greyscale-800, #151515);
+}
+
+.chat-turn-pending {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ohana-color-greyscale-500, #5e5e5e);
+  font-size: 14px;
+}
+
+.chat-composer {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.chat-input {
+  flex: 1;
+  resize: none;
+  padding: 10px 12px;
+  border: 1px solid var(--ohana-color-greyscale-200, #e6e6e6);
+  border-radius: var(--ohana-radius-card, 16px);
+  background: #fff;
+  color: var(--ohana-color-greyscale-800, #151515);
+  font: inherit;
+  font-size: 15px;
+  line-height: 1.4;
+}
+
+.chat-input:disabled {
+  background: var(--ohana-color-greyscale-100, #f4f4f4);
+  color: var(--ohana-color-greyscale-500, #5e5e5e);
+}
+
+.chat-send {
+  /* `.btn-primary` dùng chung mang `width: 100%` — đúng cho các màn P1 xếp nút theo cột, sai
+     trong hàng flex ở đây: nút đòi trọn chiều rộng và bóp ô nhập còn một sợi. Bắt buộc phải
+     ghi đè `width`, `min-width` KHÔNG chống lại được `width: 100%`.
+     (Bắt được bằng cách nhìn ảnh chụp thật — không test nào trong repo này thấy layout.) */
+  width: auto;
+  flex: 0 0 auto;
+  /* Không để nút co lại theo nội dung khi đổi icon spinner ↔ send: chiều rộng nhảy lúc đang
+     gửi làm giao diện giật. */
+  min-width: 96px;
+}

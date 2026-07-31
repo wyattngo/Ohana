@@ -1,0 +1,252 @@
+/* Shared shell + primitives for the GD0.5 Phase P1 screens (ChannelPicker / Inbox /
+   ReviewCard). Styled against the `--ohana-*` custom properties injected by
+   `lib/tokens.ts#injectOhanaTokens()` — never the raw hex from the TS objects (tokens.ts
+   header comment / DEC-OHANA-01 single-point-of-change contract).
+
+   Mobile-first, no desktop layout pass — spec 04 §3 "Out of scope: Mobile responsive polish
+   (mockup đã mobile-first 410x800, GD0.5 giữ nguyên shell, không optimize desktop)". */
+
+.ohana-app {
+  max-width: 430px;
+  min-height: 100vh;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  background: var(--ohana-color-greyscale-50, #f2f2f2);
+  font-family: var(--ohana-font-family, "Inter", system-ui, sans-serif);
+  position: relative;
+}
+
+.screen {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 24px 20px 32px;
+}
+
+.screen-header h1 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 20px;
+  font-weight: var(--ohana-weight-semibold, 600);
+  color: var(--ohana-color-greyscale-800, #151515);
+  margin: 0;
+}
+
+.screen-header p {
+  margin: 4px 0 0;
+  font-size: 14px;
+  color: var(--ohana-color-greyscale-500, #5e5e5e);
+}
+
+/* ---- Buttons ---------------------------------------------------------------------------- */
+
+.btn-primary,
+.btn-secondary,
+.btn-ghost-danger,
+.back-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: none;
+  cursor: pointer;
+  font-family: inherit;
+  font-weight: var(--ohana-weight-semibold, 600);
+  font-size: var(--ohana-size-button, 16px);
+}
+
+.btn-primary,
+.btn-secondary,
+.btn-ghost-danger {
+  padding: var(--ohana-button-padding, 10px) 24px;
+  border-radius: var(--ohana-radius-pill, 100px);
+  width: 100%;
+}
+
+.btn-primary {
+  background: var(--ohana-cta-gradient, linear-gradient(to left, #2e96fe, #9744fb, #ca50fb));
+  color: #fff;
+}
+
+.btn-primary:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.btn-secondary {
+  background: #fff;
+  color: var(--ohana-color-primary-500, #9744fb);
+  border: 1px solid var(--ohana-color-primary-200, #e3bfff);
+}
+
+.btn-ghost-danger {
+  background: transparent;
+  color: var(--ohana-color-greyscale-700, #2c2c2c);
+  border: 1px solid var(--ohana-color-greyscale-200, #b4b4b4);
+}
+
+.btn-ghost-danger:disabled,
+.btn-secondary:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.back-link {
+  align-self: flex-start;
+  background: none;
+  color: var(--ohana-color-primary-600, #752fd5);
+  padding: 4px 0;
+  font-size: 14px;
+}
+
+.back-link:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ---- Badges / pills ---------------------------------------------------------------------- */
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 10px;
+  border-radius: var(--ohana-radius-pill, 100px);
+  background: var(--ohana-color-greyscale-100, #d2d2d2);
+  color: var(--ohana-color-greyscale-700, #2c2c2c);
+  font-size: var(--ohana-size-label, 12px);
+  font-weight: var(--ohana-weight-semibold, 600);
+  white-space: nowrap;
+}
+
+.badge-status {
+  background: var(--ohana-color-primary-50, #f9f0ff);
+  color: var(--ohana-color-primary-700, #561eaf);
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 10px;
+  border-radius: var(--ohana-radius-pill, 100px);
+  font-size: var(--ohana-size-label, 12px);
+  font-weight: var(--ohana-weight-semibold, 600);
+}
+
+.pill-muted {
+  background: var(--ohana-color-greyscale-100, #d2d2d2);
+  color: var(--ohana-color-greyscale-500, #5e5e5e);
+}
+
+/* ---- Toast (spec 04 §3 B.1/B.3 success + error feedback) ---------------------------------
+   DEC-OHANA-01 §U2 only froze ONE toast color (`--ohana-toast-bg`) — the source Figma
+   component has no separate error variant either, so success/error are distinguished by
+   icon-free copy + a left accent bar (greyscale for error, the frozen toast purple for
+   success), not by inventing a new hex. */
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  width: calc(100% - 40px);
+  max-width: 390px;
+  min-height: var(--ohana-toast-height, 80px);
+  padding: 0 var(--ohana-toast-padding, 30px);
+  border-radius: var(--ohana-radius-toast-top, 20px);
+  background: var(--ohana-toast-bg, #43038f);
+  color: #fff;
+  font-weight: var(--ohana-weight-semibold, 600);
+  font-size: var(--ohana-size-button, 16px);
+  display: flex;
+  align-items: center;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+  z-index: 10;
+}
+
+.toast-error {
+  border-left: 4px solid var(--ohana-color-greyscale-50, #f2f2f2);
+}
+
+/* ---- Admin wiki ingest form (spec 04 Phase P2, AdminWikiIngest.tsx) ----------------------- */
+
+/* Hàng lối-vào-phụ ở góc trên phải (G2 gộp link Chat vào cạnh link admin). Trước đó
+   `.admin-entry-link` tự định vị absolute; giờ hàng chứa định vị, link chỉ lo kiểu chữ —
+   thêm lối vào thứ ba sau này không phải canh toạ độ lại. */
+.shell-chrome {
+  position: absolute;
+  top: 12px;
+  right: 16px;
+  z-index: 5;
+  display: flex;
+  gap: 4px;
+}
+
+.chrome-link {
+  background: none;
+  border: none;
+  padding: 4px 8px;
+  font-size: 12px;
+  font-weight: var(--ohana-weight-semibold, 600);
+  color: var(--ohana-color-greyscale-400, #797979);
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.admin-form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.admin-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 14px;
+  font-weight: var(--ohana-weight-semibold, 600);
+  color: var(--ohana-color-greyscale-700, #2c2c2c);
+}
+
+.admin-textarea,
+.admin-input {
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: var(--ohana-weight-regular, 400);
+  padding: 10px 12px;
+  border-radius: var(--ohana-radius-card, 16px);
+  border: 1px solid var(--ohana-color-greyscale-200, #b4b4b4);
+  background: #fff;
+  color: var(--ohana-color-greyscale-800, #151515);
+  resize: vertical;
+}
+
+.admin-textarea:focus,
+.admin-input:focus {
+  outline: 2px solid var(--ohana-color-primary-300, #cd97ff);
+  outline-offset: 1px;
+}
+
+.admin-field-hint {
+  font-size: 12px;
+  font-weight: var(--ohana-weight-regular, 400);
+  color: var(--ohana-color-greyscale-500, #5e5e5e);
+}
+
+/* ---- Misc ---------------------------------------------------------------------------------- */
+
+.spin {
+  animation: ohana-spin 0.8s linear infinite;
+}
+
+@keyframes ohana-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
