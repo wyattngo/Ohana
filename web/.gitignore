@@ -18,6 +18,10 @@ node_modules
 !src/lib/
 dist-ssr
 web.zip
+
+# Playwright artifacts
+test-results/
+playwright-report/
 *.local
 
 # Editor directories and files

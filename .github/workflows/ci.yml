@@ -15,6 +15,43 @@ on:
   pull_request:
 
 jobs:
+  # FE gate (web/) — build từ source + oxlint + Playwright render tests (web/e2e/, mock
+  # /api/** bằng page.route nên không cần Postgres/FastAPI). Job riêng khỏi `test`: fail
+  # độc lập, không chặn nhau. Lưu ý: `web/dist` vẫn đang commit (deviation P0 ghi trong
+  # web/.gitignore) — job này build lại từ source nên bundle hỏng vẫn làm đỏ CI; follow-up
+  # là re-ignore + xoá dist committed khi job này chứng minh ổn định.
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # pnpm 10 đọc lockfileVersion 9.0 và chạy được Node 20+; máy dev đang Node 20
+          # (corepack kéo pnpm 11 sẽ vỡ — cần Node 22). CI pin cả hai cho khớp lockfile.
+          node-version: 22
+
+      - name: Install pnpm
+        run: npm install -g pnpm@10
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Build (tsc -b + vite build)
+        run: pnpm build
+
+      - name: Oxlint
+        run: pnpm exec oxlint src e2e playwright.config.ts
+
+      - name: Playwright browsers
+        run: pnpm exec playwright install chromium --with-deps
+
+      - name: Playwright render tests
+        run: pnpm exec playwright test
+
   test:
     runs-on: ubuntu-latest
     services:

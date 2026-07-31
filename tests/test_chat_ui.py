@@ -2,11 +2,11 @@
 
 Viết TRƯỚC `web/src/screens/Chat.tsx` — kỳ vọng RED.
 
-Repo này không có Playwright, nên không test được render thật. Điều test được — và là thứ
-thật sự hay hỏng — là **hợp đồng giữa hai bên**: `ChatOut` (pydantic, `api/chat.py`) và
-interface TypeScript mà `api.ts` bind vào. Hai file, hai ngôn ngữ, không compiler nào bắc
-cầu giữa chúng; đổi tên một field ở backend thì frontend im lặng nhận `undefined` và render
-ra chuỗi rỗng. Test này bắc cầu đó.
+Render thật giờ có Playwright cover (`web/e2e/`, chạy `pnpm test:e2e` trong `web/`) — file
+này giữ đúng vai còn lại, và là thứ thật sự hay hỏng: **hợp đồng giữa hai bên**: `ChatOut`
+(pydantic, `api/chat.py`) và interface TypeScript mà `api.ts` bind vào. Hai file, hai ngôn
+ngữ, không compiler nào bắc cầu giữa chúng; đổi tên một field ở backend thì frontend im
+lặng nhận `undefined` và render ra chuỗi rỗng. Test này bắc cầu đó.
 
 Hai yêu cầu còn lại đến từ phát hiện thật ở G1, không phải từ giấy:
 
