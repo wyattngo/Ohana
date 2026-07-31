@@ -117,6 +117,56 @@ def test_typescript_interface_matches_the_python_response_model() -> None:
     assert not extra, f"interface TS khai field backend KHÔNG trả về: {sorted(extra)}"
 
 
+def test_inbox_interface_matches_the_python_response_model() -> None:
+    """Mirror của gate ChatOut phía trên cho `PendingReplyOut` — thêm SAU khi lớp lỗi này
+    xảy ra thật: A8 thêm `escalation_reasons` vào backend mà TS không khai, build vẫn xanh
+    (JSON dư field bị TS bỏ qua), nhưng draft ESCALATE render y hệt draft FAQ — đúng kịch
+    bản `db/repos.py` cảnh báo. Introspect model, không chép tay danh sách field.
+    """
+    from api.inbox import PendingReplyOut
+
+    expected = set(PendingReplyOut.model_fields)
+    assert expected, "PendingReplyOut không có field nào — introspection hỏng, test vô nghĩa"
+
+    src = _read(_API_TS)
+    m = re.search(r"interface\s+PendingReplyOut\s*\{(.*?)\n\}", src, re.S)
+    assert m, "api.ts thiếu `interface PendingReplyOut`"
+    declared = set(re.findall(r"^\s*(\w+)\s*[?]?:", _strip_comments(m.group(1)), re.M))
+
+    missing = expected - declared
+    assert not missing, f"interface TS thiếu field backend trả về: {sorted(missing)}"
+    extra = declared - expected
+    assert not extra, f"interface TS khai field backend KHÔNG trả về: {sorted(extra)}"
+
+
+def test_inbox_and_review_render_escalation_chips() -> None:
+    """A8 end-to-end: cả hai màn seller nhìn thấy draft đều phải đọc `escalation_reasons`
+    qua `escalationMeta` (nhãn VN tập trung ở intent.ts, không hardcode trong screen).
+    Thiếu một màn là seller mở đúng màn đó và mất tín hiệu escalate.
+    """
+    for screen in ("Inbox.tsx", "ReviewCard.tsx"):
+        src = _strip_comments(_read(_WEB / "screens" / screen))
+        assert "escalation_reasons" in src, f"{screen} không đọc escalation_reasons"
+        assert "escalationMeta(" in src, f"{screen} không dịch reason qua escalationMeta"
+
+
+def test_escalation_labels_cover_every_severity_rank_value() -> None:
+    """`ESCALATION_META` phải phủ ĐỦ SEVERITY_RANK — thiếu key nào thì reason đó render
+    bằng key thô tiếng Anh (fallback cố ý, nhưng chỉ dành cho drift chưa kịp vá, không
+    phải trạng thái bình thường). Introspect từ policy_gate, cùng nguồn với CHECK của DB.
+    """
+    from agent.policy_gate import SEVERITY_RANK
+
+    src = _strip_comments(_read(_WEB / "lib" / "intent.ts"))
+    m = re.search(r"ESCALATION_META[^=]*=\s*\{(.*?)\n\};", src, re.S)
+    assert m, "intent.ts thiếu ESCALATION_META"
+    declared = set(re.findall(r"^\s*(\w+)\s*:\s*\{", m.group(1), re.M))
+    missing = set(SEVERITY_RANK) - declared
+    assert not missing, f"ESCALATION_META thiếu nhãn cho: {sorted(missing)}"
+    extra = declared - set(SEVERITY_RANK)
+    assert not extra, f"ESCALATION_META có key ngoài SEVERITY_RANK: {sorted(extra)}"
+
+
 def test_chat_screen_shows_a_persistent_not_grounded_disclaimer() -> None:
     """Disclaimer hiện thường trực, KHÔNG nấp trong tooltip/title/aria.
 

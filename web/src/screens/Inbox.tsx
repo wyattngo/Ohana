@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { ChevronRight, Inbox as InboxIcon, Loader2, TriangleAlert, UserRound } from "lucide-react";
 import { ApiError, fetchInbox, type PendingReplyOut } from "../lib/api";
-import { intentMeta, statusMeta } from "../lib/intent";
+import { escalationMeta, intentMeta, statusMeta } from "../lib/intent";
 import "./Inbox.css";
 
 /**
@@ -102,6 +102,19 @@ export function InboxScreen({ onOpenReply, onError }: InboxScreenProps) {
                       </span>
                     </div>
                     <p className="reply-row-preview">{row.draft_text}</p>
+                    {row.escalation_reasons.length > 0 && (
+                      <div className="escalation-chips">
+                        {row.escalation_reasons.map((reason) => {
+                          const { label, Icon } = escalationMeta(reason);
+                          return (
+                            <span key={reason} className="badge badge-escalation">
+                              <Icon size={12} aria-hidden="true" />
+                              {label}
+                            </span>
+                          );
+                        })}
+                      </div>
+                    )}
                     <div className="reply-row-bottom">
                       <div
                         className="confidence-bar"

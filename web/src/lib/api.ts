@@ -19,6 +19,13 @@ export interface PendingReplyOut {
   intent: string;
   confidence: number;
   status: string;
+  /**
+   * A8: output of `policy_gate` — why this draft needs the seller's attention. Already
+   * severity-sorted server-side (SEVERITY_RANK); render in received order. Empty = draft
+   * thường. Gated the same way as ChatResult:
+   * `tests/test_chat_ui.py::test_inbox_interface_matches_the_python_response_model`.
+   */
+  escalation_reasons: string[];
 }
 
 export interface MockAuthorizeResult {

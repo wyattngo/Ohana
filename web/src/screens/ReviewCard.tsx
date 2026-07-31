@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Check, ChevronLeft, Loader2, X } from "lucide-react";
 import { ApiError, approveReply, rejectReply, type PendingReplyOut } from "../lib/api";
-import { intentMeta, statusMeta } from "../lib/intent";
+import { escalationMeta, intentMeta, statusMeta } from "../lib/intent";
 import "./ReviewCard.css";
 
 /**
@@ -82,6 +82,20 @@ export function ReviewCard({ reply, onBack, onDecided, onError }: ReviewCardProp
         <span>Độ tin cậy {confidencePct}%</span>
         <span className="badge badge-status">{statusLabel}</span>
       </div>
+
+      {reply.escalation_reasons.length > 0 && (
+        <div className="escalation-chips">
+          {reply.escalation_reasons.map((reason) => {
+            const { label, Icon } = escalationMeta(reason);
+            return (
+              <span key={reason} className="badge badge-escalation">
+                <Icon size={12} aria-hidden="true" />
+                {label}
+              </span>
+            );
+          })}
+        </div>
+      )}
 
       <p className="review-card-draft">{reply.draft_text}</p>
 

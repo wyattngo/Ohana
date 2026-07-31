@@ -127,6 +127,20 @@
   color: var(--ohana-color-primary-700, #561eaf);
 }
 
+/* A8 escalation chips — the frozen token set has no danger hue (see intent.ts), so the
+   distinction from the neutral intent badge is outline + TriangleAlert, tokens only. */
+.badge-escalation {
+  background: transparent;
+  border: 1px solid var(--ohana-color-greyscale-700, #2c2c2c);
+}
+
+.escalation-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+
 .pill {
   display: inline-flex;
   align-items: center;
