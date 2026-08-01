@@ -2,8 +2,8 @@
 doc: adr-tang2-ohana-ai-assistant
 status: accepted
 date: 2026-07-31
-decides: [D1, D2, D3, D4, D5, D6]
-open: [D7]
+decides: [D1, D2, D3, D4, D5, D6, D7]
+open: []
 ratified_by: Wyatt
 contract: tang2-ohana-ai-assistant-system-design.md
 track: pivot-buoc2-tang2.md
@@ -11,6 +11,7 @@ relates: ohana-be-design.md  # Tầng 3 — bất biến I1/I2/I14 áp cho Tần
 read_before:
   - any migration tạo schema `assistant`
   - any change under agent/, api/ luồng A cho Tầng 2
+  - any change under auth/ liên quan role `user` / tier claim
 ---
 
 # ADR — Tầng 2 · Ohana AI Assistant
@@ -33,16 +34,24 @@ Super-app 3 tầng: Tầng 1 (mạng xã hội — identity/billing/feed/video, 
 
 **D6 · Billing — ủy thác nền tảng, Tầng 2 giữ GATE.** Tầng 2 sở hữu tier-gate (free/pro → rate + feature), không sở hữu payment. Nâng gói gọi hook `upgrade(user_id)` về nền tảng (mẫu DrNick→ONFA). Hệ quả: không tự-freemium-billed tới khi có billing provider; nhưng GATE chạy ngay bằng `tier` claim.
 
-## §2 · Quyết định PHÁT SINH cần chốt (D7 — audit tìm ra)
+## §2 · Quyết định PHÁT SINH — D7 (ratified 2026-08-01)
 
-**D7 · Identity issuer — ai phát JWT cho user Tầng 2?** Audit `ohana-be-design.md` phát hiện Ohana đã có auth riêng (`ohana tự phát · JWT 15m + refresh xoay vòng 30d`) — hiện chỉ mint `seller`/`admin`. Điều này đổi framing "Tầng 2 cưỡi ONFA identity" ở pivot: Ohana có thể tự là identity provider cho user Tầng 2.
+**D7 · Identity issuer — Ohana tự phát (a).** Ohana mint JWT cho user Tầng 2 bằng cách mở rộng auth sẵn có (`auth/identity.py` HS256). Ohana = identity provider cho cả Tầng 3 (seller/admin) và Tầng 2 (user).
 
-Hai lựa chọn:
+Ratified (Wyatt 2026-08-01) — hai lý do:
+- Đơn giản: không couple ONFA identity, không chờ ONFA JWT verifier có sẵn.
+- Ohana đã có infra JWT chạy production Tầng 3 (S1). Thêm role `user` + claim `tier` là increment, không phải greenfield.
 
-- **(a) Ohana tự phát** — mở rộng auth sẵn có: mint role `user` + claim `tier`. Ohana = identity provider. **Đề xuất** — đơn giản, không couple ONFA cho identity; chỉ billing/tier-source mới delegated (D6).
-- **(b) ONFA JWT** — delegate cả identity cho ONFA (như DrNick).
+**Hệ quả cho Phase 2.4:**
 
-D7 không chặn Phase 2.1 (schema dùng `user_id` bất kể ai phát JWT). Cần chốt trước Phase 2.4 (chat router + tier gate). De-risk phụ: nếu chọn (a), Tầng 2 gần như hết phụ thuộc ngoài cho dev — Ohana là identity, billing delegated, không chờ Tầng 1 lẫn ONFA identity.
+- **Token shape mới cho user Tầng 2**: `{sub: user_id, role: "user", tier: "free"|"pro"}` — **KHÔNG** có `shop_id` (Tầng 2 per-user, không có shop concept). Tách hoàn toàn khỏi seller token (`{sub, shop_id, role: seller|admin}`).
+- **`UserIdentity(user_id: str, tier: str)`** dataclass tách khỏi `Identity` (Tầng 3): hai concept khác nhau — user (person) vs seller (shop role). Trộn = drift.
+- **`verify_user_token`** riêng, KHÔNG chia SQL WHERE với `verify_token`. Same secret + same allowed algo, khác payload validator (`role == "user"`, `tier ∈ {free, pro}`).
+- **`user_identity_from_cookie`** dependency mới; cùng cookie `ohana_session` để browser SPA share một transport, nhưng route Tầng 2 chỉ chấp nhận token role `user`.
+- **Tier gate** đọc `tier` từ `UserIdentity`, tra bảng limit static (`free`/`pro` → qpm + daily token cap), gọi `assistant_rate_limit.try_acquire` + kiểm `assistant_cost.get_daily_tokens` trước LLM call.
+- **Billing delegated (D6)** giữ nguyên: nâng `tier` = hook `upgrade(user_id)` về nền tảng (P2.5 hoặc sau); Phase 2.4 chỉ đọc `tier` claim, không cấp phát.
+
+**Không chọn (b) — ONFA JWT:** ONFA hiện chưa có JWT surface user-facing; nếu chọn (b), Tầng 2 phải chờ Tầng 1 hoặc ONFA identity refactor. D7 không phải quyết định-không-quay-lại: nếu về sau ONFA cần SSO chung, port sang RS256 + JWKS + mint delegated là 1-2 phase riêng, không rewrite luồng A.
 
 ## §3 · Hệ quả kiến trúc (tổng)
 
@@ -59,4 +68,4 @@ D7 không chặn Phase 2.1 (schema dùng `user_id` bất kể ai phát JWT). C�
 
 ## §5 · Phase (JIT — tạo issue khi tới, không BDUF)
 
-2.0 ADR + track (doc này) · 2.1 schema + isolation gate (brief sẵn) · 2.2 cost/rate-limit/Redis · 2.3 memory · 2.4 chat/routers + tier gate (cần D7) · 2.5 generalize domain.
+2.0 ADR + track (doc này) · 2.1 schema + isolation gate — **DONE PR #6** · 2.2 cost/rate-limit/Redis — **DONE PR #9** · 2.3 memory (save + recall) — **DONE PR #10** · 2.4 chat/routers + tier gate (D7 ratified) · 2.5 generalize domain.
