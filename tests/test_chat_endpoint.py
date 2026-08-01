@@ -246,7 +246,7 @@ def test_observability_fields_are_logged(chat_client, caplog) -> None:
 def test_cached_tokens_is_logged_from_provider_usage(chat_client, caplog) -> None:
     """`token_cached` phải lấy từ usage của provider, KHÔNG hardcode 0.
 
-    `cached_tokens` được `_extract_cache_hit_tokens` trích sẵn từ lúc port DrNick nhưng chưa
+    `cached_tokens` được `_extract_cache_hit_tokens` trích sẵn từ lúc port ban đầu nhưng chưa
     ai đọc. Log nó để có SỐ LIỆU trả lời "Together có tự cache prompt không / tỷ lệ bao nhiêu"
     trước khi bàn xây cache — thay vì đoán.
 

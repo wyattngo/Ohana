@@ -120,9 +120,9 @@ class OpenAIClient(LLMClient):
         )
         self._default_model = default_model or settings.openai_model
         # ISSUE-010 (spec 07 G0): the 429 counter used to be a module-level import of
-        # `app.alert_service`, a module never ported from drnickv4 — so that one dead import
-        # made this ENTIRE module unimportable, which is why Together (OpenAI-compatible,
-        # otherwise a free ride on this class) was blocked.
+        # `app.alert_service`, a module that never landed — so that one dead import made this
+        # ENTIRE module unimportable, which is why Together (OpenAI-compatible, otherwise a
+        # free ride on this class) was blocked.
         # Telemetry is now injected: absent hook → no counter, same exception. ISSUE-010 stays
         # OPEN for real alerting; G0 only removed the coupling, it did not port the service.
         self._on_rate_limit = on_rate_limit

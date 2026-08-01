@@ -1,7 +1,7 @@
 """Outbound Ohana platform bridge — async REST client for `{base_url}/{method}` endpoints.
 
 Transport only — no typed per-endpoint methods (those live in `tools/ohana_read.py`), no
-retry, no cache (deferred). Ported shape-for-shape from drnickv4/bridge/onfa_client.py; the
+retry, no cache (deferred). Ported shape-for-shape from an earlier bridge implementation; the
 key deviations for Ohana are:
 
   1. R1.1 EXTENDED — a handler's identity is (`user_id`, `shop_id`), so `call()` takes BOTH

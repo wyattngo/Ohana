@@ -311,7 +311,7 @@ class OrderDraft(Base):
 class PendingReply(Base):
     """A drafted reply parked for seller review (spec 01 §3 Sub-task E).
 
-    Ported shape from drnickv4's `pending_action` with the financial pieces stripped
+    Ported shape from an earlier `pending_action` table with the financial pieces stripped
     (`requires_2fa`, `error_code` gone) and the ownership seam (S4) tightened: every
     read/write MUST include `WHERE shop_id = :scope`. A seller for shop A can never see —
     let alone approve — shop B's parked replies. The `PendingReplyRepo` in db/repos.py

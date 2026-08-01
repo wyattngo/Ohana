@@ -130,7 +130,7 @@ def build_router(
         # `token_cached` = prompt-cache hit do PROVIDER báo (`agent/providers/openai_client.py`
         # `_extract_cache_hit_tokens` đọc được 3 shape: OpenAI/Together
         # `prompt_tokens_details.cached_tokens`, DeepSeek `prompt_cache_hit_tokens`, và fallback).
-        # Đã được đo sẵn từ lúc port DrNick nhưng chưa ai ĐỌC.
+        # Đã có sẵn từ lúc port ban đầu nhưng chưa ai ĐỌC.
         #
         # Log nó để trả lời bằng SỐ LIỆU, không bằng suy đoán, hai câu hỏi trước khi bàn tới
         # việc xây cache: (a) Together có tự cache prompt không, (b) tỷ lệ `token_cached/token_in`

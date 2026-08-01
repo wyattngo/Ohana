@@ -1,6 +1,6 @@
 """Tool dataclass — the shape every agent tool must fit.
 
-Ported from drnickv4 with the R1.1 signature widened for multi-tenant: a handler receives
+Ported in with the R1.1 signature widened for multi-tenant: a handler receives
 `(user_id, shop_id, args)` — `user_id` AND `shop_id` are separate args the orchestrator
 supplies from a verified `auth.identity.Identity`; neither can appear in `parameters`, so
 the LLM cannot direct a tool at another user or another shop.

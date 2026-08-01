@@ -18,8 +18,8 @@ from pathlib import Path
 def test_storage_module_removed() -> None:
     # Bất biến thật: REPO NÀY không còn package `storage`. Không assert
     # ModuleNotFoundError tuyệt đối nữa — pyenv dùng chung có project khác cài
-    # editable (đo 2026-07-30: drnickv4 chiếm tên `storage` qua meta-path finder),
-    # nên "import được" không đồng nghĩa "repo này có". Kiểm theo nguồn gốc module.
+    # editable (đo 2026-07-30: một project khác chiếm tên `storage` qua meta-path
+    # finder), nên "import được" không đồng nghĩa "repo này có". Kiểm theo nguồn gốc module.
     try:
         mod = importlib.import_module("storage")
     except ModuleNotFoundError:

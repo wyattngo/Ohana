@@ -1,9 +1,9 @@
 """Settings foundation (spec `05-Task-OhanaAISeller-ConfigEmbedder-F1.md` §7 Phase P0).
 
 Exists so `agent/providers/openai_embedder.py` and `agent/providers/openai_client.py` — both
-ported from `drnickv4/` doing `from app.config import get_settings` — resolve. Before this
-module existed, `OpenAIEmbedder()` raised `ModuleNotFoundError` (ISSUE-016 root cause), which
-is why F1 wiki-RAG was never verified against a real embedder despite being tick DONE.
+ported in doing `from app.config import get_settings` — resolve. Before this module existed,
+`OpenAIEmbedder()` raised `ModuleNotFoundError` (ISSUE-016 root cause), which is why F1
+wiki-RAG was never verified against a real embedder despite being tick DONE.
 
 Scope is P0 only: the 4 fields the two providers reference. Wiring `OpenAIEmbedder` into the
 live `default_embedder()` factory (`api/admin.py`) is Phase P1, not here.

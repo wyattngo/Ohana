@@ -4,15 +4,15 @@ Bối cảnh. `agent/providers/openai_client.py` gọi một hook `on_rate_limit
 HTTP 429, rồi RE-RAISE `RateLimitError` nguyên vẹn (fire-and-forget). Hook mặc định là `None` ⇒
 hôm nay **429 không được đếm ở đâu cả**. Module này cung cấp một đích tiêm cho hook đó.
 
-Phạm vi CÓ CHỦ Ý hẹp. Bản `app/alert_service.py` bên `drnickv4` là module đa-spec (34/36/40):
-webhook sink + cooldown Redis + bộ đếm nhiều nguồn + poller lifespan, phụ thuộc `health_service`
-và `latency_service` — cả hai CHƯA port sang ohana, và Redis cũng CHƯA wire. Port nguyên = kéo
+Phạm vi CÓ CHỦ Ý hẹp. Bản `alert_service` gốc là module đa-spec (34/36/40): webhook sink +
+cooldown Redis + bộ đếm nhiều nguồn + poller lifespan, phụ thuộc `health_service` và
+`latency_service` — cả hai CHƯA port sang ohana, và Redis cũng CHƯA wire. Port nguyên = kéo
 theo ba spec chưa thuộc scope. Ở đây chỉ có ĐÚNG bộ đếm 429, đủ để đóng khoảng trống capability
 mà ISSUE-010 nêu, không hơn.
 
 MVP in-process. Bộ đếm nằm trong bộ nhớ tiến trình, KHÔNG Redis — trung thực cho MVP một tiến
 trình. Khi Redis được wire, thay ruột `record_provider_429`/`provider_429_count` bằng
-`INCRBY`+`EXPIRE` (đúng hình dạng drnick) mà KHÔNG đổi chữ ký — call-site không phải sửa lại.
+`INCRBY`+`EXPIRE` (đúng hình dạng cũ) mà KHÔNG đổi chữ ký — call-site không phải sửa lại.
 
 Fail-OPEN tuyệt đối. `record_provider_429` được gọi TỪ TRONG khối `except RateLimitError` của
 client; một exception thoát ra đây sẽ thay `RateLimitError` bằng lỗi khác và nuốt mất tín hiệu
