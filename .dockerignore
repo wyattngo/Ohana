@@ -1,0 +1,57 @@
+# Nhỏ context = build nhanh + không leak file khỏi host vào image.
+# Rule: cấm mọi thứ ngoài mã nguồn RUNTIME + config. Rồi allow-list ngược lại nếu cần.
+
+# VCS
+.git
+.gitignore
+.github
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.venv
+venv
+env
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.import_linter_cache
+*.egg-info
+build
+dist
+
+# Test + docs — không cần trong image runtime
+tests
+docs
+*.md
+!README.md
+
+# Dev env / secrets — TUYỆT ĐỐI không copy vào image
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+
+# Web build artifact (nginx image tự build lại từ source web/)
+web/node_modules
+web/dist
+web/test-results
+web/playwright-report
+web/.oxlintrc.json
+web/*.zip
+
+# Claude tooling
+.claude
+CLAUDE.md
+
+# Local scratch
+scratchpad
+tmp
+*.log

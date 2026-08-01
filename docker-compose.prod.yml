@@ -1,0 +1,231 @@
+# Production compose — single-host self-host.
+# Chạy song song `docker-compose.yml` (dev — chỉ infra):
+#
+#     docker compose -f docker-compose.prod.yml up -d
+#
+# 3 backend process (I1) + 1 nginx + infra (postgres/redis/langfuse). Migration +
+# bootstrap-roles tách sang profile để KHÔNG auto-run mỗi restart — chạy explicit:
+#
+#     docker compose -f docker-compose.prod.yml --profile bootstrap up ohana-bootstrap
+#     docker compose -f docker-compose.prod.yml --profile migrate  up ohana-migrate
+#
+# Env: `.env.prod` (KHÔNG commit). Sinh password HEX (base64 vỡ URL) — xem DEPLOY.md §2.
+
+name: ohana-prod
+
+# ── Networks ──────────────────────────────────────────────────────────────────
+# Đặt tên tường minh — mọi service ở trong. nginx tới ohana-ai:8001 / ohana-seller:8002
+# qua DNS resolver docker (service name = hostname).
+networks:
+  ohana-net:
+    driver: bridge
+
+# ── Volumes ───────────────────────────────────────────────────────────────────
+# pgdata persistent — MẤT = mất mọi thứ. Backup daily (DEPLOY.md §11).
+# redis KHÔNG persistent (D4 fail-open — mất counter = accept).
+volumes:
+  pgdata: {}
+  langfusedata: {}
+
+# ── Services ──────────────────────────────────────────────────────────────────
+services:
+
+  # ─── Infra ────────────────────────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ohana
+      POSTGRES_PASSWORD: ${POSTGRES_PW}
+      POSTGRES_DB: ohana
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [ohana-net]
+    # KHÔNG expose port ra host trong prod — chỉ ohana-net truy cập. Muốn psql từ host?
+    # `docker compose exec postgres psql -U ohana` hoặc mở tunnel SSH.
+    # ports: ["127.0.0.1:5432:5432"]   # bỏ comment CHỈ để debug
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ohana -d ohana"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # D4 fail-open + kỷ luật MVP: counter per-day mất khi restart là chấp nhận, cùng dáng
+    # với Redis chớp. `--save ""` tắt RDB; `allkeys-lru` bảo vệ memory nếu counter
+    # chưa expire kịp. KHÔNG persistent volume.
+    command: ["redis-server", "--save", "", "--maxmemory-policy", "allkeys-lru"]
+    networks: [ohana-net]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  langfuse-db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${LANGFUSE_DB_PW}
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfusedata:/var/lib/postgresql/data
+    networks: [ohana-net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d langfuse"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  langfuse:
+    # v2 khớp SDK langfuse==2.60.10 pin ở pyproject.toml. KHÔNG v3 (cần ClickHouse+
+    # Redis+MinIO thêm 3 service).
+    image: langfuse/langfuse:2
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://postgres:${LANGFUSE_DB_PW}@langfuse-db:5432/langfuse
+      NEXTAUTH_URL: ${LANGFUSE_PUBLIC_URL:-http://localhost:3000}
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET}
+      SALT: ${LANGFUSE_SALT}
+      TELEMETRY_ENABLED: "false"
+    ports:
+      # Chỉ bind localhost — Langfuse UI KHÔNG public. Reverse proxy khác (SSH tunnel
+      # hoặc VPN) nếu cần truy cập từ máy khác.
+      - "127.0.0.1:3000:3000"
+    networks: [ohana-net]
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+
+  # ─── One-shot: bootstrap roles (profile: bootstrap) ──────────────────────
+  # Chạy 1 LẦN/cluster mới. Idempotent (script check role exists). Cần SUPERUSER_DSN =
+  # role `ohana` (owner của DB). KHÔNG auto-run — mở profile explicit:
+  #   docker compose -f docker-compose.prod.yml --profile bootstrap up ohana-bootstrap
+  ohana-bootstrap:
+    profiles: [bootstrap]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      SUPERUSER_DSN: postgresql://ohana:${POSTGRES_PW}@postgres:5432/ohana
+      MIGRATOR_PW: ${MIGRATOR_PW}
+      SVC_A_PW: ${SVC_A_PW}
+      SVC_B_PW: ${SVC_B_PW}
+      MCP_RO_PW: ${MCP_RO_PW}
+      DB_HOST: postgres
+    command: ["python", "scripts/bootstrap_roles.py"]
+    networks: [ohana-net]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # ─── One-shot: migrate (profile: migrate) ────────────────────────────────
+  # Chạy explicit khi có revision mới:
+  #   docker compose -f docker-compose.prod.yml --profile migrate up ohana-migrate
+  # Exit 0 = OK. Exit != 0 = xem log, KHÔNG restart tự động.
+  ohana-migrate:
+    profiles: [migrate]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg://ohana_migrator:${MIGRATOR_PW}@postgres:5432/ohana
+      DB_HOST: postgres
+    command: ["alembic", "upgrade", "head"]
+    networks: [ohana-net]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # ─── Backend: 3 process (I1 giữ luồng A ⊥ B ở env-level bằng DATABASE_URL role) ─
+  ohana-ai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    # svc_ohana_ai — grant CHỈ schema `platform` (I2) + `assistant` (D2 Tầng 2).
+    # KHÔNG có quyền đọc `public.pending_reply`/`shops`/...
+    environment:
+      DATABASE_URL: postgresql+psycopg://svc_ohana_ai:${SVC_A_PW}@postgres:5432/ohana
+      DB_HOST: postgres
+      REDIS_URL: redis://redis:6379/0
+    env_file: [.env.prod]
+    # command giữ mặc định của Dockerfile (main_ohana_ai:8001)
+    networks: [ohana-net]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis:    {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  ohana-seller:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      # svc_seller — grant public+platform (đọc shop data + wiki), KHÔNG có quyền
+      # đọc `assistant` schema (I2 chiều ngược).
+      DATABASE_URL: postgresql+psycopg://svc_seller:${SVC_B_PW}@postgres:5432/ohana
+      DB_HOST: postgres
+    env_file: [.env.prod]
+    command: ["uvicorn", "app.main_seller:app", "--host", "0.0.0.0", "--port", "8002"]
+    networks: [ohana-net]
+    depends_on:
+      postgres: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8002/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  ohana-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      # Cùng role svc_seller — worker cần INSERT/UPDATE outbox + read pending_reply.
+      DATABASE_URL: postgresql+psycopg://svc_seller:${SVC_B_PW}@postgres:5432/ohana
+      DB_HOST: postgres
+    env_file: [.env.prod]
+    command: ["python", "-m", "app.worker_seller"]
+    networks: [ohana-net]
+    depends_on:
+      postgres: {condition: service_healthy}
+    # Không expose port — worker không nhận HTTP. Healthcheck = process alive (docker
+    # tự restart nếu exit).
+
+  # ─── Frontend + reverse proxy (1 nginx serve cả SPA + proxy) ─────────────
+  nginx:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # Cert mount từ host (Let's Encrypt chạy trên host, KHÔNG trong compose — renew
+      # bằng certbot host `certbot renew` cron, không rebuild container).
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      # ACME challenge webroot cho HTTP-01 renew
+      - /var/www/certbot:/var/www/certbot:ro
+    networks: [ohana-net]
+    depends_on:
+      ohana-ai:     {condition: service_healthy}
+      ohana-seller: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
