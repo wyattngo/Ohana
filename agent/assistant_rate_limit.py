@@ -43,6 +43,28 @@ def _key(user_id: str) -> str:
     return f"rl:user:{user_id}:qpm:{minute}"
 
 
+def _search_key(user_id: str) -> str:
+    """Key riêng cho search endpoint (R3 · ADR round2). Namespace `rl:search:` để không
+    đụng bucket chat (`rl:user:`) — user có thể search full-speed đồng thời chat, không
+    ăn quota chéo."""
+    minute = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M")
+    return f"rl:search:{user_id}:qpm:{minute}"
+
+
+@fail_open(default=True)
+async def try_acquire_search(redis: Redis, user_id: str, limit_qpm: int) -> bool:
+    """Search rate limit (R3). Bucket riêng khỏi chat — search cheap ở DB, nhưng dễ spam
+    (bot scraping / accidental infinite loop client). Cùng thuật fixed-window 60s, cùng
+    fail-open D4. Caller (endpoint) tra `tier` free/pro suy `limit_qpm` (đề xuất: free
+    30, pro 120)."""
+    key = _search_key(user_id)
+    pipe = redis.pipeline()
+    pipe.incr(key)
+    pipe.expire(key, _WINDOW_SECONDS)
+    results = await pipe.execute()
+    return int(results[0]) <= limit_qpm
+
+
 @fail_open(default=True)
 async def try_acquire(redis: Redis, user_id: str, limit_qpm: int) -> bool:
     """True nếu user còn quota trong phút hiện tại, False nếu vượt `limit_qpm`.

@@ -31,6 +31,7 @@ from agent.assistant_conversations import (
     ConversationRow,
     MessageRow,
 )
+from agent.assistant_feedback import AssistantFeedback
 from agent.assistant_memory import AssistantMemory, MemoryRow
 from agent.embedder import Embedder, default_embedder
 from auth.user_identity import UserIdentity, user_identity_from_cookie
@@ -71,6 +72,25 @@ class ConversationListOut(BaseModel):
     next_cursor: datetime | None
 
 
+class BulkDeleteIn(BaseModel):
+    """Body cho POST /conversations/bulk-delete (R2, ADR round2). Cap 100 id/request —
+    quá tay ⇒ 422 Pydantic (không 400 thủ công vì Pydantic đủ). Client vượt cap chia
+    batch, endpoint idempotent nên không rủi ro dup delete."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    ids: list[int] = Field(min_length=1, max_length=100)
+
+
+class BulkDeleteOut(BaseModel):
+    """Response `{deleted, skipped}`. `deleted` = id thực sự UPDATE (đổi trạng thái);
+    `skipped` = id không match (không tồn tại / cross-user / đã xoá trước). Không phân
+    biệt lý do skip — cùng bài 404 single-delete (không leak existence)."""
+
+    deleted: list[int]
+    skipped: list[int]
+
+
 class MemoryOut(BaseModel):
     memory_id: int
     content: str
@@ -80,6 +100,25 @@ class MemoryOut(BaseModel):
 class MemoryListOut(BaseModel):
     items: list[MemoryOut]
     next_cursor: datetime | None
+
+
+class FeedbackIn(BaseModel):
+    """Body cho POST /messages/{id}/feedback (R4). `rating` chỉ ±1 — thumbs up/down
+    binary, không có thang 5-sao (v1). `note` optional, max 2000 char (đủ 1 đoạn góp ý,
+    ngăn free-form dài quá). CHECK ở DB (a14) là belt-and-braces cho path bypass endpoint."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    rating: int = Field(description="±1 · thumbs up/down")
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class FeedbackOut(BaseModel):
+    """Response upsert feedback. `updated_at` echo cho client verify write; không trả
+    `rating` (client đã có), không trả `note` (redundant)."""
+
+    message_id: int
+    updated_at: datetime
 
 
 class MessageOut(BaseModel):
@@ -208,6 +247,23 @@ def build_router(
             raise HTTPException(status_code=404, detail="conversation_not_found")
         return _conversation_to_out(row)
 
+    @router.post(
+        "/conversations/bulk-delete",
+        response_model=BulkDeleteOut,
+    )
+    async def bulk_delete_conversations(
+        payload: BulkDeleteIn,
+        identity: UserIdentity = Depends(user_identity_from_cookie),
+    ) -> BulkDeleteOut:
+        """R2 · xoá nhiều hội thoại 1 request. Dedup input trước khi gọi repo (client
+        gửi trùng ⇒ 1 lần UPDATE, không lỡ đếm vào skipped)."""
+        unique_ids = list(dict.fromkeys(payload.ids))
+        repo = AssistantConversations(session_factory, user_scope=identity.user_id)
+        deleted = await repo.bulk_soft_delete(unique_ids)
+        deleted_set = set(deleted)
+        skipped = [i for i in unique_ids if i not in deleted_set]
+        return BulkDeleteOut(deleted=deleted, skipped=skipped)
+
     @router.delete(
         "/conversations/{conversation_id}",
         status_code=204,
@@ -254,6 +310,32 @@ def build_router(
             items=[_message_to_out(r) for r in rows],
             next_cursor=next_cursor,
         )
+
+    # ── Feedback (R4 · ADR round2) ───────────────────────────────────────────────
+
+    @router.post(
+        "/messages/{message_id}/feedback",
+        response_model=FeedbackOut,
+    )
+    async def upsert_message_feedback(
+        message_id: int,
+        payload: FeedbackIn,
+        identity: UserIdentity = Depends(user_identity_from_cookie),
+    ) -> FeedbackOut:
+        """Upsert thumbs up/down. 422 nếu rating không ∈ {-1, 1}. 404 nếu message không
+        tồn tại / cross-user / conversation đã xoá / role != 'assistant'. Không phân biệt
+        lý do 404 (cùng bài CRUD — không leak existence).
+
+        `note` KHÔNG cast lên Langfuse (I16 analog); telemetry log rating + trace_id
+        để aggregate ở tools observability.
+        """
+        if payload.rating not in (-1, 1):
+            raise HTTPException(status_code=422, detail="rating_must_be_plus_or_minus_one")
+        repo = AssistantFeedback(session_factory, user_scope=identity.user_id)
+        updated = await repo.upsert(message_id, payload.rating, payload.note)  # type: ignore[arg-type]
+        if updated is None:
+            raise HTTPException(status_code=404, detail="message_not_found")
+        return FeedbackOut(message_id=message_id, updated_at=updated)
 
     # ── Memories ─────────────────────────────────────────────────────────────────
 

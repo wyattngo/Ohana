@@ -271,6 +271,116 @@ def test_delete_conversation_404_cross_user(app: FastAPI, cleanup_db: None) -> N
     assert get_resp.status_code == 200
 
 
+# ── Bulk delete (R2 · ADR round2) ────────────────────────────────────────────────
+
+
+def test_bulk_delete_happy_mixed(app: FastAPI, cleanup_db: None) -> None:
+    """Bulk-delete 3 id: 2 sống + 1 đã xoá trước ⇒ deleted=[2 sống], skipped=[1 cũ]."""
+    with TestClient(app) as client:
+        client.cookies.set(SESSION_COOKIE_NAME, _mint(_USER_A))
+        c1 = client.post("/api/assistant/conversations", json={"title": "a"}).json()
+        c2 = client.post("/api/assistant/conversations", json={"title": "b"}).json()
+        c3 = client.post("/api/assistant/conversations", json={"title": "c"}).json()
+        # xoá c3 trước → nó sẽ thuộc skipped
+        client.delete(f"/api/assistant/conversations/{c3['conversation_id']}")
+
+        resp = client.post(
+            "/api/assistant/conversations/bulk-delete",
+            json={
+                "ids": [
+                    c1["conversation_id"],
+                    c2["conversation_id"],
+                    c3["conversation_id"],
+                ]
+            },
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert set(body["deleted"]) == {c1["conversation_id"], c2["conversation_id"]}
+    assert body["skipped"] == [c3["conversation_id"]]
+
+    # Sau bulk-delete, GET từng cái ⇒ 404 hết.
+    with TestClient(app) as client:
+        client.cookies.set(SESSION_COOKIE_NAME, _mint(_USER_A))
+        for cid in (c1["conversation_id"], c2["conversation_id"], c3["conversation_id"]):
+            assert client.get(f"/api/assistant/conversations/{cid}").status_code == 404
+
+
+def test_bulk_delete_cross_user_skipped_not_deleted(app: FastAPI, cleanup_db: None) -> None:
+    """User A bulk-delete id của Bob ⇒ vào skipped (không 403, không leak). Bob thấy nguyên."""
+    with TestClient(app) as client:
+        client.cookies.set(SESSION_COOKIE_NAME, _mint(_USER_B))
+        bob1 = client.post("/api/assistant/conversations", json={"title": "bob1"}).json()
+        bob2 = client.post("/api/assistant/conversations", json={"title": "bob2"}).json()
+
+        client.cookies.set(SESSION_COOKIE_NAME, _mint(_USER_A))
+        alice_own = client.post("/api/assistant/conversations", json={"title": "alice"}).json()
+        resp = client.post(
+            "/api/assistant/conversations/bulk-delete",
+            json={
+                "ids": [
+                    alice_own["conversation_id"],
+                    bob1["conversation_id"],
+                    bob2["conversation_id"],
+                ]
+            },
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["deleted"] == [alice_own["conversation_id"]]
+    assert set(body["skipped"]) == {bob1["conversation_id"], bob2["conversation_id"]}
+
+    # Bob vẫn thấy 2 hội thoại của mình.
+    with TestClient(app) as client:
+        client.cookies.set(SESSION_COOKIE_NAME, _mint(_USER_B))
+        for cid in (bob1["conversation_id"], bob2["conversation_id"]):
+            assert client.get(f"/api/assistant/conversations/{cid}").status_code == 200
+
+
+def test_bulk_delete_cap_101_rejected_422(app: FastAPI, cleanup_db: None) -> None:
+    """> 100 id ⇒ 422 Pydantic (max_length=100), KHÔNG chạm DB."""
+    with TestClient(app) as client:
+        client.cookies.set(SESSION_COOKIE_NAME, _mint(_USER_A))
+        resp = client.post(
+            "/api/assistant/conversations/bulk-delete",
+            json={"ids": list(range(1, 102))},
+        )
+    assert resp.status_code == 422
+
+
+def test_bulk_delete_empty_ids_422(app: FastAPI, cleanup_db: None) -> None:
+    """[] ⇒ 422 (min_length=1). Cost-cap khỏi phải xử case rỗng ở repo."""
+    with TestClient(app) as client:
+        client.cookies.set(SESSION_COOKIE_NAME, _mint(_USER_A))
+        resp = client.post(
+            "/api/assistant/conversations/bulk-delete",
+            json={"ids": []},
+        )
+    assert resp.status_code == 422
+
+
+def test_bulk_delete_duplicate_ids_deduped(app: FastAPI, cleanup_db: None) -> None:
+    """Gửi cùng id 3 lần ⇒ 1 lần trong `deleted`, KHÔNG vào skipped."""
+    with TestClient(app) as client:
+        client.cookies.set(SESSION_COOKIE_NAME, _mint(_USER_A))
+        c1 = client.post("/api/assistant/conversations", json={"title": "x"}).json()
+        cid = c1["conversation_id"]
+        resp = client.post(
+            "/api/assistant/conversations/bulk-delete",
+            json={"ids": [cid, cid, cid]},
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["deleted"] == [cid]
+    assert body["skipped"] == []
+
+
+def test_bulk_delete_401_missing_cookie(app: FastAPI) -> None:
+    with TestClient(app) as client:
+        resp = client.post("/api/assistant/conversations/bulk-delete", json={"ids": [1]})
+    assert resp.status_code == 401
+
+
 # ── Memories ────────────────────────────────────────────────────────────────────
 
 

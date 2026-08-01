@@ -180,6 +180,37 @@ class AssistantConversations:
             await session.commit()
         return (result.rowcount or 0) > 0
 
+    async def bulk_soft_delete(self, conversation_ids: list[int]) -> list[int]:
+        """Soft-delete nhiều hội thoại trong 1 câu UPDATE. Trả list id ĐÃ xoá thật.
+
+        `ids` empty ⇒ trả []. Không raise (endpoint validate cap 100 trước). Filter
+        `deleted_at IS NULL` để idempotent — id đã xoá trước không bump `deleted_at` lại
+        (giữ timestamp gốc). Cross-user id bị AND `user_id = user_scope` loại — ID đó
+        không xuất hiện trong RETURNING.
+
+        Endpoint trả `{deleted: <returning>, skipped: <input - returning>}` — client
+        biết id nào bị loại (không tồn tại / cross-user / đã xoá) mà KHÔNG phân biệt
+        được lý do cụ thể (I2 policy: không leak existence cross-user).
+        """
+        if not conversation_ids:
+            return []
+        from sqlalchemy import func
+
+        stmt = (
+            update(AssistantConversation)
+            .where(
+                AssistantConversation.conversation_id.in_(conversation_ids),
+                AssistantConversation.user_id == self._user_scope,
+                AssistantConversation.deleted_at.is_(None),
+            )
+            .values(deleted_at=func.now())
+            .returning(AssistantConversation.conversation_id)
+        )
+        async with self._sm() as session:
+            rows = (await session.execute(stmt)).all()
+            await session.commit()
+        return [int(r[0]) for r in rows]
+
     async def soft_delete(self, conversation_id: int) -> bool:
         """Set `deleted_at = now()`. Idempotent-ish: xoá lại ⇒ False (đã có deleted_at
         không NULL, WHERE `deleted_at IS NULL` không match). Client thấy 404 lần hai."""

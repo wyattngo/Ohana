@@ -32,19 +32,21 @@ from auth.user_identity import UserIdentity
 
 @dataclass(frozen=True)
 class TierLimit:
-    """Hạn mức của một tier. `qpm` = requests per minute (rate); `daily_tokens` = token
-    cap trong 1 ngày (cost)."""
+    """Hạn mức của một tier. `qpm` = requests per minute (rate) cho chat; `daily_tokens`
+    = token cap trong 1 ngày (cost); `search_qpm` = rate riêng cho search endpoint (R3 ·
+    ADR round2, bucket riêng khỏi chat để search không ăn quota chat)."""
 
     qpm: int
     daily_tokens: int
+    search_qpm: int
 
 
 # Whitelist ĐÓNG — value phải khớp `auth/user_identity.py::_ALLOWED_TIERS`. Thêm tier
 # mới: sửa cả hai chỗ CÙNG LÚC (verify pass + gate map). Một chỗ đổi tạo silent hole
 # (verify pass tier "team" nhưng gate không có key ⇒ `unknown_tier` deny).
 TIER_LIMITS: dict[str, TierLimit] = {
-    "free": TierLimit(qpm=10, daily_tokens=50_000),
-    "pro": TierLimit(qpm=60, daily_tokens=500_000),
+    "free": TierLimit(qpm=10, daily_tokens=50_000, search_qpm=30),
+    "pro": TierLimit(qpm=60, daily_tokens=500_000, search_qpm=120),
 }
 
 

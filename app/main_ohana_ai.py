@@ -30,6 +30,7 @@ from fastapi import FastAPI
 from agent.redis_client import make_redis_pool
 from api.assistant_chat import build_router as build_assistant_chat_router
 from api.assistant_crud import build_router as build_assistant_crud_router
+from api.assistant_search import build_router as build_assistant_search_router
 from api.chat import build_router as build_chat_router
 from api.mock_auth import build_router as build_mock_auth_router
 from app.config import get_settings
@@ -74,6 +75,9 @@ app.include_router(build_assistant_chat_router(_session_factory), prefix="/api")
 # Tầng 2 Phase 2.4c · CRUD conversations + memories. Cùng session_factory (svc_ohana_ai
 # role, D2 grant assistant schema). KHÔNG cần Redis (không tier gate — CRUD không đốt LLM).
 app.include_router(build_assistant_crud_router(_session_factory), prefix="/api")
+# R3 · GET /api/assistant/search — FTS trên messages + ILIKE title. Cần Redis
+# (rate-limit riêng namespace `search:`). Tách khỏi CRUD vì CRUD không cần Redis.
+app.include_router(build_assistant_search_router(_session_factory), prefix="/api")
 
 install_csrf(app)
 

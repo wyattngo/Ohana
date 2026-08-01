@@ -32,6 +32,7 @@ from sqlalchemy import (
     Index,
     Integer,
     Numeric,
+    SmallInteger,
     Text,
     UniqueConstraint,
     Uuid,
@@ -792,6 +793,44 @@ class AssistantMessage(Base):
     )
     content: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class AssistantMessageFeedback(Base):
+    """Feedback thumbs up/down cho `assistant.messages` (R4 · ADR round2).
+
+    Composite PK `(message_id, user_id)` — 1 user rate 1 message tối đa 1 lần. Upsert
+    ghi đè trong repo (`AssistantFeedback.upsert`). `rating` chỉ ±1, CHECK ở DB (a14
+    migration) — không dựa Pydantic vì repo có thể gọi thẳng.
+
+    FK `message_id → assistant.messages ON DELETE CASCADE` — xoá message ⇒ feedback theo,
+    không orphan.
+    """
+
+    __tablename__ = "message_feedback"
+    __table_args__ = (
+        CheckConstraint("rating IN (-1, 1)", name="ck_message_feedback_rating"),
+        Index(
+            "idx_assistant_feedback_user_created",
+            "user_id",
+            "created_at",
+        ),
+        {"schema": "assistant"},
+    )
+
+    message_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("assistant.messages.message_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    user_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    rating: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
