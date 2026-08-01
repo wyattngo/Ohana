@@ -212,7 +212,7 @@ source_modules = ["bridge", "channels", "api.webhook", "api.inbox",
                   "app.main_seller", "app.worker_seller",
                   "agent.drafter", "agent.orchestrator", "agent.policy_gate"]
 forbidden_modules = ["agent.assistant_cost", "agent.assistant_rate_limit",
-                     "agent.redis_client"]
+                     "agent.redis_client", "agent.assistant_conversations"]
 
 [build-system]
 requires = ["setuptools>=68"]

@@ -243,3 +243,108 @@ async def test_memory_hit_dataclass_shape(
     assert isinstance(hit.score, float)
     # `created_at` tzaware (server_default now() với timestamptz).
     assert hit.created_at.tzinfo is not None
+
+
+# =====================================================================================
+# Phase 2.4c · list_memories + delete_memory extension.
+# =====================================================================================
+
+
+@pytest.mark.asyncio
+async def test_list_memories_sorted_desc(
+    session_factory: async_sessionmaker, cleanup_memory: None
+) -> None:
+    """list_memories sắp xếp created_at DESC — memory mới nhất đứng đầu."""
+    import asyncio
+
+    memory = AssistantMemory(session_factory, FakeEmbedder(), user_scope="p23test-list")
+    await memory.save_text("first")
+    await asyncio.sleep(0.01)
+    await memory.save_text("second")
+    await asyncio.sleep(0.01)
+    await memory.save_text("third")
+    rows = await memory.list_memories(limit=10)
+    contents = [r.content for r in rows]
+    assert contents == ["third", "second", "first"]
+
+
+@pytest.mark.asyncio
+async def test_list_memories_user_scope_hard_filter(
+    session_factory: async_sessionmaker, cleanup_memory: None
+) -> None:
+    """User A list KHÔNG thấy memory user B (cùng discipline recall_text)."""
+    mem_a = AssistantMemory(session_factory, FakeEmbedder(), user_scope="p23test-scope-a")
+    mem_b = AssistantMemory(session_factory, FakeEmbedder(), user_scope="p23test-scope-b")
+    await mem_a.save_text("alice-only")
+    await mem_b.save_text("bob-only")
+    a_rows = await mem_a.list_memories(limit=10)
+    assert [r.content for r in a_rows] == ["alice-only"]
+
+
+@pytest.mark.asyncio
+async def test_list_memories_cursor_pagination(
+    session_factory: async_sessionmaker, cleanup_memory: None
+) -> None:
+    """Cursor pagination: page 1 (limit=2), page 2 dùng cursor = created_at last."""
+    import asyncio
+
+    memory = AssistantMemory(session_factory, FakeEmbedder(), user_scope="p23test-page")
+    for i in range(3):
+        await memory.save_text(f"m{i}")
+        await asyncio.sleep(0.01)
+    page1 = await memory.list_memories(limit=2)
+    assert len(page1) == 2
+    cursor = page1[-1].created_at
+    page2 = await memory.list_memories(limit=2, before_created_at=cursor)
+    assert len(page2) == 1
+
+
+@pytest.mark.asyncio
+async def test_delete_memory_hard_removes_row(
+    session_factory: async_sessionmaker, cleanup_memory: None
+) -> None:
+    """delete_memory HARD DELETE — sau delete list không thấy + recall không match."""
+    memory = AssistantMemory(session_factory, FakeEmbedder(), user_scope="p23test-del")
+    mid = await memory.save_text("forget me")
+    assert await memory.delete_memory(mid) is True
+    rows = await memory.list_memories(limit=10)
+    assert all(r.memory_id != mid for r in rows)
+    # Recall cũng không match (hard delete = biến mất khỏi HNSW).
+    hits = await memory.recall_text("forget me", k=5)
+    assert all(h.memory_id != mid for h in hits)
+
+
+@pytest.mark.asyncio
+async def test_delete_memory_returns_false_cross_user(
+    session_factory: async_sessionmaker, cleanup_memory: None
+) -> None:
+    """User A delete memory_id của user B ⇒ False + row Bob còn nguyên."""
+    mem_a = AssistantMemory(session_factory, FakeEmbedder(), user_scope="p23test-cross-a")
+    mem_b = AssistantMemory(session_factory, FakeEmbedder(), user_scope="p23test-cross-b")
+    b_mid = await mem_b.save_text("bob-secret")
+    assert await mem_a.delete_memory(b_mid) is False
+    # Bob list vẫn thấy.
+    b_rows = await mem_b.list_memories(limit=10)
+    assert any(r.memory_id == b_mid for r in b_rows)
+
+
+@pytest.mark.asyncio
+async def test_delete_memory_returns_false_for_missing_id(
+    session_factory: async_sessionmaker, cleanup_memory: None
+) -> None:
+    """memory_id không tồn tại ⇒ False."""
+    memory = AssistantMemory(session_factory, FakeEmbedder(), user_scope="p23test-miss")
+    assert await memory.delete_memory(999_999_999) is False
+
+
+@pytest.mark.asyncio
+async def test_list_memories_limit_clamped(
+    session_factory: async_sessionmaker, cleanup_memory: None
+) -> None:
+    """limit ngoài range ⇒ clamp [1, 100] cùng bài conversations."""
+    memory = AssistantMemory(session_factory, FakeEmbedder(), user_scope="p23test-clamp")
+    await memory.save_text("only")
+    rows = await memory.list_memories(limit=0)
+    assert len(rows) == 1
+    rows = await memory.list_memories(limit=999)
+    assert len(rows) == 1

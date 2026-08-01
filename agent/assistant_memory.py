@@ -23,12 +23,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any, cast
 
-from sqlalchemy import insert, select
+from sqlalchemy import delete, insert, select
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent.embedder import Embedder
 from db.models import AssistantUserMemory
+
+_LIST_LIMIT_MAX = 100
 
 
 @dataclass(frozen=True)
@@ -38,6 +42,17 @@ class MemoryHit:
     memory_id: int
     content: str
     score: float
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class MemoryRow:
+    """Một memory record (KHÔNG kèm `embedding` — vector 1024f nặng và không hữu ích cho
+    UI list; recall dùng path riêng qua HNSW). Tách kiểu ≠ `MemoryHit` (không có `score`)
+    để endpoint list không lỡ trả field distance vô nghĩa (không có query)."""
+
+    memory_id: int
+    content: str
     created_at: datetime
 
 
@@ -120,3 +135,41 @@ class AssistantMemory:
             )
             for r in rows
         ]
+
+    async def list_memories(
+        self,
+        limit: int,
+        before_created_at: datetime | None = None,
+    ) -> list[MemoryRow]:
+        """List memory per-user (không vector), sắp xếp `created_at DESC`. Cursor pagination
+        bằng `before_created_at` — cùng bài `AssistantConversations.list_recent` (append-only
+        memory nên page-drift ít, nhưng dùng cursor giữ contract nhất quán).
+
+        Bind index `idx_assistant_user_memory_user (user_id, created_at DESC)` — tránh full
+        table scan khi user có nhiều memory.
+        """
+        clamped = max(1, min(limit, _LIST_LIMIT_MAX))
+        stmt = select(
+            AssistantUserMemory.memory_id,
+            AssistantUserMemory.content,
+            AssistantUserMemory.created_at,
+        ).where(AssistantUserMemory.user_id == self._user_scope)
+        if before_created_at is not None:
+            stmt = stmt.where(AssistantUserMemory.created_at < before_created_at)
+        stmt = stmt.order_by(AssistantUserMemory.created_at.desc()).limit(clamped)
+        async with self._sm() as session:
+            rows = (await session.execute(stmt)).all()
+        return [MemoryRow(memory_id=int(r[0]), content=r[1], created_at=r[2]) for r in rows]
+
+    async def delete_memory(self, memory_id: int) -> bool:
+        """Hard DELETE (P2.4c ADR decision — không `forgotten_at`). Trả False khi 404 (id
+        không tồn tại HOẶC thuộc user khác). WHERE `user_id = user_scope` cưỡng chế —
+        cross-user rowcount=0 ⇒ False, endpoint 404 (không leak sự tồn tại)."""
+        stmt = delete(AssistantUserMemory).where(
+            AssistantUserMemory.memory_id == memory_id,
+            AssistantUserMemory.user_id == self._user_scope,
+        )
+        async with self._sm() as session:
+            result = cast("CursorResult[Any]", await session.execute(stmt))
+            await session.commit()
+        return (result.rowcount or 0) > 0

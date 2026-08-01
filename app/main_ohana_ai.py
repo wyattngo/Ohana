@@ -29,6 +29,7 @@ from fastapi import FastAPI
 
 from agent.redis_client import make_redis_pool
 from api.assistant_chat import build_router as build_assistant_chat_router
+from api.assistant_crud import build_router as build_assistant_crud_router
 from api.chat import build_router as build_chat_router
 from api.mock_auth import build_router as build_mock_auth_router
 from app.config import get_settings
@@ -70,6 +71,9 @@ app.include_router(build_chat_router(_identity_dep), prefix="/api")
 # (P2.3) + cost/rate primitives (P2.2). session_factory chia sẻ với chat router Tầng 3
 # (cùng svc_ohana_ai role; assistant schema có D2 grant riêng).
 app.include_router(build_assistant_chat_router(_session_factory), prefix="/api")
+# Tầng 2 Phase 2.4c · CRUD conversations + memories. Cùng session_factory (svc_ohana_ai
+# role, D2 grant assistant schema). KHÔNG cần Redis (không tier gate — CRUD không đốt LLM).
+app.include_router(build_assistant_crud_router(_session_factory), prefix="/api")
 
 install_csrf(app)
 
