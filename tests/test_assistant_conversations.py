@@ -269,3 +269,135 @@ async def test_debug_purge_hard_deletes_all(
     await _debug_purge_for_user(session_factory, "p24c-alice")
     rows = await repo.list_recent(limit=100)
     assert rows == []
+
+
+# =====================================================================================
+# Phase 2.4d · append_pair + list_messages (chat persistence).
+# =====================================================================================
+
+
+@pytest.mark.asyncio
+async def test_append_pair_returns_two_ids_in_order(
+    session_factory: async_sessionmaker, cleanup_conversations: None
+) -> None:
+    """append_pair trả (user_mid, assistant_mid) — user luôn ID nhỏ hơn (INSERT trước)."""
+    repo = AssistantConversations(session_factory, user_scope="p24c-alice")
+    conv = await repo.create(title="chat")
+    u_mid, a_mid = await repo.append_pair(
+        conv.conversation_id,
+        user_content="hello",
+        assistant_content="hi there",
+    )
+    assert u_mid > 0 and a_mid > 0
+    assert u_mid < a_mid  # user INSERT trước assistant trong cùng transaction
+
+
+@pytest.mark.asyncio
+async def test_append_pair_bumps_conversation_updated_at(
+    session_factory: async_sessionmaker, cleanup_conversations: None
+) -> None:
+    """append bump `conversations.updated_at` — item nhảy lên đầu list_recent."""
+    repo = AssistantConversations(session_factory, user_scope="p24c-alice")
+    conv = await repo.create(title="chat")
+    before = conv.updated_at
+    await asyncio.sleep(0.05)
+    await repo.append_pair(conv.conversation_id, user_content="q", assistant_content="a")
+    refetched = await repo.get(conv.conversation_id)
+    assert refetched is not None
+    assert refetched.updated_at > before
+
+
+@pytest.mark.asyncio
+async def test_append_pair_rejects_empty_content(
+    session_factory: async_sessionmaker, cleanup_conversations: None
+) -> None:
+    """Empty/whitespace user hoặc assistant ⇒ ValueError. Không lưu row rỗng vào history."""
+    repo = AssistantConversations(session_factory, user_scope="p24c-alice")
+    conv = await repo.create(title="chat")
+    with pytest.raises(ValueError, match="user_content must be non-empty"):
+        await repo.append_pair(conv.conversation_id, user_content="   ", assistant_content="a")
+    with pytest.raises(ValueError, match="assistant_content must be non-empty"):
+        await repo.append_pair(conv.conversation_id, user_content="q", assistant_content="")
+
+
+@pytest.mark.asyncio
+async def test_list_messages_ascending(
+    session_factory: async_sessionmaker, cleanup_conversations: None
+) -> None:
+    """list_messages ASC by created_at — role user rồi assistant, đọc từ đầu hội thoại."""
+    repo = AssistantConversations(session_factory, user_scope="p24c-alice")
+    conv = await repo.create(title="chat")
+    await repo.append_pair(conv.conversation_id, user_content="q1", assistant_content="a1")
+    await asyncio.sleep(0.01)
+    await repo.append_pair(conv.conversation_id, user_content="q2", assistant_content="a2")
+    rows = await repo.list_messages(conv.conversation_id, limit=10)
+    assert [(r.role, r.content) for r in rows] == [
+        ("user", "q1"),
+        ("assistant", "a1"),
+        ("user", "q2"),
+        ("assistant", "a2"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_messages_empty_for_new_conversation(
+    session_factory: async_sessionmaker, cleanup_conversations: None
+) -> None:
+    """Hội thoại chưa append_pair ⇒ list_messages = []."""
+    repo = AssistantConversations(session_factory, user_scope="p24c-alice")
+    conv = await repo.create(title="empty")
+    assert await repo.list_messages(conv.conversation_id, limit=10) == []
+
+
+@pytest.mark.asyncio
+async def test_list_messages_cursor_pagination(
+    session_factory: async_sessionmaker, cleanup_conversations: None
+) -> None:
+    """Page 1 (limit=2), page 2 với `before` = created_at của item cuối ⇒ trả cũ hơn."""
+    repo = AssistantConversations(session_factory, user_scope="p24c-alice")
+    conv = await repo.create(title="chat")
+    for i in range(3):
+        await repo.append_pair(
+            conv.conversation_id,
+            user_content=f"q{i}",
+            assistant_content=f"a{i}",
+        )
+        await asyncio.sleep(0.01)
+    # 6 messages total, limit=2 lấy 2 đầu tiên (ASC), before cursor trả về SỚM hơn cursor.
+    # Semantic ASC + before: "trước cursor" = cũ hơn. Page đầu không có `before` = từ đầu.
+    page1 = await repo.list_messages(conv.conversation_id, limit=2)
+    assert len(page1) == 2
+    assert page1[0].content == "q0"
+    assert page1[1].content == "a0"
+
+
+@pytest.mark.asyncio
+async def test_list_messages_user_scope_hard_filter(
+    session_factory: async_sessionmaker, cleanup_conversations: None
+) -> None:
+    """User A dùng repo scoped user A gọi list_messages với conversation_id của user B ⇒
+    trả [] (WHERE user_id = user_scope belt-and-braces, dù endpoint đã check ownership)."""
+    repo_a = AssistantConversations(session_factory, user_scope="p24c-alice")
+    repo_b = AssistantConversations(session_factory, user_scope="p24c-bob")
+    conv_b = await repo_b.create(title="bob")
+    await repo_b.append_pair(
+        conv_b.conversation_id, user_content="bob-q", assistant_content="bob-a"
+    )
+    # Alice repo query id của Bob — hard filter user_id=alice không match row user_id=bob.
+    assert await repo_a.list_messages(conv_b.conversation_id, limit=10) == []
+
+
+@pytest.mark.asyncio
+async def test_append_pair_persists_to_correct_conversation(
+    session_factory: async_sessionmaker, cleanup_conversations: None
+) -> None:
+    """2 conversations riêng ⇒ list_messages mỗi cái chỉ trả message của mình."""
+    repo = AssistantConversations(session_factory, user_scope="p24c-alice")
+    conv1 = await repo.create(title="chat-1")
+    conv2 = await repo.create(title="chat-2")
+    await repo.append_pair(conv1.conversation_id, user_content="in-1", assistant_content="reply-1")
+    await repo.append_pair(conv2.conversation_id, user_content="in-2", assistant_content="reply-2")
+    msgs1 = await repo.list_messages(conv1.conversation_id, limit=10)
+    msgs2 = await repo.list_messages(conv2.conversation_id, limit=10)
+    assert [m.content for m in msgs1] == ["in-1", "reply-1"]
+    assert [m.content for m in msgs2] == ["in-2", "reply-2"]

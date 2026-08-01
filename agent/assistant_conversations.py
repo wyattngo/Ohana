@@ -25,9 +25,12 @@ from sqlalchemy import delete, insert, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from db.models import AssistantConversation
+from db.models import AssistantConversation, AssistantMessage
 
 _LIST_LIMIT_MAX = 100
+# Messages endpoint list dùng cap cao hơn conversations (200 vs 100) — 1 hội thoại có
+# thể dài hàng trăm turn; UI thường load 50 rồi scroll ngược.
+_MESSAGES_LIMIT_MAX = 200
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,18 @@ class ConversationRow:
     title: str | None
     created_at: datetime
     updated_at: datetime
+
+
+@dataclass(frozen=True)
+class MessageRow:
+    """1 tin nhắn trong hội thoại. `role` ∈ {"user", "assistant", "system"} — ENUM
+    `assistant.msg_role` ở DB, không convert enum type ở Python (giữ str để endpoint
+    trả JSON không cần custom serializer)."""
+
+    message_id: int
+    role: str
+    content: str
+    created_at: datetime
 
 
 class AssistantConversations:
@@ -183,6 +198,119 @@ class AssistantConversations:
             result = cast("CursorResult[Any]", await session.execute(stmt))
             await session.commit()
         return (result.rowcount or 0) > 0
+
+    # ── Messages (P2.4d chat persistence) ───────────────────────────────────────
+
+    async def append_pair(
+        self,
+        conversation_id: int,
+        *,
+        user_content: str,
+        assistant_content: str,
+    ) -> tuple[int, int]:
+        """1 transaction: INSERT user + INSERT assistant + UPDATE conversations.updated_at.
+
+        Trả (user_message_id, assistant_message_id). Cross-user hoặc soft-deleted
+        conversation ⇒ endpoint layer PHẢI check `get()` trước — repo không recheck
+        (tin caller). FK CASCADE + `user_id NOT NULL` ở message row đảm bảo scope
+        integrity ở DB layer.
+
+        Fail giữa transaction ⇒ ROLLBACK toàn bộ: KHÔNG có case "user message không có
+        assistant reply" trong DB — history luôn consistent theo cặp.
+
+        Bump `updated_at` để hội thoại nhảy lên đầu list-recent — UX pattern "most
+        recently active first" (Slack/Messenger cùng bài). Không bump ở P2.4c CRUD
+        `list_recent` sort đúng logic này rồi.
+        """
+        if not user_content or not user_content.strip():
+            raise ValueError("user_content must be non-empty")
+        if not assistant_content or not assistant_content.strip():
+            raise ValueError("assistant_content must be non-empty")
+        from sqlalchemy import func
+
+        user_stmt = (
+            insert(AssistantMessage)
+            .values(
+                conversation_id=conversation_id,
+                user_id=self._user_scope,
+                role="user",
+                content=user_content,
+            )
+            .returning(AssistantMessage.message_id)
+        )
+        assistant_stmt = (
+            insert(AssistantMessage)
+            .values(
+                conversation_id=conversation_id,
+                user_id=self._user_scope,
+                role="assistant",
+                content=assistant_content,
+            )
+            .returning(AssistantMessage.message_id)
+        )
+        bump_stmt = (
+            update(AssistantConversation)
+            .where(
+                AssistantConversation.conversation_id == conversation_id,
+                AssistantConversation.user_id == self._user_scope,
+            )
+            .values(updated_at=func.now())
+        )
+        async with self._sm() as session:
+            user_mid = (await session.execute(user_stmt)).scalar_one()
+            assistant_mid = (await session.execute(assistant_stmt)).scalar_one()
+            await session.execute(bump_stmt)
+            await session.commit()
+        return int(user_mid), int(assistant_mid)
+
+    async def list_messages(
+        self,
+        conversation_id: int,
+        limit: int,
+        before_created_at: datetime | None = None,
+    ) -> list[MessageRow]:
+        """List message trong 1 hội thoại, ASC by created_at (đọc từ đầu hội thoại
+        khớp thứ tự thời gian — KHÁC list_recent conversations là DESC).
+
+        `limit` clamp [1, 200]. Cursor `before_created_at` — khi ASC thì cursor semantic
+        là "trước cursor này" theo thời gian. Trong context chat UI thường load full từ
+        đầu hoặc load thêm cũ hơn khi scroll lên, nên ASC hợp hơn DESC.
+
+        Ownership check ở endpoint layer (`get()` trước). Repo không recheck — nếu
+        caller không check, cross-user rowcount vẫn = 0 nhờ `user_id = user_scope`
+        redundant filter (belt-and-braces).
+        """
+        clamped = max(1, min(limit, _MESSAGES_LIMIT_MAX))
+        stmt = select(
+            AssistantMessage.message_id,
+            AssistantMessage.role,
+            AssistantMessage.content,
+            AssistantMessage.created_at,
+        ).where(
+            AssistantMessage.conversation_id == conversation_id,
+            AssistantMessage.user_id == self._user_scope,
+        )
+        if before_created_at is not None:
+            stmt = stmt.where(AssistantMessage.created_at < before_created_at)
+        # Tie-breaker `message_id`: 2 message trong cùng append_pair transaction có
+        # `created_at = now()` giống nhau (server default eval 1 lần cho cả tx trên
+        # nhiều Postgres config). Không tie-break ⇒ order undefined giữa user/assistant
+        # cùng cặp; chat UI hiển thị lộn ngược. `message_id` là IDENTITY monotonic ⇒
+        # đảm bảo user < assistant (INSERT trước) khi timestamp tie.
+        stmt = stmt.order_by(AssistantMessage.created_at, AssistantMessage.message_id).limit(
+            clamped
+        )
+        async with self._sm() as session:
+            rows = (await session.execute(stmt)).all()
+        return [
+            MessageRow(
+                message_id=int(r[0]),
+                role=r[1],
+                content=r[2],
+                created_at=r[3],
+            )
+            for r in rows
+        ]
 
 
 async def _debug_purge_for_user(

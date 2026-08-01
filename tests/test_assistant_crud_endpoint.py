@@ -339,3 +339,96 @@ def test_delete_memory_404_missing_id(app: FastAPI, cleanup_db: None) -> None:
         client.cookies.set(SESSION_COOKIE_NAME, _mint(_USER_A))
         resp = client.delete("/api/assistant/memories/999999999")
     assert resp.status_code == 404
+
+
+# =====================================================================================
+# Phase 2.4d · GET /conversations/{id}/messages
+# =====================================================================================
+
+
+async def _seed_conversation_with_messages(user_scope: str, pairs: list[tuple[str, str]]) -> int:
+    """Seed 1 conversation + N cặp (user, assistant) qua repo direct. Trả conv_id."""
+    from agent.assistant_conversations import AssistantConversations
+    from db.session import make_session_factory
+
+    sf = make_session_factory()
+    repo = AssistantConversations(sf, user_scope=user_scope)
+    conv = await repo.create(title="seeded")
+    for user_c, asst_c in pairs:
+        await repo.append_pair(conv.conversation_id, user_content=user_c, assistant_content=asst_c)
+    return conv.conversation_id
+
+
+def test_list_messages_401_no_cookie(app: FastAPI) -> None:
+    with TestClient(app) as client:
+        resp = client.get("/api/assistant/conversations/1/messages")
+    assert resp.status_code == 401
+
+
+def test_list_messages_404_missing_conversation(app: FastAPI, cleanup_db: None) -> None:
+    with TestClient(app) as client:
+        client.cookies.set(SESSION_COOKIE_NAME, _mint(_USER_A))
+        resp = client.get("/api/assistant/conversations/999999999/messages")
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "conversation_not_found"}
+
+
+def test_list_messages_404_cross_user(app: FastAPI, cleanup_db: None) -> None:
+    """User A gọi list messages với conv_id của user B ⇒ 404 (không leak existence)."""
+    import asyncio
+
+    bob_conv_id = asyncio.run(_seed_conversation_with_messages(_USER_B, [("bob-q", "bob-a")]))
+    with TestClient(app) as client:
+        client.cookies.set(SESSION_COOKIE_NAME, _mint(_USER_A))
+        resp = client.get(f"/api/assistant/conversations/{bob_conv_id}/messages")
+    assert resp.status_code == 404
+
+
+def test_list_messages_returns_ordered_asc(app: FastAPI, cleanup_db: None) -> None:
+    """Response items ASC by created_at — role user rồi assistant, đọc chronological."""
+    import asyncio
+
+    conv_id = asyncio.run(_seed_conversation_with_messages(_USER_A, [("q1", "a1"), ("q2", "a2")]))
+    with TestClient(app) as client:
+        client.cookies.set(SESSION_COOKIE_NAME, _mint(_USER_A))
+        resp = client.get(f"/api/assistant/conversations/{conv_id}/messages")
+    assert resp.status_code == 200
+    body = resp.json()
+    contents = [(m["role"], m["content"]) for m in body["items"]]
+    assert contents == [
+        ("user", "q1"),
+        ("assistant", "a1"),
+        ("user", "q2"),
+        ("assistant", "a2"),
+    ]
+    assert body["next_cursor"] is None  # ít hơn limit default 50
+
+
+def test_list_messages_empty_for_new_conversation(app: FastAPI, cleanup_db: None) -> None:
+    """Conversation tạo mà chưa có message ⇒ items=[]."""
+    import asyncio
+
+    conv_id = asyncio.run(_seed_conversation_with_messages(_USER_A, []))
+    with TestClient(app) as client:
+        client.cookies.set(SESSION_COOKIE_NAME, _mint(_USER_A))
+        resp = client.get(f"/api/assistant/conversations/{conv_id}/messages")
+    assert resp.status_code == 200
+    assert resp.json()["items"] == []
+    assert resp.json()["next_cursor"] is None
+
+
+def test_list_messages_pagination(app: FastAPI, cleanup_db: None) -> None:
+    """Page 1 limit=2 lấy 2 message đầu (u1, a1 — ASC). next_cursor non-None."""
+    import asyncio
+
+    conv_id = asyncio.run(
+        _seed_conversation_with_messages(_USER_A, [("q1", "a1"), ("q2", "a2"), ("q3", "a3")])
+    )
+    with TestClient(app) as client:
+        client.cookies.set(SESSION_COOKIE_NAME, _mint(_USER_A))
+        resp = client.get(f"/api/assistant/conversations/{conv_id}/messages?limit=2")
+    body = resp.json()
+    assert len(body["items"]) == 2
+    assert body["items"][0]["content"] == "q1"
+    assert body["items"][1]["content"] == "a1"
+    assert body["next_cursor"] is not None

@@ -26,7 +26,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from agent.assistant_conversations import AssistantConversations, ConversationRow
+from agent.assistant_conversations import (
+    AssistantConversations,
+    ConversationRow,
+    MessageRow,
+)
 from agent.assistant_memory import AssistantMemory, MemoryRow
 from agent.embedder import Embedder, default_embedder
 from auth.user_identity import UserIdentity, user_identity_from_cookie
@@ -78,6 +82,26 @@ class MemoryListOut(BaseModel):
     next_cursor: datetime | None
 
 
+class MessageOut(BaseModel):
+    """1 message trong hội thoại (P2.4d chat persistence). `role` ∈ {user, assistant,
+    system} — string thay vì Literal để tránh Pydantic reject nếu ENUM DB sau này mở
+    rộng (msg_role có `system` sẵn ở ENUM nhưng chat endpoint chưa dùng)."""
+
+    message_id: int
+    role: str
+    content: str
+    created_at: datetime
+
+
+class MessageListOut(BaseModel):
+    """List messages trong 1 hội thoại. `next_cursor` = `created_at` của item cuối
+    page — client truyền lại ở `before` để load thêm cũ hơn. ASC order (khớp reading
+    order), khác conversations list DESC (recent first)."""
+
+    items: list[MessageOut]
+    next_cursor: datetime | None
+
+
 def _conversation_to_out(row: ConversationRow) -> ConversationOut:
     return ConversationOut(
         conversation_id=row.conversation_id,
@@ -90,6 +114,15 @@ def _conversation_to_out(row: ConversationRow) -> ConversationOut:
 def _memory_to_out(row: MemoryRow) -> MemoryOut:
     return MemoryOut(
         memory_id=row.memory_id,
+        content=row.content,
+        created_at=row.created_at,
+    )
+
+
+def _message_to_out(row: MessageRow) -> MessageOut:
+    return MessageOut(
+        message_id=row.message_id,
+        role=row.role,
         content=row.content,
         created_at=row.created_at,
     )
@@ -189,6 +222,38 @@ def build_router(
         if not ok:
             raise HTTPException(status_code=404, detail="conversation_not_found")
         return Response(status_code=204)
+
+    @router.get(
+        "/conversations/{conversation_id}/messages",
+        response_model=MessageListOut,
+    )
+    async def list_conversation_messages(
+        conversation_id: int,
+        identity: Annotated[UserIdentity, Depends(user_identity_from_cookie)],
+        limit: Annotated[int, Query(ge=1, le=200)] = 50,
+        before: Annotated[datetime | None, Query()] = None,
+    ) -> MessageListOut:
+        """List messages trong 1 hội thoại (P2.4d chat persistence).
+
+        **Ownership check TRƯỚC list** (`get()` first). Cross-user hoặc soft-deleted
+        conversation ⇒ 404 `conversation_not_found` (không leak existence). Repo
+        `list_messages` cũng cover `user_id = user_scope` — belt-and-braces, nếu ai
+        skip check `get()` thì rowcount vẫn = 0.
+        """
+        repo = AssistantConversations(session_factory, user_scope=identity.user_id)
+        if await repo.get(conversation_id) is None:
+            raise HTTPException(status_code=404, detail="conversation_not_found")
+        rows = await repo.list_messages(conversation_id, limit=limit, before_created_at=before)
+        # ASC — next_cursor = created_at của item CUỐI page (mới nhất trong page).
+        # Client truyền lại ở `before` để load thêm cũ hơn — nhưng semantic ASC + before
+        # = trước cursor này về thời gian, tức trả về những cái CŨ hơn. Endpoint này
+        # UX pattern: "scroll up để load lịch sử cũ hơn" ngược với chat UI thông thường.
+        # Nếu muốn "scroll down load mới hơn" thì flip logic ở client (sort DESC UI).
+        next_cursor = rows[-1].created_at if len(rows) == limit else None
+        return MessageListOut(
+            items=[_message_to_out(r) for r in rows],
+            next_cursor=next_cursor,
+        )
 
     # ── Memories ─────────────────────────────────────────────────────────────────
 

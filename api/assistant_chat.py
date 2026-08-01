@@ -39,6 +39,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from agent.assistant_conversations import AssistantConversations
 from agent.assistant_cost import get_daily_tokens, record_tokens
 from agent.assistant_memory import AssistantMemory, MemoryHit
 from agent.assistant_tier import check_and_reserve
@@ -68,22 +69,33 @@ _SYSTEM_PROMPT = (
 )
 
 _MEMORY_RECALL_K = 5
+# Title auto-generate từ user_msg đầu tiên. 40 char đủ hiển thị 1 dòng UI list; dài
+# hơn UI phải truncate lại. Nếu message toàn whitespace ⇒ title=None ("Untitled").
+_AUTO_TITLE_MAX_CHARS = 40
 
 
 class AssistantChatIn(BaseModel):
     """Body request. `extra="ignore"` có chủ đích — cùng bài `/api/chat`: client gửi
     kèm field bất kỳ (vd. `user_id`) bị bỏ qua hoàn toàn, không đường nào ảnh hưởng.
-    `user_id` chỉ đến từ JWT verified — đọc từ body là lỗ scope kinh điển."""
+    `user_id` chỉ đến từ JWT verified — đọc từ body là lỗ scope kinh điển.
+
+    `conversation_id` optional (P2.4d chat persistence):
+    - None ⇒ auto-create conversation, response trả id mới (client save để turn kế).
+    - Non-None ⇒ append vào hội thoại đã có. Ownership check → 404 nếu cross-user.
+    """
 
     model_config = ConfigDict(extra="ignore")
 
     message: str = Field(min_length=1, max_length=4000)
+    conversation_id: int | None = None
 
 
 class AssistantChatOut(BaseModel):
     """Response. `grounded=false` là cờ tường minh (D5 · pure-LLM v1) — consumer phân
     biệt câu trả lời tự do vs có căn cứ, KHÔNG suy đoán theo endpoint. `tier` +
-    `daily_tokens_used` cho UI hiển thị quota."""
+    `daily_tokens_used` cho UI hiển thị quota. `conversation_id` (P2.4d) — client
+    luôn nhận về, kể cả khi request KHÔNG truyền (server auto-create). Turn kế UI
+    truyền lại id này để nối vào cùng hội thoại."""
 
     reply: str
     model: str
@@ -91,6 +103,7 @@ class AssistantChatOut(BaseModel):
     usage: dict[str, int] = Field(default_factory=dict)
     tier: str
     daily_tokens_used: int
+    conversation_id: int
 
 
 def get_redis_from_app_state(request: Request) -> Redis:
@@ -140,6 +153,23 @@ def build_router(
                     "daily_tokens_used": verdict.daily_tokens_used,
                 },
             )
+
+        # 1b. Resolve conversation_id (P2.4d chat persistence).
+        # - `conversation_id` non-None ⇒ ownership check qua `get()`; None ⇒ 404
+        #   `conversation_not_found` (cùng bài P2.4c — không leak existence cross-user).
+        # - None ⇒ auto-create với title = user_msg[:40].strip() (rỗng ⇒ None title).
+        # THỨ TỰ: sau tier gate (429 short-circuit trước khi chạm DB), TRƯỚC memory/LLM
+        # (để 404 conv không đốt token). Tạo mới đứng đây thay vì sau LLM để nếu LLM
+        # fail vẫn có conversation row (client retry cùng id) — cost là 1 row rỗng
+        # trên fail path.
+        conversations = AssistantConversations(session_factory, user_scope=identity.user_id)
+        if payload.conversation_id is not None:
+            conv = await conversations.get(payload.conversation_id)
+            if conv is None:
+                raise HTTPException(status_code=404, detail="conversation_not_found")
+        else:
+            auto_title = payload.message.strip()[:_AUTO_TITLE_MAX_CHARS].strip() or None
+            conv = await conversations.create(title=auto_title)
 
         # 2. Memory recall. Failure không chặn chat — chỉ log + tiếp với `hits=[]`.
         embedder = embedder_factory()
@@ -218,6 +248,17 @@ def build_router(
             )
             raise HTTPException(status_code=502, detail="llm_empty_response")
 
+        # 8. Persist cặp (user_msg, assistant_reply) vào assistant.messages (P2.4d).
+        # 1 transaction — crash giữa ⇒ ROLLBACK, không lỡ có "user message không có
+        # reply" trong DB. Đứng SAU empty-reply check để không persist bong bóng rỗng.
+        # Fail ⇒ propagate 500: data integrity > UX ở đây (khác memory recall/save
+        # log-only — messages là history chính, không phải augment feature).
+        await conversations.append_pair(
+            conv.conversation_id,
+            user_content=payload.message,
+            assistant_content=reply,
+        )
+
         # Refetch counter SAU record để `daily_tokens_used` echo phản ánh lượt này.
         # Fail-open: Redis chớp ⇒ 0, UI thấy 0 nhưng chat vẫn 200.
         updated_used = await get_daily_tokens(redis, identity.user_id)
@@ -229,6 +270,7 @@ def build_router(
             usage=usage,
             tier=identity.tier,
             daily_tokens_used=updated_used,
+            conversation_id=conv.conversation_id,
         )
 
     return router

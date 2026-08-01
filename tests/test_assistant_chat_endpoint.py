@@ -101,19 +101,27 @@ def real_redis() -> Iterator[fakeredis.aioredis.FakeRedis]:
 
 @pytest.fixture
 async def cleanup_memory() -> AsyncIterator[None]:
-    """Xoá memory test trước/sau — prefix `p24b-` để không chạm DB dùng chung."""
+    """Xoá memory + conversations + messages test trước/sau — prefix `p24b-` để không
+    chạm DB dùng chung. P2.4d: chat endpoint giờ auto-persist vào conversations +
+    messages nên fixture phải dọn cả hai."""
     from sqlalchemy import text
 
     from db.session import make_session_factory
 
     sf = make_session_factory()
-    async with sf() as s:
-        await s.execute(text("DELETE FROM assistant.user_memory WHERE user_id LIKE 'p24b-%'"))
-        await s.commit()
+
+    async def _purge() -> None:
+        async with sf() as s:
+            # Messages CASCADE khi conversations bị xoá (FK ON DELETE CASCADE) — nhưng
+            # xoá tường minh cho chắc + rẻ (không rely vào FK behavior khi debug).
+            await s.execute(text("DELETE FROM assistant.messages WHERE user_id LIKE 'p24b-%'"))
+            await s.execute(text("DELETE FROM assistant.conversations WHERE user_id LIKE 'p24b-%'"))
+            await s.execute(text("DELETE FROM assistant.user_memory WHERE user_id LIKE 'p24b-%'"))
+            await s.commit()
+
+    await _purge()
     yield
-    async with sf() as s:
-        await s.execute(text("DELETE FROM assistant.user_memory WHERE user_id LIKE 'p24b-%'"))
-        await s.commit()
+    await _purge()
 
 
 @pytest.fixture
@@ -392,3 +400,150 @@ def test_fail_open_when_redis_down(app_and_fakes, monkeypatch, cleanup_memory) -
     assert resp.status_code == 200
     body = resp.json()
     assert body["daily_tokens_used"] == 0
+
+
+# =====================================================================================
+# Phase 2.4d · chat persistence — auto-create conversation + append messages.
+# =====================================================================================
+
+
+def _list_messages_direct(user_scope: str, conversation_id: int) -> list[dict]:
+    """Đọc messages qua repo trực tiếp (endpoint /messages test ở test_assistant_crud_
+    endpoint.py; ở đây verify DB state, không end-to-end). Sync wrapper — sử dụng
+    `asyncio.run` với engine mới per-call (test caller là sync TestClient)."""
+    import asyncio
+
+    from agent.assistant_conversations import AssistantConversations
+    from db.session import make_session_factory
+
+    async def _read() -> list[dict]:
+        sf = make_session_factory()
+        repo = AssistantConversations(sf, user_scope=user_scope)
+        rows = await repo.list_messages(conversation_id, limit=100)
+        return [{"role": r.role, "content": r.content} for r in rows]
+
+    return asyncio.run(_read())
+
+
+def test_chat_creates_conversation_when_id_none(app_and_fakes, cleanup_memory) -> None:
+    """Không truyền conversation_id ⇒ server auto-create, response trả id, DB có 2 messages."""
+    app, fake_llm = app_and_fakes
+    with TestClient(app) as client:
+        client.cookies.set(SESSION_COOKIE_NAME, _mint_user_token(tier="free"))
+        resp = client.post("/api/assistant/chat", json={"message": "Chào Ohana"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "conversation_id" in body
+    assert body["conversation_id"] > 0
+
+    rows = _list_messages_direct(_USER_ID, body["conversation_id"])
+    assert [(r["role"], r["content"]) for r in rows] == [
+        ("user", "Chào Ohana"),
+        ("assistant", fake_llm.reply),
+    ]
+
+
+def test_chat_uses_provided_conversation_id_and_appends(app_and_fakes, cleanup_memory) -> None:
+    """Chat 2 lần cùng conversation_id ⇒ 4 messages tích luỹ trong 1 hội thoại."""
+    app, fake_llm = app_and_fakes
+    with TestClient(app) as client:
+        client.cookies.set(SESSION_COOKIE_NAME, _mint_user_token(tier="free"))
+        r1 = client.post("/api/assistant/chat", json={"message": "turn 1"})
+        conv_id = r1.json()["conversation_id"]
+        r2 = client.post(
+            "/api/assistant/chat",
+            json={"message": "turn 2", "conversation_id": conv_id},
+        )
+    assert r2.status_code == 200
+    assert r2.json()["conversation_id"] == conv_id
+
+    rows = _list_messages_direct(_USER_ID, conv_id)
+    assert len(rows) == 4
+    assert rows[0]["content"] == "turn 1"
+    assert rows[2]["content"] == "turn 2"
+
+
+def test_chat_404_when_conversation_id_missing(app_and_fakes, cleanup_memory) -> None:
+    """conversation_id không tồn tại ⇒ 404 conversation_not_found."""
+    app, _ = app_and_fakes
+    with TestClient(app) as client:
+        client.cookies.set(SESSION_COOKIE_NAME, _mint_user_token(tier="free"))
+        resp = client.post(
+            "/api/assistant/chat",
+            json={"message": "hi", "conversation_id": 999_999_999},
+        )
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "conversation_not_found"}
+
+
+def test_chat_404_when_conversation_id_cross_user(app_and_fakes, cleanup_memory) -> None:
+    """User A gửi conversation_id của user B ⇒ 404 (không leak existence)."""
+    app, _ = app_and_fakes
+    # User B tạo conversation trước qua chat.
+    with TestClient(app) as client:
+        bob_token = _mint_user_token(tier="free", user_id="p24b-bob")
+        client.cookies.set(SESSION_COOKIE_NAME, bob_token)
+        bob_resp = client.post("/api/assistant/chat", json={"message": "bob's chat"})
+        bob_conv_id = bob_resp.json()["conversation_id"]
+
+        # User A (alice) gửi vào conv của Bob.
+        client.cookies.set(SESSION_COOKIE_NAME, _mint_user_token(tier="free"))
+        resp = client.post(
+            "/api/assistant/chat",
+            json={"message": "hack", "conversation_id": bob_conv_id},
+        )
+    assert resp.status_code == 404
+
+
+def test_chat_llm_fail_persists_nothing(app_and_fakes, cleanup_memory) -> None:
+    """LLM trả content rỗng ⇒ 502 + KHÔNG persist message. Conversation auto-create
+    ĐÃ chạy (đứng trước LLM) — chấp nhận có row conversation rỗng ở fail path (comment
+    trong endpoint đã explicit). Test này khoá "không có message rác trong DB"."""
+    app, fake_llm = app_and_fakes
+    fake_llm.reply = ""  # ⇒ endpoint raise 502
+    with TestClient(app) as client:
+        client.cookies.set(SESSION_COOKIE_NAME, _mint_user_token(tier="free"))
+        resp = client.post("/api/assistant/chat", json={"message": "trigger empty"})
+    assert resp.status_code == 502
+
+    # Không có conversation_id trong response 502, đọc DB direct qua repo — list mọi
+    # conv của user, verify 0 message ở tất cả.
+    from agent.assistant_conversations import AssistantConversations
+    from db.session import make_session_factory
+
+    async def _verify_no_messages() -> None:
+        sf = make_session_factory()
+        repo = AssistantConversations(sf, user_scope=_USER_ID)
+        convs = await repo.list_recent(limit=100)
+        for c in convs:
+            msgs = await repo.list_messages(c.conversation_id, limit=100)
+            assert msgs == [], f"conv {c.conversation_id} có {len(msgs)} messages"
+
+    import asyncio
+
+    asyncio.run(_verify_no_messages())
+
+
+def test_chat_auto_title_from_first_message(app_and_fakes, cleanup_memory) -> None:
+    """Auto-create title = user_msg[:40].strip() — dài hơn 40 chars thì cắt."""
+    app, _ = app_and_fakes
+    long_msg = "Đây là câu rất dài để test auto-title cắt ở 40 char boundary chính xác"
+    expected_title = long_msg[:40].strip()  # 40 chars đúng
+    with TestClient(app) as client:
+        client.cookies.set(SESSION_COOKIE_NAME, _mint_user_token(tier="free"))
+        resp = client.post("/api/assistant/chat", json={"message": long_msg})
+    conv_id = resp.json()["conversation_id"]
+
+    from agent.assistant_conversations import AssistantConversations
+    from db.session import make_session_factory
+
+    async def _get_title() -> str | None:
+        sf = make_session_factory()
+        repo = AssistantConversations(sf, user_scope=_USER_ID)
+        conv = await repo.get(conv_id)
+        assert conv is not None
+        return conv.title
+
+    import asyncio
+
+    assert asyncio.run(_get_title()) == expected_title
