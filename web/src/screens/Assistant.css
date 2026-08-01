@@ -3,6 +3,21 @@
    .chat-disclaimer / .btn-primary từ App.css + Chat.css. Chỉ thêm những gì đặc trưng
    cho layout 2-pane. */
 
+/* R1 streaming — con trỏ nhấp nháy sau text token cuối, ẩn khi stream đóng. Cùng
+   dáng "typing indicator" ChatGPT/Claude. */
+.chat-turn-cursor {
+  display: inline-block;
+  margin-left: 2px;
+  color: var(--ohana-color-primary-500, #6d5efc);
+  animation: chat-cursor-blink 1s steps(2, start) infinite;
+}
+
+@keyframes chat-cursor-blink {
+  to {
+    visibility: hidden;
+  }
+}
+
 .assistant-screen {
   /* Cùng logic height/flex như Chat.css — .ohana-app min-height:100vh làm container
      lớn theo nội dung, chat-transcript không chạm trần ⇒ composer đẩy khỏi màn hình. */

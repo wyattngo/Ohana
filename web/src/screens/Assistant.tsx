@@ -16,7 +16,7 @@ import {
   deleteConversation,
   fetchMessages,
   listConversations,
-  postAssistantChat,
+  streamAssistantChat,
 } from "../lib/api";
 import { formatRelativeVN } from "../lib/time";
 import "./Assistant.css";
@@ -134,28 +134,77 @@ export function AssistantScreen({ onBack, onError }: AssistantScreenProps) {
     if (!canSend) return;
 
     const question = trimmed;
-    setTurns((prev) => [...prev, { role: "user", text: question }]);
+    const wasNew = activeConvId === null;
+    // Optimistic: append user turn + placeholder assistant turn RỖNG. Token frame
+    // append vào text của placeholder này — user thấy "typing" thật.
+    setTurns((prev) => [
+      ...prev,
+      { role: "user", text: question },
+      { role: "assistant", text: "" },
+    ]);
     setDraft("");
     setSending(true);
+
+    let streamError: { code: string; message: string } | null = null;
+    let receivedAnyToken = false;
+    let doneMeta: { conversation_id: number } | null = null;
+
     try {
-      const result = await postAssistantChat(question, activeConvId);
-      setTurns((prev) => [...prev, { role: "assistant", text: result.reply }]);
-      // BE tạo/gán conversation_id — nếu tạo mới, set active + refetch list để adopt title
-      // BE tự sinh (message[:40]).
-      const wasNew = activeConvId === null;
-      setActiveConvId(result.conversation_id);
-      void loadList();
-      if (wasNew) setDrawerOpen(false); // auto-đóng drawer khi tạo mới trên mobile
+      await streamAssistantChat(question, activeConvId, {
+        onToken: (text) => {
+          receivedAnyToken = true;
+          // Append vào placeholder assistant turn (turn cuối list). functional setState
+          // — không giữ ref stale khi callback fire nhanh.
+          setTurns((prev) => {
+            const copy = prev.slice();
+            const last = copy[copy.length - 1];
+            if (last && last.role === "assistant") {
+              copy[copy.length - 1] = { ...last, text: last.text + text };
+            }
+            return copy;
+          });
+        },
+        onDone: (meta) => {
+          doneMeta = meta;
+        },
+        onError: (frame) => {
+          streamError = frame;
+        },
+      });
+
+      if (streamError) {
+        // Rollback: xoá placeholder + user turn, trả text vào input.
+        setDraft(question);
+        setTurns((prev) => prev.slice(0, -2));
+        const code = (streamError as { code: string; message: string }).code;
+        if (code === "llm_empty_response") {
+          onError("Model không trả về nội dung. Thử lại giúp em nhé.");
+        } else {
+          onError("Lỗi phía model — vui lòng thử lại.");
+        }
+      } else if (doneMeta) {
+        // BE gán/tạo conversation_id — nếu tạo mới, set active + refetch list adopt title.
+        setActiveConvId((doneMeta as { conversation_id: number }).conversation_id);
+        void loadList();
+        if (wasNew) setDrawerOpen(false);
+      } else if (!receivedAnyToken) {
+        // Stream đóng KHÔNG có done + KHÔNG có token — bất thường (network drop giữa
+        // handshake). Rollback như error path.
+        setDraft(question);
+        setTurns((prev) => prev.slice(0, -2));
+        onError("Kết nối mất giữa chừng — vui lòng thử lại.");
+      }
     } catch (err) {
-      // Rollback optimistic — trả câu vừa gõ vào input, xoá turn user.
+      // HTTP 4xx/5xx TRƯỚC khi mở stream (rate limit, auth expired, conv 404).
       setDraft(question);
-      setTurns((prev) => prev.slice(0, -1));
+      setTurns((prev) => prev.slice(0, -2));
       if (err instanceof ApiError && err.status === 401) {
         onError("Phiên đăng nhập đã hết hạn — vui lòng đăng nhập lại.");
       } else if (err instanceof ApiError && err.status === 429) {
         onError("Đã đạt giới hạn hôm nay. Nâng cấp gói để tiếp tục.");
-      } else if (err instanceof ApiError && err.status === 502) {
-        onError("Model không trả về nội dung. Thử lại giúp em nhé.");
+      } else if (err instanceof ApiError && err.status === 404) {
+        onError("Cuộc hội thoại đã bị xoá — hãy bắt đầu cuộc mới.");
+        setActiveConvId(null);
       } else {
         onError("Không gửi được câu hỏi — vui lòng thử lại.");
       }
@@ -321,18 +370,37 @@ export function AssistantScreen({ onBack, onError }: AssistantScreenProps) {
             </div>
           )}
 
-          {turns.map((turn, i) => (
-            <div key={i} className={`chat-turn chat-turn-${turn.role}`}>
-              {turn.text}
-            </div>
-          ))}
-
-          {sending && (
-            <div className="chat-turn chat-turn-assistant chat-turn-pending" role="status">
-              <Loader2 className="spin" size={16} aria-hidden="true" />
-              <span>Đang soạn câu trả lời… lần đầu có thể mất 20–30 giây.</span>
-            </div>
-          )}
+          {turns.map((turn, i) => {
+            const isStreamingPlaceholder =
+              sending &&
+              i === turns.length - 1 &&
+              turn.role === "assistant" &&
+              turn.text === "";
+            if (isStreamingPlaceholder) {
+              // First-token chưa đến — cold Together cold-start ~20s. Hiển thị pending
+              // spinner thay bong bóng rỗng (bong bóng rỗng trông như bug UI).
+              return (
+                <div
+                  key={i}
+                  className="chat-turn chat-turn-assistant chat-turn-pending"
+                  role="status"
+                >
+                  <Loader2 className="spin" size={16} aria-hidden="true" />
+                  <span>Đang soạn câu trả lời… lần đầu có thể mất 20–30 giây.</span>
+                </div>
+              );
+            }
+            return (
+              <div key={i} className={`chat-turn chat-turn-${turn.role}`}>
+                {turn.text}
+                {sending && i === turns.length - 1 && turn.role === "assistant" && (
+                  <span className="chat-turn-cursor" aria-hidden="true">
+                    ▍
+                  </span>
+                )}
+              </div>
+            );
+          })}
         </div>
 
         <form

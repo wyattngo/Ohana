@@ -229,6 +229,110 @@ export async function deleteConversation(conversationId: number): Promise<void> 
   await apiFetch(`/api/assistant/conversations/${conversationId}`, { method: "DELETE" });
 }
 
+/** Metadata BE gửi ở `event: done` — echo `AssistantChatResult` shape minus reply
+ * (reply đã được stream qua token frames). */
+export interface StreamDoneMeta {
+  conversation_id: number;
+  message_id: number;
+  model: string;
+  usage: Record<string, number>;
+  tier: string;
+  daily_tokens_used: number;
+}
+
+export interface StreamErrorFrame {
+  code: string;
+  message: string;
+}
+
+/** `POST /api/assistant/chat/stream` (R1 · ADR round2) — SSE streaming.
+ *
+ * EventSource API browser CHỈ hỗ trợ GET, không POST body. Impl bằng `fetch` +
+ * `body.getReader()` + parser thủ công. Nhận 3 loại frame:
+ * - `event: token` → onToken(text)
+ * - `event: done` → onDone(meta) rồi close (terminal)
+ * - `event: error` → onError(frame) rồi close (terminal)
+ *
+ * Abort: caller giữ AbortController để cancel giữa stream (tab close, user navigate).
+ * BE finally block CÓ persist partial reply (đã tốn token thật) — cost accounting đúng
+ * dù client disconnect.
+ *
+ * HTTP status non-200 (429 rate, 404 conv, 401 auth) raise ApiError như apiFetch —
+ * SSE chỉ mở khi status 200 (BE gate TRƯỚC khi return StreamingResponse). */
+export async function streamAssistantChat(
+  message: string,
+  conversationId: number | null,
+  callbacks: {
+    onToken: (text: string) => void;
+    onDone: (meta: StreamDoneMeta) => void;
+    onError: (frame: StreamErrorFrame) => void;
+    signal?: AbortSignal;
+  },
+): Promise<void> {
+  const headers = new Headers({ "Content-Type": "application/json", Accept: "text/event-stream" });
+  const csrfToken = readCookie(CSRF_COOKIE_NAME);
+  if (csrfToken) headers.set(CSRF_HEADER_NAME, csrfToken);
+
+  const resp = await fetch("/api/assistant/chat/stream", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ message, conversation_id: conversationId }),
+    credentials: "include",
+    signal: callbacks.signal,
+  });
+  if (!resp.ok) {
+    // 429 / 404 / 401 — BE raise trước khi mở stream (xem api/assistant_chat.py::
+    // assistant_chat_stream tier gate + ownership check).
+    throw new ApiError(resp.status);
+  }
+  if (!resp.body) throw new Error("stream_no_body");
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      buffer += decoder.decode(value, { stream: true });
+
+      // Parse SSE frames: khối phân tách bằng "\n\n". `\r\n\r\n` cũng valid theo spec.
+      let sep: number;
+      while ((sep = buffer.indexOf("\n\n")) !== -1) {
+        const rawFrame = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+        if (!rawFrame.trim()) continue;
+
+        let eventName = "message";
+        let dataLine = "";
+        for (const line of rawFrame.split("\n")) {
+          if (line.startsWith("event: ")) eventName = line.slice(7).trim();
+          else if (line.startsWith("data: ")) dataLine = line.slice(6);
+        }
+        if (!dataLine) continue;
+
+        try {
+          const data = JSON.parse(dataLine);
+          if (eventName === "token") callbacks.onToken(data.text ?? "");
+          else if (eventName === "done") {
+            callbacks.onDone(data as StreamDoneMeta);
+            return;
+          } else if (eventName === "error") {
+            callbacks.onError(data as StreamErrorFrame);
+            return;
+          }
+        } catch {
+          // Frame JSON hỏng — skip 1 frame, tiếp stream (BE nghiêm ngặt JSON encode
+          // nên đây không xảy ra thực; parser lenient để không kill toàn stream).
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 /** `POST /api/chat` (spec 07 §7 Phase G1) — seller ↔ AI tổng quát.
  *
  * No `shop_id` in the body, deliberately: the backend derives it from the verified JWT and
