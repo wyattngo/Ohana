@@ -251,6 +251,15 @@ class Settings(BaseSettings):
     # the caller.
     database_url: str = "postgresql+psycopg://ohana:ohana@localhost:5432/ohana"
 
+    # `REDIS_URL` — Tầng 2 Phase 2.2 (D3, ADR §1). Cost counter + rate-limit per-user cần
+    # Redis KV. Default trỏ compose local (dev-without-config path giữ nguyên: nếu Redis
+    # chưa lên, mọi op fail-open theo D4 — không crash user, mất gate tạm).
+    #
+    # `/0` là DB index Redis; tách namespace giữa cost/rate/alert bằng KEY PREFIX
+    # (`cost:`, `rl:`), KHÔNG bằng Redis DB index (0..15 là legacy anti-pattern —
+    # nhiều DB không share connection pool, không PubSub qua, và migration khó).
+    redis_url: str = "redis://localhost:6379/0"
+
 
 @lru_cache
 def get_settings() -> Settings:

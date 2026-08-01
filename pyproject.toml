@@ -82,6 +82,11 @@ dev = [
     # ĐÃ verify xanh"), chạy `pip install -e ".[dev]"` một lần, đọc `pip show import-linter`,
     # rồi thay số ở đây bằng version thực sự đã chạy xanh.
     "import-linter==2.3",
+    # `fakeredis` — Tầng 2 Phase 2.2. In-process Redis stub cho unit test cost/rate-limit.
+    # Verify chạm Redis THẬT bằng service compose (test lifespan) là scope khác; unit test
+    # dùng fakeredis để (a) không cần Redis running khi CI chạy pytest, (b) tách hành vi
+    # ứng dụng khỏi hành vi network. Pin cứng theo kỷ luật block này.
+    "fakeredis==2.32.0",
 ]
 
 # ⚠️ CHƯA PIN: toàn bộ `[project].dependencies` runtime vẫn dùng `>=`. Đo 2026-07-19, 4 gói
@@ -190,6 +195,24 @@ allow_indirect_imports = true
 source_modules = ["api", "app", "auth", "channels", "db", "retrieval", "parsing",
                   "tools", "agent.drafter", "agent.orchestrator"]
 forbidden_modules = ["agent.providers"]
+
+[[tool.importlinter.contracts]]
+# I1c · Tầng 2 Phase 2.2 · primitives Redis (cost + rate-limit + client wrapper) sống ở
+# luồng A. Luồng B (bridge/channels/api.webhook/api.inbox/app.main_seller/worker_seller)
+# và các drafter/orchestrator/policy_gate của Tầng 3 KHÔNG được import — giữ tách process
+# thật (I1) khi P2.4 wire router chat với các primitive này. Comment mã màu cùng bài I1
+# gốc: sai đây = deploy nhầm luồng, phát hiện muộn.
+#
+# `allow_indirect_imports = true` bởi cùng lý do I5: qua module trung gian (`app.runtime`,
+# `db.session`) vẫn OK; contract chỉ cấm import TRỰC TIẾP.
+name = "I1c · agent.assistant_* + agent.redis_client chỉ luồng A"
+type = "forbidden"
+allow_indirect_imports = true
+source_modules = ["bridge", "channels", "api.webhook", "api.inbox",
+                  "app.main_seller", "app.worker_seller",
+                  "agent.drafter", "agent.orchestrator", "agent.policy_gate"]
+forbidden_modules = ["agent.assistant_cost", "agent.assistant_rate_limit",
+                     "agent.redis_client"]
 
 [build-system]
 requires = ["setuptools>=68"]

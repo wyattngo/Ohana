@@ -22,17 +22,42 @@ app seller/combined trước; `mock_auth` log warning chỉ thẳng chỗ đó.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 
+from agent.redis_client import make_redis_pool
 from api.chat import build_router as build_chat_router
 from api.mock_auth import build_router as build_mock_auth_router
+from app.config import get_settings
 from app.runtime import install_csrf, setup_logging
 from auth.identity import build_active_shop_dep
 from db.session import make_session_factory
 
 setup_logging()
 
-app = FastAPI(title="Ohana AI", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Redis pool (Tầng 2 Phase 2.2, D3) — startup dựng, shutdown đóng.
+
+    Pool đặt trên `app.state.redis_pool` để Phase 2.4 router chat (`Depends(get_redis)`)
+    lấy được từ `request.app.state`. Không expose global vì (a) test cần isolation
+    per-fixture, (b) singleton module-scope là bẫy khi có nhiều process (uvicorn --workers).
+
+    Không cần healthcheck ở startup — D4 fail-open: Redis chớp ⇒ mất gate tạm, không
+    block boot. Redis chưa sẵn ⇒ ConnectionPool build vẫn OK (lazy connect ở op đầu).
+    """
+    settings = get_settings()
+    app.state.redis_pool = make_redis_pool(settings.redis_url)
+    try:
+        yield
+    finally:
+        await app.state.redis_pool.aclose()
+
+
+app = FastAPI(title="Ohana AI", version="0.1.0", lifespan=lifespan)
 
 _session_factory = make_session_factory()
 _identity_dep = build_active_shop_dep(_session_factory)

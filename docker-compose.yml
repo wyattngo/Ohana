@@ -29,6 +29,20 @@ services:
       timeout: 3s
       retries: 10
 
+  # Tầng 2 Phase 2.2 (D3, ADR §1) — Redis cho cost counter + rate-limit per-user.
+  # KHÔNG persistent volume (D4 fail-open + kỷ luật MVP): counter per-day mất khi restart
+  # là chấp nhận, cùng dáng với Redis chớp → fail-open. `--maxmemory-policy allkeys-lru`
+  # bảo vệ memory nếu counter chưa expire kịp; `--save ""` tắt RDB (không cần disk I/O).
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--maxmemory-policy", "allkeys-lru"]
+    ports: ["${OHANA_REDIS_PORT:-6379}:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   # v2, KHÔNG v3 — v3 cần ClickHouse + Redis + MinIO.
   # Self-host là điều kiện để golden set C4 (PII thật) ở lại trong nước.
   langfuse:
