@@ -47,6 +47,7 @@ from agent.embedder import Embedder, default_embedder
 from agent.llm_client import LLMClient
 from agent.pii import wrap
 from agent.redis_client import get_redis
+from agent.tracing_context import set_tracing_context
 from api.chat import get_llm_client
 from auth.user_identity import UserIdentity, user_identity_from_cookie
 
@@ -170,6 +171,15 @@ def build_router(
         else:
             auto_title = payload.message.strip()[:_AUTO_TITLE_MAX_CHARS].strip() or None
             conv = await conversations.create(title=auto_title)
+
+        # 1c. Wire Langfuse tracing context — user_id populate Users tab, session_id =
+        # conversation_id populate Sessions tab + group multi-turn chat, trace_id sinh
+        # mới per-turn (1 turn = 1 trace, gồm memory recall + LLM step). ContextVar
+        # copy per-Task nên request đồng thời không đè lên nhau (asyncio isolation).
+        set_tracing_context(
+            user_id=identity.user_id,
+            session_id=str(conv.conversation_id),
+        )
 
         # 2. Memory recall. Failure không chặn chat — chỉ log + tiếp với `hits=[]`.
         embedder = embedder_factory()

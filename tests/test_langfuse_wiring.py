@@ -400,3 +400,188 @@ def test_langfuse_sink_passes_timestamps_to_generation() -> None:
     assert captured_gen.get("end_time") == t1
     # Sanity: usage vẫn passed đúng shape camelCase Langfuse expect.
     assert captured_gen["usage"]["totalTokens"] == 10
+
+
+# =====================================================================================
+# TracingContext — user_id + session_id + trace_id populate Users/Sessions/grouping tabs.
+# =====================================================================================
+
+
+def test_tracing_context_default_all_none() -> None:
+    """Chưa ai set ⇒ get() trả (None, None, None). LangfuseSink fallback về hành vi cũ
+    (trace ẩn danh, không group) — non-breaking cho call-site chưa wire context."""
+    from agent.tracing_context import get_tracing_context, reset_tracing_context
+
+    reset_tracing_context()
+    ctx = get_tracing_context()
+    assert ctx.user_id is None
+    assert ctx.session_id is None
+    assert ctx.trace_id is None
+
+
+def test_set_tracing_context_generates_trace_id_when_omitted() -> None:
+    """`set_tracing_context(user_id=..., session_id=...)` không truyền trace_id ⇒ auto
+    UUID. Cùng scope: mọi record() trong async task đọc cùng trace_id → Langfuse group
+    thành 1 trace."""
+    from agent.tracing_context import (
+        get_tracing_context,
+        reset_tracing_context,
+        set_tracing_context,
+    )
+
+    reset_tracing_context()
+    tid = set_tracing_context(user_id="user-42", session_id="conv-7")
+    assert tid  # non-empty UUID
+    ctx = get_tracing_context()
+    assert ctx.user_id == "user-42"
+    assert ctx.session_id == "conv-7"
+    assert ctx.trace_id == tid
+
+
+def test_set_tracing_context_accepts_explicit_trace_id() -> None:
+    """Caller có thể pin trace_id (test hoặc trace continuation)."""
+    from agent.tracing_context import (
+        get_tracing_context,
+        reset_tracing_context,
+        set_tracing_context,
+    )
+
+    reset_tracing_context()
+    tid = set_tracing_context(user_id="x", session_id="y", trace_id="fixed-trace-123")
+    assert tid == "fixed-trace-123"
+    assert get_tracing_context().trace_id == "fixed-trace-123"
+
+
+@pytest.mark.asyncio
+async def test_tracing_context_isolated_across_asyncio_tasks() -> None:
+    """ContextVar copy per-Task — 2 request async đồng thời không đè context của nhau.
+    Cách rẻ nhất verify: spawn 2 task, mỗi task set context riêng, cross-check."""
+    import asyncio
+
+    from agent.tracing_context import get_tracing_context, set_tracing_context
+
+    async def _worker(uid: str) -> str:
+        set_tracing_context(user_id=uid, session_id=f"sess-{uid}")
+        await asyncio.sleep(0.01)
+        return get_tracing_context().user_id or "MISSING"
+
+    results = await asyncio.gather(_worker("alice"), _worker("bob"))
+    assert set(results) == {"alice", "bob"}, (
+        "ContextVar leak giữa task — mutation trong 1 task lộ sang task khác"
+    )
+
+
+def test_langfuse_sink_passes_user_and_session_to_trace() -> None:
+    """`LangfuseSink.record()` đọc TracingContext → pass `user_id`/`session_id`/`id` vào
+    `client.trace(...)`. Populate 3 tab Langfuse (Users, Sessions, trace grouping)."""
+    from datetime import UTC, datetime
+
+    from agent.llm_client import GenerationRecord
+    from agent.providers.langfuse_tracer import LangfuseSink
+    from agent.tracing_context import reset_tracing_context, set_tracing_context
+
+    captured_trace: dict = {}
+
+    class _FakeGen:
+        def __init__(self, **kw: Any) -> None: ...
+
+    class _FakeTrace:
+        def __init__(self, **kw: Any) -> None:
+            captured_trace.update(kw)
+
+        def generation(self, **kw: Any) -> _FakeGen:
+            return _FakeGen(**kw)
+
+    class _FakeLangfuse:
+        def trace(self, **kw: Any) -> _FakeTrace:
+            return _FakeTrace(**kw)
+
+    sink = LangfuseSink.__new__(LangfuseSink)
+    sink._client = _FakeLangfuse()  # type: ignore[attr-defined]  # noqa: SLF001
+
+    reset_tracing_context()
+    set_tracing_context(user_id="user-alice", session_id="conv-42", trace_id="trace-uuid-abc")
+
+    t0 = datetime(2026, 8, 1, 12, 0, 0, tzinfo=UTC)
+    rec = GenerationRecord(
+        op="step",
+        model="fake",
+        input_messages=[],
+        output="hi",
+        started_at=t0,
+        ended_at=t0,
+    )
+    sink.record(rec)
+
+    assert captured_trace.get("id") == "trace-uuid-abc"
+    assert captured_trace.get("user_id") == "user-alice"
+    assert captured_trace.get("session_id") == "conv-42"
+
+
+def test_langfuse_sink_omits_context_kwargs_when_unset() -> None:
+    """Context rỗng ⇒ NOT PASS `user_id`/`session_id`/`id` (không set = None sẽ overwrite
+    default nào đó của SDK). Non-breaking cho call-site chưa wire context."""
+    from datetime import UTC, datetime
+
+    from agent.llm_client import GenerationRecord
+    from agent.providers.langfuse_tracer import LangfuseSink
+    from agent.tracing_context import reset_tracing_context
+
+    captured_trace: dict = {}
+
+    class _FakeTrace:
+        def __init__(self, **kw: Any) -> None:
+            captured_trace.update(kw)
+
+        def generation(self, **kw: Any) -> None:
+            return None
+
+    class _FakeLangfuse:
+        def trace(self, **kw: Any) -> _FakeTrace:
+            return _FakeTrace(**kw)
+
+    sink = LangfuseSink.__new__(LangfuseSink)
+    sink._client = _FakeLangfuse()  # type: ignore[attr-defined]  # noqa: SLF001
+
+    reset_tracing_context()
+
+    t0 = datetime(2026, 8, 1, 12, 0, 0, tzinfo=UTC)
+    rec = GenerationRecord(
+        op="complete",
+        model="fake",
+        input_messages=[],
+        output="hi",
+        started_at=t0,
+        ended_at=t0,
+    )
+    sink.record(rec)
+
+    assert "id" not in captured_trace
+    assert "user_id" not in captured_trace
+    assert "session_id" not in captured_trace
+    # Nhưng name + start_time vẫn phải có (bất biến cũ).
+    assert captured_trace["name"] == "llm.complete"
+    assert captured_trace["start_time"] == t0
+
+
+@pytest.mark.asyncio
+async def test_multiple_records_same_context_share_trace_id() -> None:
+    """Cùng request → set_tracing_context 1 lần → N record() cùng trace_id → Langfuse SDK
+    upsert cùng trace (grouping). Test verify tracer emit CÙNG trace_id cho N call.
+    """
+    from agent.tracing_context import (
+        get_tracing_context,
+        reset_tracing_context,
+        set_tracing_context,
+    )
+
+    reset_tracing_context()
+    set_tracing_context(user_id="u", session_id="s")
+    tid_1 = get_tracing_context().trace_id
+
+    # Simulate multi-step (drafter multi-round pattern) — 3 record calls trong cùng task,
+    # cùng contextvar snapshot.
+    tid_reads = [get_tracing_context().trace_id for _ in range(3)]
+    assert all(t == tid_1 for t in tid_reads), (
+        "trace_id đổi giữa các read trong cùng context — grouping vỡ"
+    )

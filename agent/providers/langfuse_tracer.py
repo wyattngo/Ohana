@@ -36,7 +36,25 @@ class LangfuseSink:
         # Trace + generation cùng start_time để UI grouping timeline chuẩn. Nếu để SDK
         # tự stamp (không pass), trace = t0, generation = t0+ε → span 0-duration →
         # cột End Time trống + Latency null trên UI.
-        trace = self._client.trace(name=f"llm.{gen.op}", start_time=gen.started_at)
+        #
+        # Đọc TracingContext (contextvar set bởi endpoint) để pass user_id + session_id
+        # + trace_id lên Langfuse — populate tab Users/Sessions + group multi-step trong
+        # 1 request thành 1 trace (SDK v2 upsert theo `id`). Context rỗng ⇒ fallback về
+        # hành vi cũ (trace ẩn danh, không group) — non-breaking cho call-site chưa wire.
+        from agent.tracing_context import get_tracing_context
+
+        ctx = get_tracing_context()
+        trace_kwargs: dict[str, object] = {
+            "name": f"llm.{gen.op}",
+            "start_time": gen.started_at,
+        }
+        if ctx.trace_id is not None:
+            trace_kwargs["id"] = ctx.trace_id
+        if ctx.user_id is not None:
+            trace_kwargs["user_id"] = ctx.user_id
+        if ctx.session_id is not None:
+            trace_kwargs["session_id"] = ctx.session_id
+        trace = self._client.trace(**trace_kwargs)
         trace.generation(
             name=gen.op,
             model=gen.model,
