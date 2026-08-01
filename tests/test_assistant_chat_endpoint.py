@@ -44,7 +44,12 @@ _USER_ID = "p24b-alice"
 
 
 class _FakeLLM:
-    """Ghi lại messages, trả reply cố định. Không mạng."""
+    """Ghi lại messages, trả reply cố định. Không mạng.
+
+    Set `last_model` sau mỗi call — khớp contract real adapter (xem
+    `agent/llm_client.py::LLMClient.last_model` docstring). Endpoint đọc từ
+    `last_model` chứ không `_default_model` (không xuyên wrapper stack).
+    """
 
     _default_model = "fake-llm-p24b"
 
@@ -61,9 +66,11 @@ class _FakeLLM:
         }
         self.seen: list[list[dict[str, Any]]] = []
         self.last_hits: dict[str, int] = {}
+        self.last_model: str | None = None
 
     async def step(self, messages: list[dict[str, Any]], **kwargs: Any) -> AssistantStep:
         self.seen.append(messages)
+        self.last_model = self._default_model
         return AssistantStep(content=self.reply, tool_calls=[], usage=self.usage)
 
 

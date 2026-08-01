@@ -56,11 +56,14 @@ class _FakeStreamLLM:
         self.raise_mid_stream = raise_mid_stream
         self.seen: list[list[dict[str, Any]]] = []
         self.last_hits: dict[str, int] = {}
+        self.last_model: str | None = None
 
     async def step_stream(
         self, messages: list[dict[str, Any]], **kwargs: Any
     ) -> AsyncIterator[StreamEvent]:
         self.seen.append(messages)
+        # Set `last_model` như real adapter — endpoint đọc SAU StreamDone.
+        self.last_model = self._default_model
         if self.raise_on_start:
             raise RuntimeError("simulated_provider_error")
         for i, ch in enumerate(self.chunks):

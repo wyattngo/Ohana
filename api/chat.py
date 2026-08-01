@@ -121,7 +121,9 @@ def build_router(
         latency_ms = int((time.perf_counter() - started) * 1000)
 
         usage = step.usage or {}
-        model_id = getattr(llm, "_default_model", "unknown")
+        # `last_model` resolve sau call (adapter set + propagate qua wrapper);
+        # `_default_model` KHÔNG xuyên PIIFilteringClient stack production.
+        model_id = getattr(llm, "last_model", None) or "unknown"
 
         # Đo lường là SỐ ĐẾM, không phải bản sao nội dung. Không log `payload.message` cũng
         # không log `step.content`: tin nhắn seller có thể chứa thông tin khách hàng, và PDPL

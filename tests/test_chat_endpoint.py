@@ -33,14 +33,20 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 class _FakeLLM:
-    """Ghi lại messages nhận được, trả reply cố định. Không mạng, không key."""
+    """Ghi lại messages nhận được, trả reply cố định. Không mạng, không key.
+
+    Set `last_model` sau step() — khớp real adapter contract (endpoint đọc từ đó,
+    không từ `_default_model` vì không xuyên wrapper stack production).
+    """
 
     def __init__(self, reply: str = "Chào anh, em có thể giúp gì?") -> None:
         self.reply = reply
         self.seen: list[list[dict[str, Any]]] = []
+        self.last_model: str | None = None
 
     async def step(self, messages: list[dict[str, Any]], **kwargs: Any) -> AssistantStep:
         self.seen.append(messages)
+        self.last_model = "fake-llm-tang3"
         return AssistantStep(
             content=self.reply,
             tool_calls=[],

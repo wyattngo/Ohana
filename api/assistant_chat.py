@@ -216,7 +216,9 @@ def build_router(
         total_tokens = usage.get("total_tokens") or (
             usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
         )
-        model_id = getattr(llm, "_default_model", "unknown")
+        # Model resolve từ `last_model` (adapter set sau call, propagate qua wrapper).
+        # `_default_model` KHÔNG xuyên PIIFilteringClient wrapper stack production.
+        model_id = getattr(llm, "last_model", None) or "unknown"
 
         # 5. Record cost. Fail-open — Redis chớp ⇒ mất 1 record, không raise.
         await record_tokens(redis, identity.user_id, total_tokens)
@@ -374,7 +376,11 @@ def build_router(
             """
             chunks: list[str] = []
             done_usage: dict[str, int] | None = None
-            model_id = getattr(llm, "_default_model", "unknown")
+            # `model_id` resolve SAU stream done (adapter set `last_model` cuối mỗi call —
+            # xem `agent/llm_client.py::LLMClient.last_model` docstring). `_default_model`
+            # KHÔNG xuyên PIIFilteringClient wrapper (chỉ có ở raw adapter), nên gán trước
+            # stream sẽ luôn ra "unknown" trên stack production.
+            model_id = "unknown"
             started = time.perf_counter()
 
             try:
@@ -401,6 +407,10 @@ def build_router(
                 # tiếp — SSE closed, client thấy `error` frame là terminal.
                 return
 
+            # Resolve model từ `last_model` side-channel (adapter set cuối call, propagate
+            # qua PIIFilteringClient + TracingClient). Fall back "unknown" nếu adapter
+            # không set (legacy provider).
+            model_id = getattr(llm, "last_model", None) or "unknown"
             reply = "".join(chunks).strip()
             latency_ms = int((time.perf_counter() - started) * 1000)
 
