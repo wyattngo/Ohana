@@ -4,28 +4,12 @@ version = "0.1.0"
 description = "AI copilot cho seller social-commerce VN (Zalo/FB/IG) — MVP Zalo-only."
 requires-python = ">=3.11"
 dependencies = [
-    # PIN CỨNG, cùng lý do đã pin dev tool (ISSUE-019) — nhưng đây là RUNTIME, hỏng nặng hơn.
+    # PIN CỨNG runtime — `>=` tạo hai app khác nhau giữa hai lần `pip install` cách vài tuần,
+    # CI xanh không chứng minh được cái sẽ chạy ở prod. Version dưới đây là hiện trạng CI đã
+    # xác nhận (git log để tra revision baseline).
     #
-    # Với `>=`, hai lần `pip install` cách nhau vài tuần cho ra hai ứng dụng khác nhau, và
-    # CI xanh KHÔNG chứng minh được gì về cái sẽ chạy ở production. Đo 2026-07-20 trước khi
-    # pin — floor khai trong file này so với thứ THỰC SỰ đang chạy:
-    #
-    #   🔴 openai         1.30  → 2.45.0   ← SDK của CẢ TogetherClient LẪN TogetherEmbedder
-    #   🔴 pypdf          4.0   → 6.14.2
-    #   🔴 redis          5.0   → 8.0.1
-    #   🔴 sse-starlette  2.1   → 3.4.5
-    #   🟡 fastapi 0.110→0.139 · uvicorn 0.29→0.51 · pydantic 2.6→2.13 · alembic 1.13→1.18
-    #
-    # Bốn cái đầu đã qua ĐỔI MAJOR. Toàn bộ test suite chưa bao giờ chạy trên floor đã khai —
-    # nó chạy trên thứ pip tình cờ giải ra hôm cài. `openai` đáng lo nhất: nó là đường sống
-    # của mọi lời gọi LLM và embedding, và bản 2.x đổi API so với 1.x.
-    #
-    # Version dưới đây = ĐÚNG thứ CI run 29709797545 (aae835c) chạy xanh đủ 11 step, gồm
-    # alembic + pytest trên container sạch. Pin là chốt hiện trạng đã được CI xác nhận,
-    # KHÔNG phải nâng cấp mù.
-    #
-    # Nâng version: đổi số ở đây → chạy `pytest -m live` (fake client KHÔNG bắt được lỗi
-    # SDK/endpoint) → xem CI xanh → mới commit. Đừng nới thành `>=` để "tiện".
+    # Nâng version: đổi số ở đây → `pytest -m live` (fake client không bắt lỗi SDK) → CI xanh →
+    # commit. ĐỪNG nới thành `>=` để "tiện" — đó là lý do file này pin ngay từ đầu.
     "fastapi==0.139.2",
     "uvicorn[standard]==0.51.0",
     "pydantic==2.13.4",
