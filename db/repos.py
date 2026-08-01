@@ -819,6 +819,57 @@ class SendQueueRepo:
         )
 
 
+# OHB-24 · send dedup — atomic barrier cho send_one flow. INSERT ON CONFLICT DO NOTHING
+# RETURNING là cùng khuôn với webhook_event_log dedup (§6.1, I7): Postgres serialize
+# INSERT trên PK, đúng 1 bên thắng, N-1 bên nhận rowcount=0. 🚫 Bỏ RETURNING = không
+# phân biệt được duplicate vs new; check-then-insert riêng = race window kinh điển.
+_RESERVE_SEND = text("""
+    INSERT INTO sent_log (reply_id, shop_id, customer_id)
+    VALUES (:reply_id, :shop_id, :customer_id)
+    ON CONFLICT (reply_id) DO NOTHING
+    RETURNING reply_id
+""")
+
+# Rollback khi send() raise — CHỈ đường exception path gọi. 🚫 Đừng gọi ở đường thành
+# công (mất audit) hoặc lúc mark_sent no-op (reservation ĐÚNG, chỉ mark bị soán quyền).
+_ROLLBACK_SEND = text("DELETE FROM sent_log WHERE reply_id = :reply_id")
+
+
+class SentLogRepo:
+    """Send dedup log (OHB-24) — unscoped, cùng biên nền-tảng với SendQueueRepo (send-
+    worker chạy khắp mọi shop, không theo tenant). Isolation ở caller: send_one truyền
+    shop_id + customer_id gắn cứng từ SendJob (row ĐÃ claim), không từ input ngoài.
+
+    KHÔNG shop_scope trong constructor — cùng lý do SendQueueRepo/OutboxRepo/SchedulerRepo.
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def reserve_send(self, *, reply_id: str, shop_id: str, customer_id: str) -> bool:
+        """Atomic dedup barrier. Trả `True` = reservation mới (được phép gọi sender),
+        `False` = đã có reply_id trước (skip send, đường mark_sent-clean-claim).
+
+        Race: N worker cùng bắn INSERT ⇒ Postgres serialize trên PK, 1 thắng, N-1
+        nhận rowcount=0. Cùng khuôn `webhook_event_log` dedup (I7)."""
+        result = await self._session.execute(
+            _RESERVE_SEND,
+            {"reply_id": reply_id, "shop_id": shop_id, "customer_id": customer_id},
+        )
+        row = result.first()
+        await self._session.commit()
+        return row is not None
+
+    async def rollback(self, reply_id: str) -> None:
+        """Xoá reservation khi send() raise — lượt kế retry được (reservation không
+        rollback là draft im lặng vĩnh viễn cho reply_id đó).
+
+        CHỈ gọi khi CHẮC CHẮN sender.send() KHÔNG thành công (exception path). Mọi đường
+        khác — success, mark_sent no-op — GIỮ reservation (audit + chống double)."""
+        await self._session.execute(_ROLLBACK_SEND, {"reply_id": reply_id})
+        await self._session.commit()
+
+
 # §6.3 NGUYÊN VĂN (design — PRE-010 C2), đổi tên theo ánh xạ: `seller.conversation` →
 # `conversations`, cột khoá `conversation_id` → `id`.
 #

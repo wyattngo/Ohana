@@ -1,11 +1,11 @@
-"""Entrypoint worker luồng B (A4 → A5 → A7 → OHB-23) — đủ 4 loop của design §3:
+"""Entrypoint worker luồng B (A4 → A5 → A7 → OHB-23 → OHB-24) — đủ 4 loop của design §3:
 
-| Loop       | Chu kỳ | Việc                                                        |
-|------------|--------|-------------------------------------------------------------|
-| `outbox`   | 200ms  | claim §6.2 → ghi tin khách (C1) → set debounce (coalesce)   |
-| `debounce` | 500ms  | claim §6.3 conversation đến hạn → compose draft (guard O9)  |
-| `send`     | 500ms  | claim draft `approved` → OutboundChannel.send → mark 'sent' |
-| `reaper`   | 10s    | R1 draft hết TTL · R2 outbox kẹt · R3 §6.9 · R4 §6.10 · R5  |
+| Loop       | Chu kỳ | Việc                                                                  |
+|------------|--------|-----------------------------------------------------------------------|
+| `outbox`   | 200ms  | claim §6.2 → ghi tin khách (C1) → set debounce (coalesce)             |
+| `debounce` | 500ms  | claim §6.3 conversation đến hạn → compose draft (guard O9)            |
+| `send`     | 500ms  | claim `approved` → **dedup sent_log (OHB-24)** → send → mark 'sent'   |
+| `reaper`   | 10s    | R1 draft hết TTL · R2 outbox kẹt · R3 §6.9 · R4 §6.10 · R5            |
 
 Coalesce (w§2.2): tin mới ĐẨY LÙI `next_debounce_at`, nên cụm tin gõ liên tiếp thành MỘT
 draft. Lỗi compose ⇒ để claim treo cho R3 gỡ sau 5' — retry có nhịp, không retry nóng.
@@ -53,6 +53,7 @@ from db.repos import (
     SchedulerRepo,
     SendJob,
     SendQueueRepo,
+    SentLogRepo,
 )
 from db.session import make_session_factory
 
@@ -381,26 +382,72 @@ async def run_debounce_loop(deps: WorkerDeps, *, run_once: bool = False) -> None
 
 
 async def send_one(job: SendJob, deps: WorkerDeps) -> None:
-    """Một send-job: gọi `OutboundChannel.send` (network) → mark_sent (echo :claimed_at).
-    Sender raise ⇒ release_send_claim ngay (draft về 'approved' cho lượt kế) rồi re-raise
-    cho caller log — KHÔNG mark 'sent' khi sender chưa xác nhận.
+    """OHB-24 · dedup barrier trước send(). Flow ba pha:
 
-    Mark_sent rowcount=0 nghĩa là R5 đã gỡ claim (worker này treo >5') hoặc worker khác
-    đã claim lại — không log 'sent' oan, cảnh báo cho vận hành thấy claim-timeout đang
-    xảy ra. rowcount=1 là đường thành công bình thường."""
-    await deps.sender.send(shop_id=job.shop_id, customer_id=job.customer_id, text=job.draft_text)
+    (1) `SentLogRepo.reserve_send` — INSERT ON CONFLICT DO NOTHING RETURNING trên
+        `sent_log(reply_id PK)`. Atomic dedup: `False` ⇒ đã sent trước đó (crash-reap-
+        resend từ lượt trước) ⇒ mark_sent clear claim, KHÔNG gọi sender lần hai.
+    (2) `sender.send()` — network. Exception ⇒ `SentLogRepo.rollback` (DELETE dedup)
+        rồi re-raise cho caller (run_send_loop bắt để release claim + log).
+    (3) `mark_sent` (echo `:claimed_at`). rowcount=0 ⇒ R5 gỡ claim trước; sender ĐÃ
+        gửi và dedup log đã lock reply_id ⇒ lượt sau `reserve_send` fail ⇒ KHÔNG
+        double-send. Trước OHB-24 flow chỉ 2 pha và log warning "có thể double-send" —
+        đó là hố exactly-once đã đóng.
+
+    Trade-off ký: crash giữa (1) và (2) ⇒ reservation đăng ký nhưng sender không gọi
+    ⇒ khách không nhận (im lặng, at-most-once). Reservation không rollback vì worker
+    không biết send() có thành công hay không — retry là window race gửi 2 lần thật."""
+    # (1) Dedup barrier
+    async with deps.session_factory() as session:
+        reserved = await SentLogRepo(session).reserve_send(
+            reply_id=job.reply_id, shop_id=job.shop_id, customer_id=job.customer_id
+        )
+    if not reserved:
+        # Đã sent trước đó (crash-reap-resend từ lượt claim trước). Clear claim, KHÔNG
+        # gọi sender. Đây là đường "phục hồi trạng thái sổ sách" — sender đã gửi thật
+        # ở lượt trước, chỉ mark_sent bị crash.
+        logger.warning(
+            "send dedup hit: reply %s đã sent trước (crash-reap-resend?) — skip sender",
+            job.reply_id,
+        )
+        async with deps.session_factory() as session:
+            await PendingReplyRepo(session, shop_scope=job.shop_id).mark_sent(
+                job.reply_id, claimed_at=job.claimed_at
+            )
+        return
+
+    # (2) Network — exception ⇒ rollback dedup để lượt kế retry được (nếu không
+    # rollback, reservation lock reply_id vĩnh viễn ⇒ draft im lặng mãi).
+    try:
+        await deps.sender.send(
+            shop_id=job.shop_id, customer_id=job.customer_id, text=job.draft_text
+        )
+    except Exception:
+        try:
+            async with deps.session_factory() as session:
+                await SentLogRepo(session).rollback(job.reply_id)
+        except Exception:
+            # Rollback fail = reservation kẹt = draft im lặng vĩnh viễn cho reply_id
+            # này. Log to, vận hành xử tay (DELETE FROM sent_log WHERE reply_id = ...).
+            logger.exception(
+                "sent_log rollback lỗi reply=%s — reservation kẹt, cần gỡ tay!",
+                job.reply_id,
+            )
+        raise
+
+    # (3) Mark sent (echo claimed_at)
     async with deps.session_factory() as session:
         n = await PendingReplyRepo(session, shop_scope=job.shop_id).mark_sent(
             job.reply_id, claimed_at=job.claimed_at
         )
     if n == 0:
-        # R5 gỡ claim trước khi mark_sent land — sender ĐÃ gửi (có thể double-send nếu
-        # worker sau claim lại và gửi lại). Đây là đánh đổi đã ký: I13 (không im lặng
-        # vĩnh viễn) ưu tiên hơn "gửi đúng 1 lần" tuyệt đối cho gạch dưới GĐ0 — Zalo
-        # HTTP thật lấy idempotency key qua bên platform (PRE-004), chỗ đó khoá cứng.
-        logger.warning(
-            "mark_sent no-op: reply %s bị R5/worker khác soán quyền — có thể double-send "
-            "khi lượt sau claim lại (I13 ưu tiên hơn strict-once ở GĐ0, xem OHB-23 note)",
+        # R5 gỡ claim trước mark_sent — sender ĐÃ gửi. KHÔNG còn "có thể double-send"
+        # (comment cũ của OHB-23): dedup log lock reply_id ⇒ lượt sau `reserve_send`
+        # trả False ⇒ đường dedup-hit ở trên chạy, mark_sent thành công không qua
+        # sender. Info-level thay vì warning vì đây là đường phục hồi bình thường.
+        logger.info(
+            "mark_sent no-op: reply %s bị R5/worker khác soán quyền — dedup log "
+            "chống double-send (OHB-24)",
             job.reply_id,
         )
 

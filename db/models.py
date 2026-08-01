@@ -818,3 +818,26 @@ class AssistantUserMemory(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class SentLog(Base):
+    """Dedup log cho send-worker Tầng 3 (OHB-24 · a13). Chống double-send khi crash-
+    reap-resend: `reserve_send` INSERT ON CONFLICT DO NOTHING RETURNING trên `reply_id`
+    PK là atomic barrier — lần hai (sau crash) trả rowcount=0 ⇒ send_one skip sender.
+
+    Không FK về `pending_reply(reply_id)`: retention khác (pending_reply có thể xoá cho
+    training label §8.1, sent_log giữ audit lâu). Giữ độc lập là chủ đích, không thiếu
+    ràng buộc.
+
+    Rollback (DELETE) khi sender.send() raise để lượt kế retry — grant DELETE tường
+    minh CHỈ bảng này trong a13 (a1 default public chỉ SELECT/INSERT/UPDATE)."""
+
+    __tablename__ = "sent_log"
+    __table_args__ = (Index("idx_sent_log_shop_sent", "shop_id", "sent_at"),)
+
+    reply_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    shop_id: Mapped[str] = mapped_column(Text, nullable=False)
+    customer_id: Mapped[str] = mapped_column(Text, nullable=False)
+    sent_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

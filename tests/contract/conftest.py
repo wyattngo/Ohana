@@ -39,6 +39,8 @@ def wipe_tenant(conn: psycopg.Connection, *, shop: str, channel: str) -> None:
     conn.execute("DELETE FROM webhook_event_log WHERE channel = %s", (channel,))
     conn.execute("DELETE FROM cost_reservation WHERE shop_id = %s", (shop,))
     conn.execute("DELETE FROM cost_budget WHERE shop_id = %s", (shop,))
+    # OHB-24 · sent_log dedup — xoá trước pending_reply (không FK nhưng cùng cây tenant).
+    conn.execute("DELETE FROM sent_log WHERE shop_id = %s", (shop,))
     conn.execute("DELETE FROM pending_reply WHERE shop_id = %s", (shop,))
     conn.execute("DELETE FROM messages WHERE shop_id = %s", (shop,))
     conn.execute("DELETE FROM conversations WHERE shop_id = %s", (shop,))
