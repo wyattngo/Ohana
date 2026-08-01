@@ -1,10 +1,18 @@
 ---
 doc: adr-round2-api-streaming-bulk-search-feedback
-status: proposed
+status: accepted
 date: 2026-08-01
 decides: [R1, R2, R3, R4, R5]
-open: [Q1, Q2, Q3]
-ratified_by: (pending)
+open: []
+ratified_by: Wyatt
+ratified_date: 2026-08-01
+shipped_at:
+  - "ca289fa · R1-R4 BE + tests + migrations a14/a15"
+  - "48ed184 · fix: model=last_model xuyên PIIFilteringClient wrapper"
+  - "b377ae6 · R1 FE consumer — Assistant.tsx wire /chat/stream + typing cursor"
+q1_resolved: "a — worker OHB-23 đã ship đủ; no delta"
+q2_resolved: "search KHÔNG bao gồm user_memory (dùng /memory/recall riêng nếu cần)"
+q3_resolved: "no admin feedback summary endpoint — đọc DB trực tiếp đủ ở scale hiện tại"
 relates: adr-tang2-ohana-ai-assistant.md, ohana-be-design.md
 scope: Tầng 2 (R1–R4) + Tầng 3 (R5)
 ---

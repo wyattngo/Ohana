@@ -289,6 +289,25 @@ curl -X DELETE -b cookies.txt \
   http://localhost:8001/api/assistant/conversations/42
 ```
 
+### `POST /api/assistant/conversations/bulk-delete`
+
+**R2 · ADR round2.** Soft-delete nhiều conversation trong 1 request. Cap 100 id/req (Pydantic `max_length=100`; vượt ⇒ **422**). Client dedup input server-side (trùng id không lỡ vào `skipped`).
+
+```bash
+curl -X POST -b cookies.txt \
+  -H "Content-Type: application/json" \
+  -H "X-CSRF-Token: $CSRF" \
+  -d '{"ids": [42, 43, 44]}' \
+  http://localhost:8001/api/assistant/conversations/bulk-delete
+```
+
+```json
+{"deleted": [42, 43], "skipped": [44]}
+```
+
+- `deleted` — id thực sự UPDATE (đổi trạng thái sang soft-deleted).
+- `skipped` — id không match: không tồn tại HOẶC cross-user HOẶC đã xoá trước. Không phân biệt lý do (cùng bài 404 single-delete).
+
 ### `GET /api/assistant/conversations/{id}/messages?limit=50&before=<iso>`
 
 **P2.4d.** List messages 1 conversation, ASC by `(created_at, message_id)` — tie-breaker `message_id` là chủ đích (user+assistant trong 1 transaction có cùng `created_at`, sort chỉ theo created_at ⇒ thứ tự đảo ngẫu nhiên).
@@ -330,6 +349,88 @@ curl -b cookies.txt 'http://localhost:8001/api/assistant/memories?limit=20'
 ### `DELETE /api/assistant/memories/{id}` → 204
 
 Hard delete (khác conversations soft-delete). Cross-user ⇒ **404**.
+
+### `POST /api/assistant/chat/stream`
+
+**R1 · ADR round2.** SSE variant của `POST /assistant/chat`. Cùng semantic (tier gate + memory + persist) nhưng LLM output stream token theo `text/event-stream`. Tier deny / conv 404 raise **429/404 TRƯỚC** khi mở stream; lỗi mid-stream ⇒ `event: error` (KHÔNG persist reply dở).
+
+```bash
+curl -N -X POST -b cookies.txt \
+  -H "Content-Type: application/json" \
+  -H "X-CSRF-Token: $CSRF" \
+  -H "Accept: text/event-stream" \
+  -d '{"message": "Đếm từ 1 đến 3", "conversation_id": null}' \
+  http://localhost:8001/api/assistant/chat/stream
+```
+
+```
+event: token
+data: {"text": "1"}
+
+event: token
+data: {"text": "\n"}
+
+event: token
+data: {"text": "2"}
+
+event: done
+data: {"conversation_id": 5, "message_id": 34, "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo", "usage": {"prompt_tokens": 341, "completion_tokens": 2, "total_tokens": 343}, "tier": "pro", "daily_tokens_used": 1517}
+```
+
+- **event: token** — 1 delta text từ LLM. Client append vào bubble đang render.
+- **event: done** — terminal. Metadata: `conversation_id` (BE tạo mới nếu request null), `message_id` (assistant turn), `usage`, `daily_tokens_used` (echo sau record).
+- **event: error** — terminal. `{code, message}`. Code hiện có: `llm_error`, `llm_empty_response`, `persist_failed`.
+- **Cost accounting**: reserve trước-mở-stream, record ở `event: done` (client disconnect giữa chừng ⇒ partial reply vẫn persist, cost đúng).
+- **nginx**: `proxy_buffering off` cho location này (deploy/nginx.conf); backend set `X-Accel-Buffering: no` + `Cache-Control: no-cache` header.
+
+### `POST /api/assistant/messages/{id}/feedback`
+
+**R4 · ADR round2.** Thumbs up/down cho 1 assistant message. Upsert per (user, message) — rate lại ghi đè. Chỉ áp cho `role='assistant'` (rate user message ⇒ **404**).
+
+```bash
+curl -X POST -b cookies.txt \
+  -H "Content-Type: application/json" \
+  -H "X-CSRF-Token: $CSRF" \
+  -d '{"rating": 1, "note": "câu trả lời rõ ràng"}' \
+  http://localhost:8001/api/assistant/messages/102/feedback
+```
+
+```json
+{"message_id": 102, "updated_at": "2026-08-01T14:22:33.123456Z"}
+```
+
+- `rating` chỉ `-1` hoặc `1` (DB CHECK + endpoint validate ⇒ **422** nếu khác).
+- `note` optional, max 2000 char. **KHÔNG cast lên Langfuse** (I16 analog: free-text PII risk).
+- **404** cross-user / message không tồn tại / role != 'assistant'.
+
+### `GET /api/assistant/search?q=<query>`
+
+**R3 · ADR round2.** FTS trên `assistant.messages.content` (GIN index, config `simple`) + ILIKE trên `conversations.title`. Snippet 25-word với `<em>...</em>` highlight từ `ts_headline`. Rate limit riêng namespace `rl:search:` (free 30/min, pro 120/min; không đụng chat bucket).
+
+```bash
+curl -b cookies.txt 'http://localhost:8001/api/assistant/search?q=hà+nội'
+```
+
+```json
+{
+  "conversations": [
+    {"conversation_id": 5, "title": "Kế hoạch Hà Nội Q4", "updated_at": "..."}
+  ],
+  "messages": [
+    {
+      "message_id": 88,
+      "conversation_id": 5,
+      "snippet": "Thủ đô của Việt Nam là <em>Hà</em> <em>Nội</em>, ...",
+      "created_at": "..."
+    }
+  ]
+}
+```
+
+- `q` required, 1–200 char (**422** nếu rỗng/quá dài).
+- Cap 20 kết quả/loại. Không pagination v1 — client vượt cap phải refine query.
+- Cross-user isolated qua `user_id` filter; soft-deleted conv loại khỏi kết quả.
+- **429** `search_rate_limit_exceeded` khi vượt qpm.
 
 ---
 
@@ -390,9 +491,9 @@ Vite dev proxy `/api → 127.0.0.1:8001` (web/vite.config.ts) — FE luôn gọi
 
 ## 10 · Chưa có (backlog)
 
-- **Streaming SSE** — `/assistant/chat` hiện non-stream. Nếu ship, persist ở `StreamDone` (P2.4d note).
-- **Bulk delete messages** — chưa endpoint. Xoá conversation ⇒ soft-delete parent (messages vẫn nằm, ẩn qua ownership).
-- **Search conversations** — chưa endpoint (F2+).
-- **Feedback / rating** — `POST /assistant/feedback` cho Langfuse Scores tab (backlog).
-- **Send-on-approve worker** — `POST /inbox/{id}/approve` KHÔNG gửi tin cho khách (PRE-004).
+- **FE consumer cho search + feedback** — R3/R4 BE ready, Assistant.tsx chưa wire UI. F2+.
+- **Vietnamese analyzer cho FTS** — R3 dùng config `simple` (không stem "đang chạy" ↔ "chạy"). v2 revisit với `pg_search`/`pgroonga` khi có measurement.
+- **Search cursor pagination** — v1 cap 20/loại. Vượt = refine query. Wire cursor khi user thực sự cần.
+- **Bulk delete messages** — chỉ conversations có bulk endpoint. Message thường xoá theo CASCADE của conversation.
+- **Send-on-approve push notify** — worker OHB-23 đã ship (auto-drain approved → send). Chỉ chưa có UI real-time cho seller thấy "đã gửi" (ADR round2 R5, Q1=a, backlog).
 - **Real Zalo OAuth** — `mock_authorize*` là dev only, spec 05+ ship real login flow.

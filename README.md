@@ -11,7 +11,7 @@
 | Tầng | Vai | Trạng thái |
 |---|---|---|
 | **1** — Ohana Social | Identity / billing / feed / video | Đợi platform ready |
-| **2** — Ohana AI Assistant | Chat per-user + memory + freemium gate | **BE code-complete**, FE F1 sidebar ship |
+| **2** — Ohana AI Assistant | Chat per-user + memory + freemium gate | **BE + FE ship**, streaming SSE + bulk-delete + search + feedback (round 2) |
 | **3** — AI Seller (Zalo) | Webhook → LLM draft → seller duyệt → gửi | **Code-complete GD0.5** (BE + FE 6 màn) |
 
 ## Chọn cách chạy
@@ -55,4 +55,4 @@ Setup deep-dive (vì sao từng lệnh): [SETUP.md](SETUP.md).
 
 ## Trạng thái
 
-501 test · main sạch · dev + prod đã docker-hoá. Backlog: Tầng 2 FE F2 (edit title, memory UI, search, streaming).
+520 test · main sạch · dev + prod đã docker-hoá. Backlog: Tầng 2 FE F2 (edit title, memory UI, search UI, feedback thumbs UI).
