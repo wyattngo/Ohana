@@ -183,6 +183,7 @@ pytest -q
 | [ohana-be-design.md](docs/ohana-be-design.md) | Hợp đồng kỹ thuật — 16 bất biến, schema, 10 câu SQL. **Authoritative.** |
 | [adr-tang2-ohana-ai-assistant.md](docs/adr-tang2-ohana-ai-assistant.md) | Kiến trúc Tầng 2 (D1–D7 ratified) |
 | [adopt-plan.md](docs/adopt-plan.md) | Đã có gì · thiếu gì · thứ tự A1–A8 |
+| [api-reference.md](docs/api-reference.md) | API dev reference — tất cả endpoint, cookie/CSRF, error code, curl examples |
 | [cc-brief-buoc2-*.md](docs/) | Brief chi tiết phase 2.1 → 2.4d |
 | [cc-brief-web-*.md](docs/) | Brief FE (F1 sidebar Tầng 2 — draft) |
 | [SETUP.md](SETUP.md) | Vì sao từng lệnh dev (432 dòng — deep) |
