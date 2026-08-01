@@ -28,6 +28,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from agent.redis_client import make_redis_pool
+from api.assistant_chat import build_router as build_assistant_chat_router
 from api.chat import build_router as build_chat_router
 from api.mock_auth import build_router as build_mock_auth_router
 from app.config import get_settings
@@ -64,6 +65,11 @@ _identity_dep = build_active_shop_dep(_session_factory)
 
 app.include_router(build_mock_auth_router(), prefix="/api")
 app.include_router(build_chat_router(_identity_dep), prefix="/api")
+# Tầng 2 Phase 2.4b · POST /api/assistant/chat — luồng chat user (khác Tầng 3 seller).
+# Dùng user_identity_from_cookie (tách khỏi Identity) + tier gate (P2.4a) + memory
+# (P2.3) + cost/rate primitives (P2.2). session_factory chia sẻ với chat router Tầng 3
+# (cùng svc_ohana_ai role; assistant schema có D2 grant riêng).
+app.include_router(build_assistant_chat_router(_session_factory), prefix="/api")
 
 install_csrf(app)
 
