@@ -8,13 +8,11 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
-# dist is intentionally NOT ignored (spec 04 P0 deviation — flagged for Wyatt): no CI step
-# builds this yet (.github/workflows/ci.yml is out of P0's ALLOWED_FILES scope) and the repo
-# has a real `origin` remote, so the built bundle is committed until a follow-up adds a
-# `pnpm build` CI step. Re-ignore + delete the committed copy once that lands.
-# (root .gitignore has Python-packaging `dist/` and `lib/` patterns that would swallow
-# web/dist and web/src/lib — the negations below are what actually keep them tracked)
-!dist/
+# dist untracked kể từ 2026-08 — build artifact tái tạo bằng `pnpm build` (dev) hoặc
+# web/Dockerfile stage 1 (prod). App.main dev đã guard `if _WEB_DIST.is_dir()` nên clone
+# không có dist vẫn boot OK. Root .gitignore có Python-packaging `dist/` pattern nên phải
+# khai lại ở đây (web/dist là JS build), tương tự cho src/lib (Python packaging pattern).
+dist
 !src/lib/
 dist-ssr
 web.zip
