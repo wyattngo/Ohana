@@ -1,0 +1,320 @@
+/* Assistant screen — 2-pane desktop (≥768px) / drawer mobile (<768px).
+   Reuse .chat-transcript / .chat-turn* / .chat-composer / .chat-input / .chat-send /
+   .chat-disclaimer / .btn-primary từ App.css + Chat.css. Chỉ thêm những gì đặc trưng
+   cho layout 2-pane. */
+
+.assistant-screen {
+  /* Cùng logic height/flex như Chat.css — .ohana-app min-height:100vh làm container
+     lớn theo nội dung, chat-transcript không chạm trần ⇒ composer đẩy khỏi màn hình. */
+  height: 100vh;
+  height: 100dvh;
+  box-sizing: border-box;
+  flex: 0 0 auto;
+  padding: 0;
+  gap: 0;
+  display: flex;
+  flex-direction: row;
+  position: relative;
+}
+
+/* ── Sidebar ─────────────────────────────────────────────────────────────────────────── */
+
+.assistant-sidebar {
+  width: 260px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--ohana-color-greyscale-100, #f4f4f4);
+  border-right: 1px solid var(--ohana-color-greyscale-200, #e6e6e6);
+  overflow: hidden;
+}
+
+.assistant-sidebar-header {
+  padding: 16px 12px 8px;
+  border-bottom: 1px solid var(--ohana-color-greyscale-200, #e6e6e6);
+}
+
+.assistant-new-conv {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--ohana-color-greyscale-300, #d1d1d1);
+  border-radius: var(--ohana-radius-card, 16px);
+  background: #fff;
+  color: var(--ohana-color-greyscale-800, #151515);
+  font: inherit;
+  font-weight: var(--ohana-weight-semibold, 600);
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.assistant-new-conv:hover {
+  background: var(--ohana-color-primary-50, #f9f0ff);
+  border-color: var(--ohana-color-primary-300, #cd97ff);
+}
+
+.assistant-conv-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px 8px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.assistant-conv-empty {
+  padding: 12px 8px;
+  margin: 0;
+  color: var(--ohana-color-greyscale-500, #5e5e5e);
+  font-size: 13px;
+  line-height: 1.4;
+  text-align: center;
+}
+
+.assistant-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 20px 8px;
+  color: var(--ohana-color-greyscale-500, #5e5e5e);
+  font-size: 13px;
+}
+
+.assistant-list-error {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 8px;
+  color: var(--ohana-color-greyscale-600, #4a4a4a);
+  font-size: 13px;
+}
+
+.assistant-retry-btn {
+  padding: 4px 10px;
+  border: 1px solid var(--ohana-color-greyscale-300, #d1d1d1);
+  border-radius: 12px;
+  background: #fff;
+  color: var(--ohana-color-greyscale-800, #151515);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.assistant-conv-row {
+  display: flex;
+  align-items: stretch;
+  border-radius: 12px;
+  overflow: hidden;
+  transition: background-color 0.12s;
+}
+
+.assistant-conv-row:hover {
+  background: rgba(151, 68, 251, 0.04);
+}
+
+.assistant-conv-active {
+  background: var(--ohana-color-primary-50, #f9f0ff);
+}
+
+.assistant-conv-open {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border: none;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  color: var(--ohana-color-greyscale-800, #151515);
+}
+
+.assistant-conv-title {
+  font-size: 14px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.assistant-conv-time {
+  font-size: 11px;
+  color: var(--ohana-color-greyscale-500, #5e5e5e);
+}
+
+.assistant-conv-delete {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  border: none;
+  background: transparent;
+  color: var(--ohana-color-greyscale-400, #8a8a8a);
+  cursor: pointer;
+  border-radius: 8px;
+  opacity: 0.6;
+}
+
+.assistant-conv-delete:hover {
+  opacity: 1;
+  color: #c53030;
+  background: rgba(197, 48, 48, 0.08);
+}
+
+/* ── Main pane ────────────────────────────────────────────────────────────────────── */
+
+.assistant-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px 20px 20px;
+  overflow: hidden;
+  background: var(--ohana-color-greyscale-50, #f2f2f2);
+}
+
+.assistant-main-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.assistant-main-header h1 {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-size: 18px;
+  font-weight: var(--ohana-weight-semibold, 600);
+  color: var(--ohana-color-greyscale-800, #151515);
+}
+
+.assistant-drawer-toggle {
+  display: none; /* mobile only — @media dưới */
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border: none;
+  border-radius: 12px;
+  background: #fff;
+  color: var(--ohana-color-greyscale-800, #151515);
+  cursor: pointer;
+}
+
+.back-link-compact {
+  padding: 6px 12px;
+  font-size: 13px;
+  border-radius: 12px;
+  border: 1px solid var(--ohana-color-greyscale-300, #d1d1d1);
+  background: #fff;
+  color: var(--ohana-color-greyscale-800, #151515);
+  cursor: pointer;
+  font: inherit;
+}
+
+.back-link-compact:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.assistant-empty {
+  margin: auto 0;
+  padding: 16px;
+  text-align: center;
+  color: var(--ohana-color-greyscale-600, #4a4a4a);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+.assistant-empty p {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 500;
+}
+
+.assistant-empty-hint {
+  color: var(--ohana-color-greyscale-500, #5e5e5e);
+  font-size: 13px !important;
+  font-weight: 400 !important;
+}
+
+/* ── Drawer backdrop (mobile only) ────────────────────────────────────────────────── */
+
+.assistant-drawer-backdrop {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  border: none;
+  padding: 0;
+  z-index: 5;
+  cursor: pointer;
+}
+
+/* ── Mobile (<768px) — sidebar → drawer ───────────────────────────────────────────── */
+
+@media (max-width: 767px) {
+  .assistant-sidebar {
+    position: absolute;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: 82%;
+    max-width: 320px;
+    z-index: 10;
+    transform: translateX(-100%);
+    transition: transform 0.2s ease-out;
+    box-shadow: 4px 0 16px rgba(0, 0, 0, 0.08);
+  }
+
+  .assistant-sidebar-open {
+    transform: translateX(0);
+  }
+
+  .assistant-drawer-toggle {
+    display: flex;
+  }
+
+  .assistant-drawer-backdrop {
+    display: block;
+  }
+
+  .assistant-main {
+    width: 100%;
+  }
+}
+
+/* ── .ohana-app max-width override cho màn Assistant ──────────────────────────────── */
+
+/* .ohana-app hiện tại pin max-width:430px cho mobile-first. Màn Assistant cần rộng hơn
+   trên desktop (sidebar 260 + main ≥400 = ≥660). Override CHỈ khi màn hiện tại là
+   assistant — App.tsx wrap chrome khác, KHÔNG có class ohana-app-assistant sẵn. Cách
+   nhẹ nhất: target `.assistant-screen` parent `.ohana-app`, dùng `:has()` (Chromium/
+   Safari ≥15.4/Firefox 121). Fallback: browser cũ vẫn thấy sidebar+main nhưng
+   max-width 430 làm sidebar chiếm phần lớn — chấp nhận cho browser cũ (< 1% VN market
+   theo can-i-use). */
+.ohana-app:has(.assistant-screen) {
+  max-width: 100%;
+}
+
+/* Desktop layout tight-max để không kéo dài vô hạn trên monitor lớn */
+@media (min-width: 1024px) {
+  .ohana-app:has(.assistant-screen) {
+    max-width: 1200px;
+  }
+}

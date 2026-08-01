@@ -38,11 +38,9 @@ F1 = mount lối vào Tầng 2 đầu tiên: một chat có **sidebar list conve
 - **Tier badge / daily token counter** — response chat có `tier` + `daily_tokens_used`, F1 không hiển thị (thêm ở F2 khi có UX cho quota).
 - **Cost cap 429 UX riêng** — hiện dùng chung fallback error toast, F2 mới tách.
 
-## Prerequisite (chưa có, phải giải quyết trước khi ship)
+## Prerequisite
 
-- **Mock user auth cho Tầng 2.** Cookie `ohana_session` share với seller/admin, nhưng token phải `role="user"` + `tier` field. [api/mock_auth.py](api/mock_auth.py) hiện chỉ mint `seller`/`admin`. Cần thêm nhánh `role=user` mint token với `tier="free"|"pro"` (default free).
-  - **Scope quyết định trước khi code F1:** làm mock user auth trong PR F1 luôn, hay tách PR BE riêng? Đề xuất: tách PR nhỏ BE trước (thêm 1 nhánh trong `mock_authorize`, ~10 dòng + 2 test), F1 mount lên.
-  - Không có prerequisite này ⇒ `postAssistantChat` return 401 vì cookie chỉ có seller token.
+- ~~**Mock user auth cho Tầng 2.**~~ ✓ Đã ship P2.4a: [`POST /api/mock/authorize_user?tier=free|pro`](api/mock_auth.py) mint token `role="user"` + `tier` + set cookie `ohana_session` + `ohana_csrf`. Fixture user_id `dev-user-t2-001`. 5 test full ở [`tests/test_mock_auth_user.py`](tests/test_mock_auth_user.py). F1 chỉ cần gọi endpoint này — không PR BE riêng.
 
 ## Bất biến chạm
 
@@ -222,12 +220,7 @@ web/e2e/assistant-sidebar.spec.ts      — new (~200 LOC, 8 test)
 web/e2e/helpers.ts                     — thêm mockAssistantRoutes helper
 ```
 
-BE PR nhỏ tách trước (prerequisite):
-```
-api/mock_auth.py                       — thêm nhánh role=user + tier claim
-auth/user_identity.py                  — (chỉ verify) already ready
-tests/test_mock_auth.py                — +2 test cho user role
-```
+BE prerequisite: ĐÃ CÓ (P2.4a) — F1 chỉ tiêu thụ.
 
 ## Verify (khi ship)
 

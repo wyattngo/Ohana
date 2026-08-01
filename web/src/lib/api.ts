@@ -133,6 +133,102 @@ export async function mockAuthorize(role: "seller" | "admin" = "seller"): Promis
   return (await resp.json()) as MockAuthorizeResult;
 }
 
+/** `POST /api/mock/authorize_user` (P2.4a, dev-only) — Tầng 2 user token với `role="user"`
+ * + `tier` claim. Cookie khác role với seller/admin — endpoint `/api/assistant/*` chỉ nhận
+ * token role `user`. Fixture user_id server-side = `dev-user-t2-001` (per-user không có
+ * shop concept). */
+export interface MockUserAuthorizeResult {
+  user_id: string;
+  tier: string;
+  role: string;
+}
+
+export async function mockAuthorizeUser(tier: "free" | "pro" = "free"): Promise<MockUserAuthorizeResult> {
+  const resp = await apiFetch(`/api/mock/authorize_user?tier=${encodeURIComponent(tier)}`, {
+    method: "POST",
+  });
+  return (await resp.json()) as MockUserAuthorizeResult;
+}
+
+/* ── Tầng 2 · Assistant (P2.4b–d) ───────────────────────────────────────────────────────
+ *
+ * Cookie share `ohana_session` với seller/admin nhưng route Tầng 2 chỉ nhận token
+ * `role="user"` — trước khi gọi 4 hàm dưới đây, phải qua `mockAuthorizeUser()` (dev)
+ * hoặc real user login (spec 05+). Sai role ⇒ 401 `invalid_session_cookie`. */
+
+export interface ConversationRow {
+  conversation_id: number;
+  title: string | null;
+  created_at: string; // ISO 8601
+  updated_at: string;
+}
+
+export interface ConversationListResult {
+  items: ConversationRow[];
+  /** Cursor cho page tiếp — `updated_at` của item cuối page hiện tại. F1 KHÔNG dùng
+   * (fetch một lần `limit=20`), giữ field để không phải sửa contract khi F2 thêm load-more. */
+  next_cursor: string | null;
+}
+
+export interface MessageRow {
+  message_id: number;
+  role: "user" | "assistant" | "system";
+  content: string;
+  created_at: string;
+}
+
+/** Mirror `AssistantChatOut` server-side (api/assistant_chat.py). `conversation_id` server
+ * mint khi request body gửi `null` — auto-title từ `message[:40].strip()`. */
+export interface AssistantChatResult {
+  reply: string;
+  model: string;
+  grounded: boolean;
+  usage: Record<string, number>;
+  tier: string;
+  daily_tokens_used: number;
+  conversation_id: number;
+}
+
+/** `GET /api/assistant/conversations?limit=20` — sorted `updated_at DESC` server-side, item
+ * mới nhất lên đầu. F1 fetch một lần, không cursor. */
+export async function listConversations(): Promise<ConversationListResult> {
+  const resp = await apiFetch("/api/assistant/conversations?limit=20");
+  return (await resp.json()) as ConversationListResult;
+}
+
+/** `GET /api/assistant/conversations/{id}/messages?limit=50` — ASC by (created_at,
+ * message_id). Tie-breaker `message_id` là chủ đích: cả user+assistant trong 1 transaction
+ * có cùng `created_at` (server default eval once), sort chỉ theo created_at thì thứ tự
+ * đảo ngẫu nhiên. Xem `agent/assistant_conversations.py::list_messages` docstring. */
+export async function fetchMessages(conversationId: number): Promise<MessageRow[]> {
+  const resp = await apiFetch(
+    `/api/assistant/conversations/${conversationId}/messages?limit=50`,
+  );
+  const body = (await resp.json()) as { items: MessageRow[]; next_cursor: string | null };
+  return body.items;
+}
+
+/** `POST /api/assistant/chat` — gửi 1 lượt. `conversationId=null` ⇒ BE tạo conversation
+ * mới (auto-title = message[:40]) và trả về `conversation_id`. `conversationId=N` ⇒ append
+ * vào N (ownership check server-side, cross-user → 404, KHÔNG 403 leak existence). */
+export async function postAssistantChat(
+  message: string,
+  conversationId: number | null,
+): Promise<AssistantChatResult> {
+  const resp = await apiFetch("/api/assistant/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message, conversation_id: conversationId }),
+  });
+  return (await resp.json()) as AssistantChatResult;
+}
+
+/** `DELETE /api/assistant/conversations/{id}` — soft-delete server-side. 204 no-content khi
+ * OK, 404 khi id không tồn tại/cross-user (cùng bài ownership pattern). */
+export async function deleteConversation(conversationId: number): Promise<void> {
+  await apiFetch(`/api/assistant/conversations/${conversationId}`, { method: "DELETE" });
+}
+
 /** `POST /api/chat` (spec 07 §7 Phase G1) — seller ↔ AI tổng quát.
  *
  * No `shop_id` in the body, deliberately: the backend derives it from the verified JWT and

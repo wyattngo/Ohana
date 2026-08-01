@@ -2,6 +2,7 @@ import { useCallback, useState } from "react";
 import "./App.css";
 import { AdminShopOnboard } from "./screens/AdminShopOnboard";
 import { AdminWikiIngest } from "./screens/AdminWikiIngest";
+import { AssistantScreen } from "./screens/Assistant";
 import { ChannelPicker } from "./screens/ChannelPicker";
 import { ChatScreen } from "./screens/Chat";
 import { InboxScreen } from "./screens/Inbox";
@@ -33,6 +34,7 @@ type Screen =
   | { name: "inbox" }
   | { name: "review"; reply: PendingReplyOut }
   | { name: "chat" }
+  | { name: "assistant" }
   | { name: "admin" }
   | { name: "adminShops" };
 
@@ -61,28 +63,39 @@ function App() {
       {/* Chrome dùng chung cho các lối vào phụ. Trước G2 chỉ có một link admin định vị tuyệt
           đối; thêm link Chat cạnh nó bằng cách bọc cả hai vào một hàng — giữ nguyên vị trí
           góc trên phải, không phải nhét thêm một phần tử absolute thứ hai rồi canh tay. */}
-      {screen.name !== "admin" && screen.name !== "adminShops" && screen.name !== "chat" && (
-        <div className="shell-chrome">
-          <button type="button" className="chrome-link" onClick={() => setScreen({ name: "chat" })}>
-            Hỏi AI
-          </button>
-          <button type="button" className="chrome-link" onClick={() => setScreen({ name: "admin" })}>
-            Quản trị Wiki
-          </button>
-          <button
-            type="button"
-            className="chrome-link"
-            onClick={() => setScreen({ name: "adminShops" })}
-          >
-            Tạo shop
-          </button>
-        </div>
-      )}
+      {screen.name !== "admin" &&
+        screen.name !== "adminShops" &&
+        screen.name !== "chat" &&
+        screen.name !== "assistant" && (
+          <div className="shell-chrome">
+            <button
+              type="button"
+              className="chrome-link"
+              onClick={() => setScreen({ name: "assistant" })}
+            >
+              Trợ lý AI
+            </button>
+            <button type="button" className="chrome-link" onClick={() => setScreen({ name: "chat" })}>
+              Hỏi AI
+            </button>
+            <button type="button" className="chrome-link" onClick={() => setScreen({ name: "admin" })}>
+              Quản trị Wiki
+            </button>
+            <button
+              type="button"
+              className="chrome-link"
+              onClick={() => setScreen({ name: "adminShops" })}
+            >
+              Tạo shop
+            </button>
+          </div>
+        )}
 
       {screen.name === "channel" && (
         <ChannelPicker
           onConnected={() => setScreen({ name: "inbox" })}
           onAdminConnected={() => setScreen({ name: "adminShops" })}
+          onUserConnected={() => setScreen({ name: "assistant" })}
           onError={showError}
         />
       )}
@@ -113,6 +126,10 @@ function App() {
 
       {screen.name === "chat" && (
         <ChatScreen onBack={() => setScreen({ name: "inbox" })} onError={showError} />
+      )}
+
+      {screen.name === "assistant" && (
+        <AssistantScreen onBack={() => setScreen({ name: "inbox" })} onError={showError} />
       )}
 
       {screen.name === "adminShops" && (

@@ -32,16 +32,22 @@ belongs to `GD0-ZALO` after those two blockers clear.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from agent.embedder import default_embedder
+from agent.redis_client import make_redis_pool
 from api.admin import build_router as build_admin_router
+from api.assistant_chat import build_router as build_assistant_chat_router
+from api.assistant_crud import build_router as build_assistant_crud_router
 from api.chat import build_router as build_chat_router
 from api.inbox import build_router as build_inbox_router
 from api.mock_auth import build_router as build_mock_auth_router
+from app.config import get_settings
 from app.runtime import install_csrf, setup_logging
 from auth.identity import build_active_shop_dep, build_admin_dep
 from db.session import make_session_factory
@@ -50,7 +56,20 @@ from db.session import make_session_factory
 # docstring bên đó cho bài học caplog/force=True và contract double-submit.
 setup_logging()
 
-app = FastAPI(title="Ohana AI Seller", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Redis pool cho Tầng 2 (P2.2 D3) — cost counter + rate limit.
+    Mirror `app.main_ohana_ai:lifespan` — file combined dev cần cùng infra."""
+    settings = get_settings()
+    app.state.redis_pool = make_redis_pool(settings.redis_url)
+    try:
+        yield
+    finally:
+        await app.state.redis_pool.aclose()
+
+
+app = FastAPI(title="Ohana AI Seller", version="0.1.0", lifespan=lifespan)
 
 _session_factory = make_session_factory()
 
@@ -78,6 +97,10 @@ app.include_router(
 # inside the router's dependency, so a missing TOGETHER_API_KEY breaks /api/chat only rather
 # than preventing this module from importing at all.
 app.include_router(build_chat_router(_identity_dep), prefix="/api")
+# Tầng 2 (P2.4b–d) — assistant chat + CRUD conversations/memories. Cùng session_factory,
+# route Tầng 2 chỉ nhận token role="user" (auth/user_identity.py) — tách khỏi seller/admin.
+app.include_router(build_assistant_chat_router(_session_factory), prefix="/api")
+app.include_router(build_assistant_crud_router(_session_factory), prefix="/api")
 
 
 @app.get("/health")

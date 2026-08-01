@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { ChevronRight, Lock, Loader2, MessageCircle, ShieldCheck } from "lucide-react";
-import { ApiError, mockAuthorize } from "../lib/api";
+import { ChevronRight, Lock, Loader2, MessageCircle, ShieldCheck, Sparkles } from "lucide-react";
+import { ApiError, mockAuthorize, mockAuthorizeUser } from "../lib/api";
 import { Logo } from "../components/Logo";
 import "./ChannelPicker.css";
 
@@ -37,12 +37,21 @@ interface ChannelPickerProps {
    * chết ở 403 — plumbing hai đầu có sẵn (`mockAuthorize` nhận "admin", server cho phép),
    * thiếu mỗi lối vào. Dev-fixture-only như toàn bộ mock-authorize; biến mất cùng nó ở spec 05. */
   onAdminConnected: () => void;
+  /** F1: mint token Tầng 2 (`role="user"` + `tier="free"`) qua `/api/mock/authorize_user` —
+   * cần trước khi vào màn Assistant, else `/api/assistant/*` 401. Cùng dev-fixture-only. */
+  onUserConnected: () => void;
   onError: (message: string) => void;
 }
 
-export function ChannelPicker({ onConnected, onAdminConnected, onError }: ChannelPickerProps) {
+export function ChannelPicker({
+  onConnected,
+  onAdminConnected,
+  onUserConnected,
+  onError,
+}: ChannelPickerProps) {
   const [view, setView] = useState<View>({ name: "pick" });
   const [adminConnecting, setAdminConnecting] = useState(false);
+  const [userConnecting, setUserConnecting] = useState(false);
 
   async function handleAdminAuthorize(): Promise<void> {
     setAdminConnecting(true);
@@ -56,6 +65,21 @@ export function ChannelPicker({ onConnected, onAdminConnected, onError }: Channe
           : "Kết nối thất bại — vui lòng thử lại.",
       );
       setAdminConnecting(false);
+    }
+  }
+
+  async function handleUserAuthorize(): Promise<void> {
+    setUserConnecting(true);
+    try {
+      await mockAuthorizeUser("free");
+      onUserConnected();
+    } catch (err) {
+      onError(
+        err instanceof ApiError
+          ? `Kết nối thất bại (mã ${err.status}) — vui lòng thử lại.`
+          : "Kết nối thất bại — vui lòng thử lại.",
+      );
+      setUserConnecting(false);
     }
   }
 
@@ -119,6 +143,21 @@ export function ChannelPicker({ onConnected, onAdminConnected, onError }: Channe
             <ShieldCheck size={14} aria-hidden="true" />
           )}
           Vào với quyền quản trị (dev)
+        </button>
+        <button
+          type="button"
+          className="dev-admin-link"
+          disabled={userConnecting}
+          onClick={() => {
+            void handleUserAuthorize();
+          }}
+        >
+          {userConnecting ? (
+            <Loader2 className="spin" size={14} aria-hidden="true" />
+          ) : (
+            <Sparkles size={14} aria-hidden="true" />
+          )}
+          Vào với quyền user (dev)
         </button>
       </main>
     );

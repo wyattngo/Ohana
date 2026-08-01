@@ -196,18 +196,23 @@
   right: 16px;
   z-index: 5;
   display: flex;
-  gap: 4px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 2px 6px;
+  /* Giới hạn chiều rộng để không đè lên logo lockup bên trái (khoảng 200px cho lockup). */
+  max-width: calc(100% - 220px);
 }
 
 .chrome-link {
   background: none;
   border: none;
-  padding: 4px 8px;
-  font-size: 12px;
+  padding: 3px 6px;
+  font-size: 11px;
   font-weight: var(--ohana-weight-semibold, 600);
   color: var(--ohana-color-greyscale-400, #797979);
   cursor: pointer;
   text-decoration: underline;
+  white-space: nowrap;
 }
 
 .admin-form {
