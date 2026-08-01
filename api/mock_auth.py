@@ -44,6 +44,12 @@ _FIXTURE_SHOP_ID = "fixture-shop-001"
 _SESSION_MAX_AGE_SECONDS = 24 * 60 * 60  # 24h dev convenience — no refresh flow at GD0.5
 _ALLOWED_ROLES = ("seller", "admin")
 
+# P2.4a · Tầng 2 user identity (D7 · Ohana tự phát). Fixture riêng tách khỏi Tầng 3
+# seller (`dev-user-001`) để cùng session dev không clash. Tier whitelist khớp
+# `auth/user_identity.py::_ALLOWED_TIERS` và `agent/assistant_tier.py::TIER_LIMITS`.
+_FIXTURE_TIER_2_USER_ID = "dev-user-t2-001"
+_ALLOWED_TIERS_MOCK = ("free", "pro")
+
 
 def _is_dev_env() -> bool:
     """Checked per-request (not baked in at router-build time) and FAIL-CLOSED: unset or any
@@ -132,5 +138,42 @@ def build_router() -> APIRouter:
             max_age=_SESSION_MAX_AGE_SECONDS,
         )
         return {"oa_id": _FIXTURE_OA_ID, "shop_id": _FIXTURE_SHOP_ID, "role": role}
+
+    @router.post("/authorize_user")
+    async def mock_authorize_user(response: Response, tier: str = "free") -> dict[str, str]:
+        """P2.4a · Mint user Tầng 2 token (D7 · Ohana tự phát). Same cookie
+        `ohana_session` với seller flow — route Tầng 2 (P2.4b) chỉ nhận token role
+        `user`, seller/admin token vẫn phục vụ route Tầng 3 như cũ.
+
+        KHÔNG seed shop (Tầng 2 per-user, không có shop concept). Same `_is_dev_env`
+        fail-closed gate — outside dev route này 404 như `/mock/authorize`.
+        """
+        if not _is_dev_env():
+            raise HTTPException(status_code=404)
+        if tier not in _ALLOWED_TIERS_MOCK:
+            raise HTTPException(status_code=422, detail="invalid_tier")
+
+        token = jwt.encode(
+            {"sub": _FIXTURE_TIER_2_USER_ID, "role": "user", "tier": tier},
+            get_jwt_secret(),
+            algorithm="HS256",
+        )
+        response.set_cookie(
+            key=SESSION_COOKIE_NAME,
+            value=token,
+            httponly=True,
+            secure=False,
+            samesite="lax",
+            max_age=_SESSION_MAX_AGE_SECONDS,
+        )
+        response.set_cookie(
+            key=CSRF_COOKIE_NAME,
+            value=secrets.token_urlsafe(32),
+            httponly=False,
+            secure=False,
+            samesite="lax",
+            max_age=_SESSION_MAX_AGE_SECONDS,
+        )
+        return {"user_id": _FIXTURE_TIER_2_USER_ID, "tier": tier, "role": "user"}
 
     return router
