@@ -1,6 +1,12 @@
-# Ohana AI
+<p align="center">
+  <img src="web/public/ohana-mark.svg" alt="Ohana" width="96" height="96" />
+</p>
 
-**Backend** cho super-app 3 tầng của Ohana. Self-host — không SaaS.
+<h1 align="center">Ohana AI</h1>
+
+<p align="center"><strong>Backend</strong> cho super-app 3 tầng của Ohana. Self-host — không SaaS.</p>
+
+---
 
 | Tầng | Vai | Trạng thái |
 |---|---|---|
