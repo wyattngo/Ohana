@@ -256,3 +256,147 @@ def test_factory_with_keys_wraps_pii_outside_tracing(monkeypatch: pytest.MonkeyP
         assert isinstance(client._inner, TracingClient)  # noqa: SLF001
     finally:
         get_settings.cache_clear()
+
+
+# =====================================================================================
+# start_time / end_time on GenerationRecord — fix Langfuse "End Time trống + Latency null".
+# =====================================================================================
+
+
+@pytest.mark.asyncio
+async def test_tracing_records_start_and_end_time_around_await() -> None:
+    """TracingClient stamp `started_at` TRƯỚC `await inner`, `ended_at` SAU. Record có
+    thời điểm THẬT của LLM call, không phải thời điểm gọi `record()` hay `sink.record`.
+
+    Trước fix: `GenerationRecord` không có 2 field này ⇒ Langfuse SDK default cả
+    start/end = thời điểm gọi `.generation()` ⇒ span 0-duration ⇒ UI Latency null.
+    Test này khoá contract: nếu ai bỏ start/end khỏi dataclass hoặc quên stamp trong
+    tracer, đỏ ngay.
+    """
+    import asyncio
+    from datetime import UTC, datetime
+
+    class _SlowInner(_FakeInner):
+        async def step(self, messages, *, model=None, **kw: Any):  # type: ignore[no-untyped-def, override]
+            self.last_model = model or self._default_model
+            await asyncio.sleep(0.05)  # ép span > 0
+            self.last_usage = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            return AssistantStep(content="ok", usage=self.last_usage)
+
+    inner = _SlowInner()
+    sink = _CollectingSink()
+    client = TracingClient(inner, sink)
+
+    before = datetime.now(UTC)
+    await client.step(_msgs("hi"))
+    after = datetime.now(UTC)
+
+    assert len(sink.records) == 1
+    rec = sink.records[0]
+    # Cả hai stamp là datetime aware UTC.
+    assert rec.started_at.tzinfo is not None
+    assert rec.ended_at.tzinfo is not None
+    # started_at ∈ [before, after], ended_at ∈ [started_at, after].
+    assert before <= rec.started_at <= after
+    assert rec.started_at <= rec.ended_at <= after
+    # Span thật sự > 0 (sleep 50ms).
+    assert (rec.ended_at - rec.started_at).total_seconds() >= 0.04
+
+
+@pytest.mark.asyncio
+async def test_all_ops_record_start_and_end_time() -> None:
+    """Cả 4 op (complete/stream/step/step_stream) phải stamp start_time + end_time.
+
+    Không stamp ở 1 op = trace op đó thiếu latency trên UI. Test cover đủ 4 để không
+    ai lỡ tay bỏ ở 1 nhánh khi refactor."""
+    inner = _FakeInner()
+    sink = _CollectingSink()
+    client = TracingClient(inner, sink)
+
+    await client.complete(_msgs("a"))
+    async for _ in client.stream(_msgs("b")):
+        pass
+    await client.step(_msgs("c"))
+    async for _ in client.step_stream(_msgs("d")):
+        pass
+
+    assert [r.op for r in sink.records] == ["complete", "stream", "step", "step_stream"]
+    for r in sink.records:
+        assert r.started_at is not None, f"op={r.op} thiếu started_at"
+        assert r.ended_at is not None, f"op={r.op} thiếu ended_at"
+        assert r.started_at <= r.ended_at
+
+
+@pytest.mark.asyncio
+async def test_provider_error_path_still_records_start_and_end_time() -> None:
+    """Adapter raise ⇒ tracer vẫn ghi record kèm start/end. Nếu ai đặt ended_at chỉ
+    ở success path (quên ở except), record error path sẽ mất latency.
+    """
+    from datetime import UTC, datetime
+
+    class _Boom(_FakeInner):
+        async def complete(self, messages, *, model=None, **kw: Any) -> str:  # type: ignore[no-untyped-def, override]
+            self.last_model = model or self._default_model
+            raise ValueError("provider timeout")
+
+    sink = _CollectingSink()
+    client = TracingClient(_Boom(), sink)
+    before = datetime.now(UTC)
+    with pytest.raises(ValueError, match="provider timeout"):
+        await client.complete(_msgs("x"))
+    after = datetime.now(UTC)
+
+    assert sink.records[0].error is not None
+    assert before <= sink.records[0].started_at <= after
+    assert sink.records[0].started_at <= sink.records[0].ended_at <= after
+
+
+def test_langfuse_sink_passes_timestamps_to_generation() -> None:
+    """`LangfuseSink.record()` phải pass `start_time`/`end_time` vào `trace.generation(...)`.
+    Không pass ⇒ SDK v2 default cả hai = now ⇒ span 0-duration.
+
+    Fake Langfuse client — chỉ capture kwargs của trace() + generation() để assert."""
+    from datetime import UTC, datetime
+
+    from agent.llm_client import GenerationRecord
+    from agent.providers.langfuse_tracer import LangfuseSink
+
+    captured_gen: dict = {}
+    captured_trace: dict = {}
+
+    class _FakeGeneration:
+        def __init__(self, **kwargs: Any) -> None:
+            captured_gen.update(kwargs)
+
+    class _FakeTrace:
+        def __init__(self, **kwargs: Any) -> None:
+            captured_trace.update(kwargs)
+
+        def generation(self, **kwargs: Any) -> _FakeGeneration:
+            return _FakeGeneration(**kwargs)
+
+    class _FakeLangfuse:
+        def trace(self, **kwargs: Any) -> _FakeTrace:
+            return _FakeTrace(**kwargs)
+
+    sink = LangfuseSink.__new__(LangfuseSink)
+    sink._client = _FakeLangfuse()  # type: ignore[attr-defined]  # noqa: SLF001
+
+    t0 = datetime(2026, 8, 1, 12, 0, 0, tzinfo=UTC)
+    t1 = datetime(2026, 8, 1, 12, 0, 5, tzinfo=UTC)
+    rec = GenerationRecord(
+        op="step",
+        model="fake-model",
+        input_messages=[{"role": "user", "content": "hi"}],
+        output="hello",
+        started_at=t0,
+        ended_at=t1,
+        usage={"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
+    )
+    sink.record(rec)
+
+    assert captured_trace.get("start_time") == t0
+    assert captured_gen.get("start_time") == t0
+    assert captured_gen.get("end_time") == t1
+    # Sanity: usage vẫn passed đúng shape camelCase Langfuse expect.
+    assert captured_gen["usage"]["totalTokens"] == 10

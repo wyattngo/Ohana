@@ -12,6 +12,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, Literal, NotRequired, Protocol, TypedDict
 
 logger = logging.getLogger(__name__)
@@ -282,12 +283,19 @@ class GenerationRecord:
     """Một lượt gọi model đã hoàn tất, shape trung tính để sink ghi đi đâu tùy nó.
 
     `input_messages` là messages ĐÃ REDACT (xem comment vị trí stack ở trên). `error`
-    non-None khi provider ném — record vẫn được ghi để trace nhìn thấy cả lượt hỏng."""
+    non-None khi provider ném — record vẫn được ghi để trace nhìn thấy cả lượt hỏng.
+
+    `started_at` / `ended_at` (UTC): TracingClient stamp bracketing `await inner.*`.
+    Sink Langfuse pass thẳng lên `trace.generation(start_time=, end_time=)` — nếu bỏ
+    trống, SDK v2 default cả hai = thời điểm gọi `.generation()` → span 0-duration →
+    UI hiện Latency null, End Time trống. Bắt buộc set, không optional."""
 
     op: str  # "complete" | "stream" | "step" | "step_stream"
     model: str | None
     input_messages: list[ChatMessage]
     output: str | None
+    started_at: datetime
+    ended_at: datetime
     tool_calls: list[ToolCall] = field(default_factory=list)
     usage: dict[str, int] | None = None
     error: str | None = None
@@ -328,6 +336,7 @@ class TracingClient(LLMClient):
         max_tokens: int | None = None,
     ) -> AsyncIterator[str]:
         chunks: list[str] = []
+        started_at = datetime.now(UTC)
         try:
             async for delta in self._inner.stream(
                 messages, model=model, temperature=temperature, max_tokens=max_tokens
@@ -343,6 +352,8 @@ class TracingClient(LLMClient):
                     model=self._inner.last_model,
                     input_messages=messages,
                     output="".join(chunks) or None,
+                    started_at=started_at,
+                    ended_at=datetime.now(UTC),
                     usage=self._inner.last_usage,
                     error=repr(exc),
                 )
@@ -356,6 +367,8 @@ class TracingClient(LLMClient):
                 model=self._inner.last_model,
                 input_messages=messages,
                 output="".join(chunks),
+                started_at=started_at,
+                ended_at=datetime.now(UTC),
                 usage=self._inner.last_usage,
             )
         )
@@ -368,6 +381,7 @@ class TracingClient(LLMClient):
         temperature: float = 0.7,
         max_tokens: int | None = None,
     ) -> str:
+        started_at = datetime.now(UTC)
         try:
             out = await self._inner.complete(
                 messages, model=model, temperature=temperature, max_tokens=max_tokens
@@ -381,6 +395,8 @@ class TracingClient(LLMClient):
                     model=self._inner.last_model,
                     input_messages=messages,
                     output=None,
+                    started_at=started_at,
+                    ended_at=datetime.now(UTC),
                     usage=self._inner.last_usage,
                     error=repr(exc),
                 )
@@ -394,6 +410,8 @@ class TracingClient(LLMClient):
                 model=self._inner.last_model,
                 input_messages=messages,
                 output=out,
+                started_at=started_at,
+                ended_at=datetime.now(UTC),
                 usage=self._inner.last_usage,
             )
         )
@@ -408,6 +426,7 @@ class TracingClient(LLMClient):
         temperature: float = 0.7,
         max_tokens: int | None = None,
     ) -> AssistantStep:
+        started_at = datetime.now(UTC)
         try:
             result = await self._inner.step(
                 messages, tools=tools, model=model, temperature=temperature, max_tokens=max_tokens
@@ -421,6 +440,8 @@ class TracingClient(LLMClient):
                     model=self._inner.last_model,
                     input_messages=messages,
                     output=None,
+                    started_at=started_at,
+                    ended_at=datetime.now(UTC),
                     usage=self._inner.last_usage,
                     error=repr(exc),
                 )
@@ -434,6 +455,8 @@ class TracingClient(LLMClient):
                 model=self._inner.last_model,
                 input_messages=messages,
                 output=result.content,
+                started_at=started_at,
+                ended_at=datetime.now(UTC),
                 tool_calls=list(result.tool_calls),
                 usage=result.usage,
             )
@@ -454,6 +477,7 @@ class TracingClient(LLMClient):
         # streaming-with-tools thì đi đường đó; record ghi tại StreamDone.
         chunks: list[str] = []
         done: StreamDone | None = None
+        started_at = datetime.now(UTC)
         try:
             async for event in self._inner.step_stream(
                 messages,
@@ -477,6 +501,8 @@ class TracingClient(LLMClient):
                     model=self._inner.last_model,
                     input_messages=messages,
                     output="".join(chunks) or None,
+                    started_at=started_at,
+                    ended_at=datetime.now(UTC),
                     usage=self._inner.last_usage,
                     error=repr(exc),
                 )
@@ -490,6 +516,8 @@ class TracingClient(LLMClient):
                 model=self._inner.last_model,
                 input_messages=messages,
                 output="".join(chunks) or None,
+                started_at=started_at,
+                ended_at=datetime.now(UTC),
                 tool_calls=list(done.accumulated_tool_calls) if done else [],
                 usage=done.usage if done else self._inner.last_usage,
             )

@@ -33,10 +33,15 @@ class LangfuseSink:
         self._client = Langfuse(public_key=public_key, secret_key=secret_key, host=host)
 
     def record(self, gen: GenerationRecord) -> None:
-        trace = self._client.trace(name=f"llm.{gen.op}")
+        # Trace + generation cùng start_time để UI grouping timeline chuẩn. Nếu để SDK
+        # tự stamp (không pass), trace = t0, generation = t0+ε → span 0-duration →
+        # cột End Time trống + Latency null trên UI.
+        trace = self._client.trace(name=f"llm.{gen.op}", start_time=gen.started_at)
         trace.generation(
             name=gen.op,
             model=gen.model,
+            start_time=gen.started_at,
+            end_time=gen.ended_at,
             input=gen.input_messages,
             output=gen.output
             if not gen.tool_calls
