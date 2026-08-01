@@ -164,6 +164,7 @@ class PIIFilteringClient(LLMClient):
             redacted, model=model, temperature=temperature, max_tokens=max_tokens
         )
         self.last_usage = self._inner.last_usage
+        self.last_model = self._inner.last_model
         return result
 
     async def step(
@@ -184,6 +185,7 @@ class PIIFilteringClient(LLMClient):
             max_tokens=max_tokens,
         )
         self.last_usage = self._inner.last_usage
+        self.last_model = self._inner.last_model
         return result
 
     async def step_stream(
@@ -212,6 +214,7 @@ class PIIFilteringClient(LLMClient):
         ):
             yield event
         self.last_usage = self._inner.last_usage
+        self.last_model = self._inner.last_model
 
     def stream(
         self,

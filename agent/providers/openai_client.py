@@ -174,8 +174,11 @@ class OpenAIClient(LLMClient):
     ) -> AsyncIterator[str]:
         # Reset side-channel; populated from the final usage chunk below (spec 25 P1).
         self.last_usage = None
+        resolved_model = model or self._default_model
+        # Set BEFORE await để nếu provider raise, tracer vẫn có model để ghi record error.
+        self.last_model = resolved_model
         raw = await self._create(
-            model=model or self._default_model,
+            model=resolved_model,
             messages=_to_openai_messages(messages),
             temperature=temperature,
             max_tokens=max_tokens,
@@ -206,8 +209,10 @@ class OpenAIClient(LLMClient):
         max_tokens: int | None = None,
     ) -> str:
         self.last_usage = None
+        resolved_model = model or self._default_model
+        self.last_model = resolved_model
         resp = await self._create(
-            model=model or self._default_model,
+            model=resolved_model,
             messages=_to_openai_messages(messages),
             temperature=temperature,
             max_tokens=max_tokens,
@@ -228,12 +233,14 @@ class OpenAIClient(LLMClient):
         max_tokens: int | None = None,
     ) -> AssistantStep:
         self.last_usage = None
+        resolved_model = model or self._default_model
+        self.last_model = resolved_model
         openai_tools = _to_openai_tools(tools)
         kwargs: dict[str, Any] = {}
         if openai_tools is not None:
             kwargs["tools"] = openai_tools
         resp = await self._create(
-            model=model or self._default_model,
+            model=resolved_model,
             messages=_to_openai_messages(messages),
             temperature=temperature,
             max_tokens=max_tokens,
@@ -277,6 +284,8 @@ class OpenAIClient(LLMClient):
         - emits exactly one `StreamDone` at end with finish_reason, parsed tool_calls, usage.
         """
         self.last_usage = None
+        resolved_model = model or self._default_model
+        self.last_model = resolved_model
         openai_tools = _to_openai_tools(tools)
         kwargs: dict[str, Any] = {}
         if openai_tools is not None:
@@ -284,13 +293,13 @@ class OpenAIClient(LLMClient):
         # Reasoning-mode (CoT on a separate `delta.reasoning` channel). Only request extra_body for
         # a model known to support it — else gpt-4o/other could reject the call. The tier gate is
         # upstream (orchestrator); `reasoning` already encodes "mode==pro_only and tier==pro".
-        if reasoning and (model or self._default_model) in get_settings().reasoning_models:
+        if reasoning and resolved_model in get_settings().reasoning_models:
             kwargs["extra_body"] = {
                 "reasoning": {"enabled": True},
                 "chat_template_kwargs": {"thinking": True},
             }
         raw = await self._create(
-            model=model or self._default_model,
+            model=resolved_model,
             messages=_to_openai_messages(messages),
             temperature=temperature,
             max_tokens=max_tokens,

@@ -28,25 +28,34 @@ from agent.llm_client import (
 _RAW_PHONE = "0912345678"  # khớp pattern `phone` của agent/pii.py — bị thay bằng [SĐT]
 
 
-class _FakeInner(LLMClient):
-    """Provider giả — trả lời cố định, ghi lại messages nó nhận."""
+_DEFAULT_MODEL = "fake-default-model-x"
 
-    def __init__(self) -> None:
+
+class _FakeInner(LLMClient):
+    """Provider giả — trả lời cố định, ghi lại messages nó nhận. Mô phỏng adapter thật:
+    set `last_model = model or default` đầu mỗi call (khớp OpenAIClient contract), để
+    TracingClient đọc được model đã RESOLVE thay vì tham số `None` từ wrapper."""
+
+    def __init__(self, default_model: str = _DEFAULT_MODEL) -> None:
         super().__init__()
         self.seen: list[list[ChatMessage]] = []
+        self._default_model = default_model
 
-    async def stream(self, messages, **kw: Any):  # type: ignore[no-untyped-def, override]
+    async def stream(self, messages, *, model=None, **kw: Any):  # type: ignore[no-untyped-def, override]
         self.seen.append(messages)
+        self.last_model = model or self._default_model
         self.last_usage = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
         yield "ok"
 
-    async def complete(self, messages, **kw: Any) -> str:  # type: ignore[no-untyped-def, override]
+    async def complete(self, messages, *, model=None, **kw: Any) -> str:  # type: ignore[no-untyped-def, override]
         self.seen.append(messages)
+        self.last_model = model or self._default_model
         self.last_usage = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
         return "ok"
 
-    async def step(self, messages, **kw: Any) -> AssistantStep:  # type: ignore[no-untyped-def, override]
+    async def step(self, messages, *, model=None, **kw: Any) -> AssistantStep:  # type: ignore[no-untyped-def, override]
         self.seen.append(messages)
+        self.last_model = model or self._default_model
         self.last_usage = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
         return AssistantStep(content="ok", usage=self.last_usage)
 
@@ -146,6 +155,87 @@ def test_factory_without_keys_has_no_tracing_layer(monkeypatch: pytest.MonkeyPat
         )
     finally:
         get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_tracing_records_resolved_model_when_caller_omits_it() -> None:
+    """Bug đã tồn tại pre-fix: call-site `.step(messages)` KHÔNG truyền `model=`, wrapper
+    có `model=None` ở signature, `TracingClient` ghi `GenerationRecord.model=model` (=None).
+    Sink Langfuse group "Model Costs" theo tên model — `None` không match ⇒ "No data".
+
+    Fix: adapter set `self.last_model = resolved` đầu mỗi call, `TracingClient` đọc từ
+    `self._inner.last_model` thay cho tham số. Test này bắt regress bằng cách gọi cả 4 op
+    KHÔNG truyền `model=` và assert record có model non-None và bằng default của inner."""
+    inner = _FakeInner()
+    sink = _CollectingSink()
+    client = TracingClient(inner, sink)
+
+    await client.complete(_msgs("a"))
+    async for _ in client.stream(_msgs("b")):
+        pass
+    await client.step(_msgs("c"))
+    async for _ in client.step_stream(_msgs("d")):
+        pass
+
+    assert [r.op for r in sink.records] == ["complete", "stream", "step", "step_stream"]
+    # Trước fix: model=None ở tất cả record. Sau fix: model = last_model của adapter.
+    assert all(r.model == _DEFAULT_MODEL for r in sink.records), (
+        f"model=None trong record: Langfuse sẽ hiện 'No data' ở Model Costs. "
+        f"Records: {[(r.op, r.model) for r in sink.records]}"
+    )
+    # `last_model` cũng phải mirror xuyên tầng (cùng bài `last_usage`).
+    assert client.last_model == inner.last_model == _DEFAULT_MODEL
+
+
+@pytest.mark.asyncio
+async def test_tracing_records_explicit_model_when_caller_passes_it() -> None:
+    """Caller truyền `model="claude-x"` ⇒ adapter set `last_model = "claude-x"`, tracer
+    echo. Đảm bảo fix không hardcode default — override thứ nhất vẫn thắng."""
+    inner = _FakeInner()
+    sink = _CollectingSink()
+    client = TracingClient(inner, sink)
+
+    await client.step(_msgs("hi"), model="claude-sonnet-explicit")
+
+    assert sink.records[0].model == "claude-sonnet-explicit"
+    assert client.last_model == "claude-sonnet-explicit"
+
+
+@pytest.mark.asyncio
+async def test_provider_error_still_records_resolved_model() -> None:
+    """Adapter set `last_model` TRƯỚC await. Provider raise ⇒ record error vẫn ghi model
+    thật, không mất traceability cho traces lỗi. Test này khoá đúng vị trí `self.last_model
+    = resolved_model` phải NẰM TRƯỚC `await self._create(...)` trong adapter."""
+
+    class _BoomAfterModelSet(_FakeInner):
+        async def step(  # type: ignore[override]
+            self, messages, *, model=None, **kw: Any
+        ) -> AssistantStep:
+            # Mô phỏng đúng adapter: set last_model trước, rồi raise ở "network".
+            self.last_model = model or self._default_model
+            raise RuntimeError("provider timeout")
+
+    sink = _CollectingSink()
+    client = TracingClient(_BoomAfterModelSet(), sink)
+    with pytest.raises(RuntimeError, match="provider timeout"):
+        await client.step(_msgs("x"))
+    assert sink.records[0].error is not None
+    assert sink.records[0].model == _DEFAULT_MODEL, (
+        "record error path phải giữ model — nếu None thì trace lỗi mất context"
+    )
+
+
+@pytest.mark.asyncio
+async def test_last_model_mirrored_through_pii_wrapper() -> None:
+    """`PIIFilteringClient(TracingClient(inner))` — contract mirror xuyên tầng. Consumer
+    bên ngoài (orchestrator, endpoint) đọc `client.last_model` phải nhận value thật, không
+    None. Cùng bài `last_usage` mirror sẵn có."""
+    from agent.pii_client import PIIFilteringClient
+
+    inner = _FakeInner()
+    client = PIIFilteringClient(TracingClient(inner, _CollectingSink()))
+    await client.step(_msgs("hello"))
+    assert client.last_model == _DEFAULT_MODEL
 
 
 def test_factory_with_keys_wraps_pii_outside_tracing(monkeypatch: pytest.MonkeyPatch) -> None:

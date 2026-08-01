@@ -140,11 +140,23 @@ class LLMClient(ABC):
     `self.last_usage = {prompt_tokens, completion_tokens, total_tokens, cached_tokens} | None` at
     the end of every call (`cached_tokens` = provider prompt-cache hits, spec 44 P1; 0 when
     unreported). It mirrors `AssistantStep.usage` for uniform reads on `step()`.
-    Orchestrator reads after each call. Single-turn orderly access; not thread-safe across turns."""
+    Orchestrator reads after each call. Single-turn orderly access; not thread-safe across turns.
+
+    MODEL CAPTURE: `last_model` side-channel — cùng bài `last_usage` — expose model đã RESOLVE
+    (sau khi adapter apply `model or self._default_model`). Vì sao cần: `TracingClient` bọc
+    ngoài chỉ thấy tham số `model=` mà caller truyền vào — mà mọi call-site production
+    (api.chat, api.assistant_chat, agent.drafter) gọi `.step(messages)` KHÔNG truyền model,
+    nên `TracingClient` không có model để đưa lên `GenerationRecord.model` → sink Langfuse
+    nhận `model=None` → "Model costs" / "Model Usage" report "No data" (Langfuse group theo
+    tên model). Adapter set `last_model` cuối mỗi call, tracer đọc từ `_inner.last_model`
+    thay cho tham số. Single-turn contract giống `last_usage`."""
 
     def __init__(self) -> None:
         # Side-channel for complete()/stream() usage; step() also mirrors here for uniform reads.
         self.last_usage: dict[str, int] | None = None
+        # Side-channel for resolved model name — set bởi adapter (`model or self._default_model`)
+        # để TracingClient/PIIFilteringClient đọc mà không phải re-derive default logic.
+        self.last_model: str | None = None
 
     @abstractmethod
     def stream(
@@ -324,10 +336,11 @@ class TracingClient(LLMClient):
                 yield delta
         except Exception as exc:
             self.last_usage = self._inner.last_usage
+            self.last_model = self._inner.last_model
             self._emit(
                 GenerationRecord(
                     op="stream",
-                    model=model,
+                    model=self._inner.last_model,
                     input_messages=messages,
                     output="".join(chunks) or None,
                     usage=self._inner.last_usage,
@@ -336,10 +349,11 @@ class TracingClient(LLMClient):
             )
             raise
         self.last_usage = self._inner.last_usage
+        self.last_model = self._inner.last_model
         self._emit(
             GenerationRecord(
                 op="stream",
-                model=model,
+                model=self._inner.last_model,
                 input_messages=messages,
                 output="".join(chunks),
                 usage=self._inner.last_usage,
@@ -360,10 +374,11 @@ class TracingClient(LLMClient):
             )
         except Exception as exc:
             self.last_usage = self._inner.last_usage
+            self.last_model = self._inner.last_model
             self._emit(
                 GenerationRecord(
                     op="complete",
-                    model=model,
+                    model=self._inner.last_model,
                     input_messages=messages,
                     output=None,
                     usage=self._inner.last_usage,
@@ -372,10 +387,11 @@ class TracingClient(LLMClient):
             )
             raise
         self.last_usage = self._inner.last_usage
+        self.last_model = self._inner.last_model
         self._emit(
             GenerationRecord(
                 op="complete",
-                model=model,
+                model=self._inner.last_model,
                 input_messages=messages,
                 output=out,
                 usage=self._inner.last_usage,
@@ -398,10 +414,11 @@ class TracingClient(LLMClient):
             )
         except Exception as exc:
             self.last_usage = self._inner.last_usage
+            self.last_model = self._inner.last_model
             self._emit(
                 GenerationRecord(
                     op="step",
-                    model=model,
+                    model=self._inner.last_model,
                     input_messages=messages,
                     output=None,
                     usage=self._inner.last_usage,
@@ -410,10 +427,11 @@ class TracingClient(LLMClient):
             )
             raise
         self.last_usage = self._inner.last_usage
+        self.last_model = self._inner.last_model
         self._emit(
             GenerationRecord(
                 op="step",
-                model=model,
+                model=self._inner.last_model,
                 input_messages=messages,
                 output=result.content,
                 tool_calls=list(result.tool_calls),
@@ -452,10 +470,11 @@ class TracingClient(LLMClient):
                 yield event
         except Exception as exc:
             self.last_usage = self._inner.last_usage
+            self.last_model = self._inner.last_model
             self._emit(
                 GenerationRecord(
                     op="step_stream",
-                    model=model,
+                    model=self._inner.last_model,
                     input_messages=messages,
                     output="".join(chunks) or None,
                     usage=self._inner.last_usage,
@@ -464,10 +483,11 @@ class TracingClient(LLMClient):
             )
             raise
         self.last_usage = self._inner.last_usage
+        self.last_model = self._inner.last_model
         self._emit(
             GenerationRecord(
                 op="step_stream",
-                model=model,
+                model=self._inner.last_model,
                 input_messages=messages,
                 output="".join(chunks) or None,
                 tool_calls=list(done.accumulated_tool_calls) if done else [],
