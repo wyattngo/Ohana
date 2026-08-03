@@ -54,6 +54,12 @@ services:
       SALT: ${LANGFUSE_SALT}
       TELEMETRY_ENABLED: "false"
     ports: ["3000:3000"]
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 1G
     depends_on:
       langfuse-db:
         condition: service_healthy

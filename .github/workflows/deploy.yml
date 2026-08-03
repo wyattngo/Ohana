@@ -1,0 +1,100 @@
+name: Deploy to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+      image_tag:
+        description: 'Docker image tag (SHA or latest)'
+        required: true
+        default: 'latest'
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event.inputs.environment }}
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to ${{ github.event.inputs.environment }}
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          IMAGE_TAG: ${{ github.event.inputs.image_tag }}
+          DOCKER_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKER_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p $DEPLOY_PORT $DEPLOY_HOST >> ~/.ssh/known_hosts 2>/dev/null || true
+
+          ssh -i ~/.ssh/deploy_key -p $DEPLOY_PORT $DEPLOY_USER@$DEPLOY_HOST << 'EOF'
+            set -e
+            cd /opt/ohana-be
+
+            # Load environment
+            export $(grep -v '^#' .env.prod | xargs)
+
+            # Pull latest images
+            echo "Pulling images..."
+            docker login -u "$DOCKER_USERNAME" -p "$DOCKER_TOKEN" || true
+            docker pull $DOCKER_USERNAME/ohana-be:$IMAGE_TAG
+            docker pull $DOCKER_USERNAME/ohana-web:$IMAGE_TAG
+
+            # Run migrations
+            echo "Running migrations..."
+            docker compose -f docker-compose.prod.yml --profile migrate up \
+              --exit-code-from ohana-migrate --remove-orphans
+
+            # Run bootstrap (idempotent, safe to run repeatedly)
+            echo "Running bootstrap..."
+            docker compose -f docker-compose.prod.yml --profile bootstrap up \
+              --exit-code-from ohana-bootstrap --remove-orphans || true
+
+            # Verify contract tests
+            echo "Verifying isolation gates..."
+            python -m pytest tests/contract/ -q
+
+            # Update images in compose
+            sed -i "s|image:.*ohana-be:.*|image: $DOCKER_USERNAME/ohana-be:$IMAGE_TAG|g" docker-compose.prod.yml
+            sed -i "s|image:.*ohana-web:.*|image: $DOCKER_USERNAME/ohana-web:$IMAGE_TAG|g" docker-compose.prod.yml
+
+            # Restart services
+            echo "Restarting services..."
+            docker compose -f docker-compose.prod.yml up -d \
+              postgres redis langfuse-db langfuse \
+              ohana-ai ohana-seller ohana-worker nginx
+
+            # Health checks
+            echo "Waiting for services to become healthy..."
+            sleep 10
+            docker compose -f docker-compose.prod.yml ps
+
+            # Verify endpoints
+            echo "Verifying health endpoints..."
+            curl -sf http://127.0.0.1:8001/health || exit 1
+            curl -sf http://127.0.0.1:8002/health || exit 1
+
+            echo "✓ Deployment successful"
+          EOF
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "Deployment failed! Check logs above."
+          exit 1

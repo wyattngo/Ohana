@@ -1,0 +1,8 @@
+# Daily backup setup
+# Add to crontab: crontab -e
+# Then add this line:
+
+0 2 * * * cd /opt/ohana-be && /opt/ohana-be/scripts/backup.sh >> /var/log/ohana-backup.log 2>&1
+
+# Weekly password rotation reminder (optional)
+0 3 * * 1 echo "Reminder: Rotate database passwords if needed" | mail -s "Ohana DB Password Rotation" ops@example.com
