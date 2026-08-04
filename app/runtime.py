@@ -41,10 +41,16 @@ def setup_logging() -> None:
 
 
 # CSRF (double-submit cookie). Chỉ check request mutating dưới /api. `/api/mock/authorize`
-# miễn: đó là route bootstrap MINT ra session (và chính CSRF cookie) — chưa có session
-# nào cho một forged cross-site POST cưỡi lên, và đòi header ở đây làm route không gọi
-# được từ browser sạch cookie.
-_CSRF_EXEMPT_PATHS = {"/api/mock/authorize"}
+# và `/api/mock/authorize_user` (P2.4a, Tầng 2) miễn: cả hai là route bootstrap MINT ra
+# session (và chính CSRF cookie) — chưa có session nào cho một forged cross-site POST cưỡi
+# lên, và đòi header ở đây làm route không gọi được từ browser sạch cookie.
+#
+# Cháy thật 2026-08-04: F1 thêm `authorize_user` mà quên thêm vào set này — route mint
+# CHÍNH nó bị middleware nó cần miễn chặn 403 `csrf_check_failed` (F1's own unit test không
+# bắt được vì `_make_app()` ở đó chỉ mount router trần, không gắn `install_csrf`). Lý do
+# miễn giống hệt route kia, không phải trường hợp riêng — khi thêm route mint thứ ba thì
+# soi lại comment này trước, đừng chỉ thêm route rồi test router trần.
+_CSRF_EXEMPT_PATHS = {"/api/mock/authorize", "/api/mock/authorize_user"}
 _CSRF_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 

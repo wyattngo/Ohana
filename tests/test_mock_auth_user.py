@@ -4,6 +4,8 @@ Cover:
 - 404 outside dev (fail-closed như `/mock/authorize`).
 - 422 invalid tier.
 - Happy path: mint token verify được bằng `verify_user_token` với `get_jwt_secret()`.
+- CSRF exemption qua APP THẬT (regression — xem `test_authorize_user_is_csrf_exempt...`
+  bên dưới cho lý do file này từng để lọt bug).
 """
 
 from __future__ import annotations
@@ -79,3 +81,28 @@ def test_authorize_user_default_tier_free(monkeypatch) -> None:
     session_cookie = resp.cookies.get(SESSION_COOKIE_NAME)
     identity = verify_user_token(session_cookie, secret=get_jwt_secret())
     assert identity.tier == "free"
+
+
+def test_authorize_user_is_csrf_exempt_through_the_real_app(monkeypatch) -> None:
+    """Regression cháy thật 2026-08-04: mọi test ở trên dựng `_make_app()` — router trần,
+    KHÔNG gắn `install_csrf` — nên cả bốn test kia xanh trong khi route thật 403 ngay lượt
+    gọi đầu tiên từ browser sạch cookie. `app/runtime.py`'s CSRF double-submit middleware
+    chặn MỌI POST không có cặp cookie/header khớp, và route mint không có cookie nào ở
+    lượt gọi đầu (nó CHÍNH LÀ nơi sinh ra cookie CSRF) — `_CSRF_EXEMPT_PATHS` quên thêm
+    `/api/mock/authorize_user` khi F1 thêm route này (chỉ có `/api/mock/authorize` từ P0).
+
+    Test này đi qua `app.main:app` THẬT (middleware đầy đủ), gọi với ZERO cookie — đúng
+    hệt trạng thái một tab trình duyệt mới mở — và đòi 200, không phải 403
+    `csrf_check_failed`. Bug này gate-được ở đây vì dùng app thật; không gate được ở bốn
+    test phía trên vì chúng cố tình bare-router (đơn vị, không phải tích hợp)."""
+    monkeypatch.setenv("OHANA_ENV", "dev")
+    monkeypatch.setenv("OHANA_JWT_SECRET", "test-secret-p24a")
+    from app.main import app
+
+    with TestClient(app) as client:
+        resp = client.post("/api/mock/authorize_user?tier=free")
+
+    assert resp.status_code == 200, (
+        f"route mint bị CSRF middleware tự chặn chính nó (status={resp.status_code}, "
+        f"body={resp.text!r}) — thiếu trong _CSRF_EXEMPT_PATHS (app/runtime.py)"
+    )
