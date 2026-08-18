@@ -1,161 +1,147 @@
-# deploy/ — docker-compose production
+# Deployment Pipeline for Ohana BE
 
-Đóng gói Ohana BE thành 1 stack docker-compose để `docker compose up -d` là chạy.
+This directory contains deployment automation and documentation for Ohana BE across environments.
 
-## Nội dung
+## Files
 
-| File | Việc |
-|---|---|
-| `../Dockerfile` | Backend Python 3.11 image (dùng chung cho 3 process) |
-| `../web/Dockerfile` | Frontend build (Node 20 + pnpm@10) → nginx 1.27 serve |
-| `../docker-compose.prod.yml` | Stack chính — infra + 3 backend + 1 nginx, 2 profile one-shot |
-| `../.dockerignore` | Cấm .git/.venv/tests/docs/.env vào image |
-| `deploy/nginx.conf` | Reverse proxy 443 → 2 uvicorn upstream + SPA fallback |
-| `deploy/entrypoint.sh` | Chờ postgres healthy → exec CMD (KHÔNG auto-migrate) |
-| `deploy/.env.prod.example` | Template 32 biến, copy sang `.env.prod` (root repo) |
+- **ci.yml** — GitHub Actions workflow for testing, linting, type checking, and building Docker images
+- **deploy.yml** — GitHub Actions workflow for deploying to staging/production with safety checks
+- **deploy.sh** — Local deployment helper script
 
-## Chạy lần đầu (cluster mới)
+## Quick Start
 
+### 1. Set up GitHub secrets (one-time)
+
+In your GitHub repository settings, add:
+
+| Secret | Purpose |
+|--------|---------|
+| `DOCKERHUB_USERNAME` | Docker Hub account for image registry |
+| `DOCKERHUB_TOKEN` | Docker Hub token (personal access token) |
+| `DEPLOY_HOST` | Production/staging server hostname or IP |
+| `DEPLOY_USER` | SSH user (e.g., `deploy`) |
+| `DEPLOY_PORT` | SSH port (default `22`) |
+| `DEPLOY_KEY` | SSH private key (base64 or PEM) |
+
+**Generate deploy key:**
 ```bash
-# 1. Env — tạo .env.prod, sinh password HEX
-cp deploy/.env.prod.example .env.prod
-for k in POSTGRES_PW MIGRATOR_PW SVC_A_PW SVC_B_PW MCP_RO_PW \
-         LANGFUSE_DB_PW LANGFUSE_NEXTAUTH_SECRET LANGFUSE_SALT; do
-  echo "$k=$(openssl rand -hex 24)" >> .env.prod
-done
-# Điền tay: ANTHROPIC_API_KEY, TOGETHER_API_KEY, APP_VERSION, ...
-
-# 2. Cert Let's Encrypt (chạy trên HOST, không trong compose)
-sudo apt install certbot
-sudo certbot certonly --standalone -d api.ohana.example
-# Sửa deploy/nginx.conf: đổi `api.ohana.example` sang domain thật
-
-# 3. Build + kéo image infra
-docker compose -f docker-compose.prod.yml build
-docker compose -f docker-compose.prod.yml pull postgres redis langfuse langfuse-db
-
-# 4. Infra lên trước
-docker compose -f docker-compose.prod.yml up -d postgres redis langfuse-db langfuse
-
-# 5. Bootstrap 4 role Postgres — 1 lần, opt-in profile
-docker compose -f docker-compose.prod.yml --profile bootstrap up ohana-bootstrap
-# Exit 0 = OK. Xem log: "role ok: {ohana_migrator, svc_ohana_ai, svc_seller, mcp_readonly}"
-
-# 6. Migrate — opt-in profile
-docker compose -f docker-compose.prod.yml --profile migrate up ohana-migrate
-# Exit 0 = OK
-
-# 7. Backend + nginx lên
-docker compose -f docker-compose.prod.yml up -d ohana-ai ohana-seller ohana-worker nginx
-docker compose -f docker-compose.prod.yml ps      # 8 service, tất cả healthy
-
-# 8. Verify
-curl -sf https://api.ohana.example/health          # nginx → SPA
-docker compose -f docker-compose.prod.yml exec ohana-ai curl -sf http://127.0.0.1:8001/health
-docker compose -f docker-compose.prod.yml exec ohana-seller curl -sf http://127.0.0.1:8002/health
+ssh-keygen -t ed25519 -f /tmp/deploy_key -N ""
+cat /tmp/deploy_key | base64 -w0  # Copy into DEPLOY_KEY secret
 ```
 
-## Deploy code mới (routine)
+Then add public key to target server's `~/.ssh/authorized_keys`.
 
+### 2. Merge to main branch
+
+- Push to `develop` for testing
+- Open PR and ensure CI passes
+- Merge to `main` → images auto-build and push to Docker Hub
+
+### 3. Deploy
+
+**Option A: Via GitHub UI**
+- Go to **Actions → Deploy to Production**
+- Click **Run workflow**
+- Select environment (staging/production) and image tag
+
+**Option B: Via CLI**
 ```bash
-git pull --ff-only origin main
+./scripts/deploy.sh production latest
+```
 
-# Có migration mới?
-ls db/migrations/versions/ | tail -3
-# Nếu có ⇒ chạy migrate TRƯỚC restart backend
-docker compose -f docker-compose.prod.yml build ohana-migrate
-docker compose -f docker-compose.prod.yml --profile migrate up ohana-migrate
+**Option C: Manual SSH**
+```bash
+ssh deploy@prod.example.com
+cd /opt/ohana-be
+docker compose -f docker-compose.prod.yml pull
+docker compose -f docker-compose.prod.yml up -d
+```
 
-# Rebuild + rolling restart
-docker compose -f docker-compose.prod.yml build ohana-ai ohana-seller ohana-worker nginx
-docker compose -f docker-compose.prod.yml up -d ohana-ai ohana-seller ohana-worker nginx
+## Pipeline Stages
 
-# Verify (checklist §Smoke test trong /engineering:deploy-checklist output)
+### 1. CI (on every push)
+- ✓ Lint with `ruff`
+- ✓ Type check with `mypy`
+- ✓ Import structure validation with `lint-imports`
+- ✓ Run pytest suite
+- ✓ Verify isolation contracts
+
+### 2. Build (on main branch only)
+- ✓ Build backend image (Python + FastAPI)
+- ✓ Build frontend image (Node + Vite)
+- ✓ Push to Docker Hub with SHA tag and `latest`
+
+### 3. Deploy (manual trigger)
+- ✓ SSH into target server
+- ✓ Pull latest images
+- ✓ Run Alembic migrations
+- ✓ Run bootstrap (idempotent)
+- ✓ Verify isolation contracts on target
+- ✓ Update docker-compose.prod.yml
+- ✓ Restart services with healthchecks
+- ✓ Verify endpoints respond
+
+## Monitoring
+
+### During deployment
+```bash
+# Watch logs
+ssh deploy@prod.example.com
+docker compose -f docker-compose.prod.yml logs -f
+
+# Check service health
+docker compose -f docker-compose.prod.yml ps
+```
+
+### Post-deployment
+```bash
+# Verify healthchecks
+curl -sf https://api.example.com/health
+
+# Check database
+docker compose -f docker-compose.prod.yml exec postgres psql -U ohana -c "SELECT VERSION();"
+
+# Verify isolation
+pytest tests/contract/ -q
 ```
 
 ## Rollback
 
-```bash
-git reset --hard <prev-sha>
-# Nếu migration mới cần downgrade:
-docker compose -f docker-compose.prod.yml --profile migrate run --rm ohana-migrate \
-  alembic downgrade <prev-revision>
-# Rebuild + restart
-docker compose -f docker-compose.prod.yml build ohana-ai ohana-seller ohana-worker
-docker compose -f docker-compose.prod.yml up -d ohana-ai ohana-seller ohana-worker
-```
-
-Downgrade vỡ ⇒ `pg_restore` từ dump (DEPLOY.md §12).
-
-## Backup Postgres (cron trên host)
+If deployment fails:
 
 ```bash
-# /etc/cron.d/ohana-pg-backup
-0 3 * * *  root  docker compose -f /opt/ohana-be/docker-compose.prod.yml exec -T postgres \
-  pg_dump -Fc -U ohana ohana > /backups/ohana_$(date +\%F).dump
+ssh deploy@prod.example.com
+cd /opt/ohana-be
+
+# Restore previous image tag
+sed -i 's|:latest|:PREVIOUS_SHA|g' docker-compose.prod.yml
+
+# Restart
+docker compose -f docker-compose.prod.yml up -d
+
+# Verify
+docker compose -f docker-compose.prod.yml ps
+curl -sf http://127.0.0.1:8001/health
 ```
 
-Rotate: `find /backups -name 'ohana_*.dump' -mtime +30 -delete`.
+## Secrets management
 
-## Renew cert (cron trên host, không trong compose)
+All sensitive values are stored in:
+- **GitHub Secrets** — for CI/CD workflows
+- **.env.prod** — on target server (never committed)
+- **SSH private key** — on your machine, in `~/.ssh/deploy_key`
 
-```bash
-# certbot cài trên host. Renew reload nginx container.
-0 4 * * *  root  certbot renew --quiet --deploy-hook \
-  "docker compose -f /opt/ohana-be/docker-compose.prod.yml exec nginx nginx -s reload"
-```
+Never commit `.env.prod` or private keys to git.
 
-## Kiến trúc
+## Troubleshooting
 
-```
-                        Internet (443)
-                              │
-                              ▼
-                       ┌─────────────┐
-                       │  nginx      │  TLS terminate + SPA fallback
-                       │  (web/      │
-                       │   Dockerfile│
-                       │   builds    │
-                       │   SPA)      │
-                       └──┬───┬──┬───┘
-              /api/chat   │   │  │   /api/inbox
-           /api/assistant │   │  │   /api/admin
-                          │   │  │   /webhook
-                          ▼   │  ▼
-                ┌──────────┐  │ ┌─────────────┐
-                │ ohana-ai │  │ │ohana-seller │
-                │  :8001   │  │ │  :8002      │
-                │ svc_ohana│  │ │ svc_seller  │
-                │   _ai    │  │ │             │
-                └────┬─────┘  │ └──────┬──────┘
-                     │        │        │
-                     │        │        ▼
-                     │        │  ┌─────────────┐
-                     │        │  │ohana-worker │
-                     │        │  │ (no port)   │
-                     │        │  │ svc_seller  │
-                     │        │  └──────┬──────┘
-                     ▼        │         │
-                ┌─────────────┴─────────┴─────┐
-                │      postgres:16            │
-                │  (pgvector, isolated by     │
-                │   role grant — I2/I14)      │
-                └─────────────────────────────┘
-                                              
-                ┌─────────────┐   ┌───────────────┐
-                │  redis:7    │   │  langfuse:2   │
-                │ (counter,   │   │ (self-host,   │
-                │  no persist)│   │  UI :3000     │
-                │             │   │  localhost    │
-                │             │   │  only)        │
-                └─────────────┘   └───────────────┘
-```
+| Issue | Solution |
+|-------|----------|
+| CI fails on lint | Run `ruff check --fix .` locally and commit |
+| CI fails on type check | Run `mypy api agent app ...` to see errors |
+| Deploy fails on SSH | Verify `DEPLOY_KEY` is PEM format, host is reachable |
+| Deploy fails on migration | Check logs: `docker compose logs ohana-migrate` |
+| Services won't start | Verify `.env.prod` has all 32 required vars |
+| Healthchecks failing | Check logs: `docker compose logs ohana-ai`, `curl -v http://127.0.0.1:8001/health` |
 
-## Chưa làm — backlog
-
-- **CI auto-build + push image** — hiện `build:` local. Chuyển sang GHCR/Docker Hub khi có CI budget.
-- **Blue-green / rolling multi-replica** — hiện restart = 5s downtime. Muốn zero-downtime cần thêm HAProxy hoặc traefik với health-check-based routing.
-- **Prometheus + Grafana + Loki** — hiện log = `docker compose logs`. Alerting = mắt người.
-- **Auto-rotate password DB** — hiện thủ công `ALTER ROLE` + edit `.env.prod` + restart.
-- **Multi-host** — 1 container = 1 host hiện tại. Chuyển swarm/k8s khi có > 1 node.
-- **Certbot vào compose** — hiện chạy trên host. Đóng gói vào chỉ khi mất quyền host.
+See [DEPLOY.md](../DEPLOY.md) for full deployment guide.

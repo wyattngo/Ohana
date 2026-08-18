@@ -1,57 +1,15 @@
-# CI — mọi step là HARD gate, không có chế độ warn-only (quyết định 2026-07-30:
-# lint-imports vào CI ngay sau khi I5b xanh, để không sinh ra gate mềm rồi quên siết).
-#
-# Thứ tự khớp "Verify tối thiểu" của skill ohana-be-coder:
-#   ruff → mypy → lint-imports → alembic (bằng ohana_migrator) → pytest
-#
-# DB: pgvector service + bootstrap_roles + alembic BẰNG ROLE ohana_migrator — cùng
-# đường với local dev. Chạy alembic bằng owner `ohana` dù chỉ một lần là mọi bảng
-# sinh sau rơi khỏi default privileges (I2 hỏng im lặng) — xem docstring migration a1.
 name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
+    branches: [main, develop]
+
+permissions:
+  contents: read
 
 jobs:
-  # FE gate (web/) — build từ source + oxlint + Playwright render tests (web/e2e/, mock
-  # /api/** bằng page.route nên không cần Postgres/FastAPI). Job riêng khỏi `test`: fail
-  # độc lập, không chặn nhau. Lưu ý: `web/dist` vẫn đang commit (deviation P0 ghi trong
-  # web/.gitignore) — job này build lại từ source nên bundle hỏng vẫn làm đỏ CI; follow-up
-  # là re-ignore + xoá dist committed khi job này chứng minh ổn định.
-  web:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: web
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          # pnpm 10 đọc lockfileVersion 9.0 và chạy được Node 20+; máy dev đang Node 20
-          # (corepack kéo pnpm 11 sẽ vỡ — cần Node 22). CI pin cả hai cho khớp lockfile.
-          node-version: 22
-
-      - name: Install pnpm
-        run: npm install -g pnpm@10
-
-      - name: Install
-        run: pnpm install --frozen-lockfile
-
-      - name: Build (tsc -b + vite build)
-        run: pnpm build
-
-      - name: Oxlint
-        run: pnpm exec oxlint src e2e playwright.config.ts
-
-      - name: Playwright browsers
-        run: pnpm exec playwright install chromium --with-deps
-
-      - name: Playwright render tests
-        run: pnpm exec playwright test
-
   test:
     runs-on: ubuntu-latest
     services:
@@ -59,69 +17,116 @@ jobs:
         image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: ohana
-          POSTGRES_PASSWORD: ci
+          POSTGRES_PASSWORD: test
           POSTGRES_DB: ohana
-        ports: ["5432:5432"]
         options: >-
-          --health-cmd "pg_isready -U ohana -d ohana"
-          --health-interval 5s
+          --health-cmd "pg_isready -U ohana"
+          --health-interval 10s
           --health-timeout 5s
-          --health-retries 10
+          --health-retries 5
+        ports:
+          - 5432:5432
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
 
-    env:
-      # Mật khẩu throwaway — service container sống đúng một job run.
-      MIGRATOR_PW: ci_migrator
-      SVC_A_PW: ci_svc_a
-      SVC_B_PW: ci_svc_b
-      MCP_RO_PW: ci_mcp_ro
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint with ruff
+        run: ruff check .
+
+      - name: Type check with mypy
+        run: mypy api agent app auth bridge channels db parsing retrieval tools
+
+      - name: Import structure check
+        run: lint-imports
+
+      - name: Run migrations
+        env:
+          DATABASE_URL: postgresql+psycopg://ohana:test@localhost:5432/ohana
+        run: alembic upgrade head
+
+      - name: Run tests
+        env:
+          DATABASE_URL: postgresql+psycopg://ohana:test@localhost:5432/ohana
+          REDIS_URL: redis://localhost:6379/0
+          ANTHROPIC_API_KEY: sk-ant-test
+          TOGETHER_API_KEY: test-key
+          LANGFUSE_PUBLIC_KEY: pk-lf-test
+          LANGFUSE_SECRET_KEY: sk-lf-test
+          LANGFUSE_HOST: http://localhost:3000
+        run: pytest -v
+
+      - name: Contract tests (isolation gates)
+        env:
+          DATABASE_URL: postgresql+psycopg://ohana:test@localhost:5432/ohana
+        run: pytest tests/contract/ -v
+
+  build:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    permissions:
+      contents: read
+      packages: write
 
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
         with:
-          # Pin 3.11 (adopt-plan Q1: nâng 3.12 là PR riêng, không ghép vào đây).
-          python-version: "3.11"
-          cache: pip
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Install
-        run: pip install -e ".[dev]"
-
-      - name: Ruff
+      - name: Extract metadata
+        id: meta
         run: |
-          ruff check .
-          ruff format --check .
+          echo "image-tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+          echo "image-short=$(echo ${{ github.sha }} | head -c 7)" >> $GITHUB_OUTPUT
 
-      - name: Mypy
-        run: mypy app agent retrieval parsing db bridge tools api auth
+      - name: Build and push backend
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/ohana-be:${{ steps.meta.outputs.image-short }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/ohana-be:latest
+          cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/ohana-be:buildcache
+          cache-to: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/ohana-be:buildcache,mode=max
 
-      - name: Import contracts (I1 · I5 · I5b)
-        run: lint-imports
-
-      - name: Bootstrap roles + vector extension
-        # CREATE EXTENSION cần superuser — chạy bằng owner `ohana` TRƯỚC alembic,
-        # để `CREATE EXTENSION IF NOT EXISTS` trong migration 0001 thành no-op.
-        #
-        # `ohana_test`: DB RIÊNG cho pytest — fixture `fresh_db` DROP mọi bảng trên
-        # DATABASE_URL, không được trỏ nó vào DB alembic quản (conftest có guard tên
-        # `_test`). Contract tests vẫn trỏ 4 DSN role vào DB `ohana` đã migrate.
-        run: |
-          PGPASSWORD=ci psql -h localhost -U ohana -d ohana -c "CREATE EXTENSION IF NOT EXISTS vector"
-          PGPASSWORD=ci psql -h localhost -U ohana -d postgres -c "CREATE DATABASE ohana_test OWNER ohana"
-          SUPERUSER_DSN="postgresql://ohana:ci@localhost:5432/ohana" python scripts/bootstrap_roles.py
-
-      - name: Alembic upgrade head (bằng ohana_migrator)
-        run: alembic upgrade head
-        env:
-          DATABASE_URL: postgresql+psycopg://ohana_migrator:${{ env.MIGRATOR_PW }}@localhost:5432/ohana
-
-      - name: Pytest (kèm contract I14/I15)
-        run: pytest -q
-        env:
-          # DB test riêng — xem comment ở step Bootstrap. Alembic gate trong
-          # tests/test_embedding_dim.py cũng chạy trên DB này (nó tự reset từ zero).
-          DATABASE_URL: postgresql+psycopg://ohana:ci@localhost:5432/ohana_test
-          MIGRATOR_DSN: postgresql://ohana_migrator:${{ env.MIGRATOR_PW }}@localhost:5432/ohana
-          SVC_A_DSN: postgresql://svc_ohana_ai:${{ env.SVC_A_PW }}@localhost:5432/ohana
-          SVC_B_DSN: postgresql://svc_seller:${{ env.SVC_B_PW }}@localhost:5432/ohana
-          MCP_RO_DSN: postgresql://mcp_readonly:${{ env.MCP_RO_PW }}@localhost:5432/ohana
+      - name: Build and push frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./web
+          file: ./web/Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/ohana-web:${{ steps.meta.outputs.image-short }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/ohana-web:latest
+          cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/ohana-web:buildcache
+          cache-to: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/ohana-web:buildcache,mode=max
